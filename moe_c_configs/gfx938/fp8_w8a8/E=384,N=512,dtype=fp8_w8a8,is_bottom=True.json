@@ -1,0 +1,170 @@
+{
+    "1": {
+        "BLOCK_SIZE_M": 16,
+        "MODE": 60038,
+        "SORTING_METHOD": "ck_sorting",
+        "N_LOOP2": 1
+    },
+    "2": {
+        "BLOCK_SIZE_M": 16,
+        "MODE": 60042,
+        "SORTING_METHOD": "ck_sorting",
+        "N_LOOP2": 1
+    },
+    "3": {
+        "BLOCK_SIZE_M": 16,
+        "MODE": 60042,
+        "SORTING_METHOD": "ck_sorting",
+        "N_LOOP2": 1
+    },
+    "4": {
+        "BLOCK_SIZE_M": 16,
+        "MODE": 60038,
+        "SORTING_METHOD": "ck_sorting",
+        "N_LOOP2": 1
+    },
+    "5": {
+        "BLOCK_SIZE_M": 16,
+        "MODE": 60038,
+        "SORTING_METHOD": "ck_sorting",
+        "N_LOOP2": 1
+    },
+    "6": {
+        "BLOCK_SIZE_M": 16,
+        "MODE": 60038,
+        "SORTING_METHOD": "ck_sorting",
+        "N_LOOP2": 1
+    },
+    "7": {
+        "BLOCK_SIZE_M": 16,
+        "MODE": 60038,
+        "SORTING_METHOD": "ck_sorting",
+        "N_LOOP2": 1
+    },
+    "8": {
+        "BLOCK_SIZE_M": 16,
+        "MODE": 60038,
+        "SORTING_METHOD": "ck_sorting",
+        "N_LOOP2": 1
+    },
+    "9": {
+        "BLOCK_SIZE_M": 16,
+        "MODE": 60038,
+        "SORTING_METHOD": "ck_sorting",
+        "N_LOOP2": 1
+    },
+    "10": {
+        "BLOCK_SIZE_M": 16,
+        "MODE": 60038,
+        "SORTING_METHOD": "ck_sorting",
+        "N_LOOP2": 1
+    },
+    "11": {
+        "BLOCK_SIZE_M": 16,
+        "MODE": 60038,
+        "SORTING_METHOD": "ck_sorting",
+        "N_LOOP2": 1
+    },
+    "12": {
+        "BLOCK_SIZE_M": 16,
+        "MODE": 60038,
+        "SORTING_METHOD": "ck_sorting",
+        "N_LOOP2": 1
+    },
+    "13": {
+        "BLOCK_SIZE_M": 16,
+        "MODE": 60038,
+        "SORTING_METHOD": "ck_sorting",
+        "N_LOOP2": 1
+    },
+    "14": {
+        "BLOCK_SIZE_M": 16,
+        "MODE": 60038,
+        "SORTING_METHOD": "ck_sorting",
+        "N_LOOP2": 1
+    },
+    "15": {
+        "BLOCK_SIZE_M": 16,
+        "MODE": 60038,
+        "SORTING_METHOD": "ck_sorting",
+        "N_LOOP2": 1
+    },
+    "16": {
+        "BLOCK_SIZE_M": 16,
+        "MODE": 60038,
+        "SORTING_METHOD": "ck_sorting",
+        "N_LOOP2": 1
+    },
+    "32": {
+        "BLOCK_SIZE_M": 16,
+        "MODE": 60043,
+        "SORTING_METHOD": "ck_sorting",
+        "N_LOOP2": 1
+    },
+    "64": {
+        "BLOCK_SIZE_M": 16,
+        "MODE": 60043,
+        "SORTING_METHOD": "ck_sorting",
+        "N_LOOP2": 1
+    },
+    "128": {
+        "BLOCK_SIZE_M": 16,
+        "MODE": 60046,
+        "SORTING_METHOD": "ck_sorting",
+        "N_LOOP2": 1
+    },
+    "256": {
+        "BLOCK_SIZE_M": 16,
+        "MODE": 60046,
+        "SORTING_METHOD": "ck_sorting",
+        "N_LOOP2": 1
+    },
+    "512": {
+        "BLOCK_SIZE_M": 16,
+        "MODE": 60043,
+        "SORTING_METHOD": "ck_sorting",
+        "N_LOOP2": 1
+    },
+    "1024": {
+        "BLOCK_SIZE_M": 32,
+        "MODE": 80324,
+        "N_LOOP2": 4,
+        "SORTING_METHOD": "moe_align"
+    },
+    "2048": {
+        "BLOCK_SIZE_M": 64,
+        "MODE": 80642,
+        "N_LOOP2": 2,
+        "SORTING_METHOD": "moe_align"
+    },
+    "4096": {
+        "BLOCK_SIZE_M": 128,
+        "MODE": 81282,
+        "N_LOOP2": 2,
+        "SORTING_METHOD": "moe_align"
+    },
+    "6144": {
+        "BLOCK_SIZE_M": 80,
+        "MODE": 80804,
+        "N_LOOP2": 4,
+        "SORTING_METHOD": "moe_align"
+    },
+    "8192": {
+        "BLOCK_SIZE_M": 96,
+        "MODE": 80964,
+        "N_LOOP2": 4,
+        "SORTING_METHOD": "moe_align"
+    },
+    "16384": {
+        "BLOCK_SIZE_M": 96,
+        "MODE": 80964,
+        "N_LOOP2": 4,
+        "SORTING_METHOD": "moe_align"
+    },
+    "32768": {
+        "BLOCK_SIZE_M": 96,
+        "MODE": 80964,
+        "N_LOOP2": 4,
+        "SORTING_METHOD": "moe_align"
+    }
+}

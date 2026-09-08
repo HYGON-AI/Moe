@@ -1,0 +1,16 @@
+{
+  "56": {"BLOCK_SIZE_M": 32, "MODE": 100322, "SORTING_METHOD": "ck_sorting"},
+  "112": {"BLOCK_SIZE_M": 32, "MODE": 100322, "SORTING_METHOD": "ck_sorting"},
+  "1400": {"BLOCK_SIZE_M": 32, "MODE": 100322, "SORTING_METHOD": "ck_sorting"},
+  "2240": {"BLOCK_SIZE_M": 48, "MODE": 100482, "SORTING_METHOD": "ck_sorting"},
+  "2800": {"BLOCK_SIZE_M": 64, "MODE": 100642, "SORTING_METHOD": "ck_sorting"},
+  "4480": {"BLOCK_SIZE_M": 48, "MODE": 100482, "SORTING_METHOD": "ck_sorting"},
+  "5712": {"BLOCK_SIZE_M": 64, "MODE": 100642, "SORTING_METHOD": "ck_sorting"},
+  "6552": {"BLOCK_SIZE_M": 64, "MODE": 100642, "SORTING_METHOD": "ck_sorting"},
+  "8960": {"BLOCK_SIZE_M": 64, "MODE": 100642, "SORTING_METHOD": "ck_sorting"},
+  "11424": {"BLOCK_SIZE_M": 64, "MODE": 100642, "SORTING_METHOD": "ck_sorting"},
+  "13104": {"BLOCK_SIZE_M": 64, "MODE": 100642, "SORTING_METHOD": "ck_sorting"},
+  "14336": {"BLOCK_SIZE_M": 64, "MODE": 100642, "SORTING_METHOD": "ck_sorting"},
+  "28672": {"BLOCK_SIZE_M": 64, "MODE": 100642, "SORTING_METHOD": "ck_sorting"},
+  "57344": {"BLOCK_SIZE_M": 64, "MODE": 100642, "SORTING_METHOD": "ck_sorting"}
+}

@@ -1,0 +1,700 @@
+#include "moe_c_common.h"
+
+// 模板抽象
+// BLOCK_MNK: [16, 128, 128]
+// WARP_MNK: [16, 32, 64]
+// MMA_MNK: [16, 16, 32]
+// BLOCK_MNK / WARP_MNK = [1, 4, 2]  代表warp在MN方向的排布 block_k/warp_k代表stage
+// WARP_MNK / MMA_MNK = [1, 2, 2]    代表warp在MNK方向重复计算的次数 会分配额外的寄存器
+static torch::Tensor moe_c_moe_gemm_marlin_w8a8_impl(torch::Tensor input,
+  torch::Tensor b_qweight,
+  torch::Tensor output,
+  torch::Tensor a_scale,
+  torch::Tensor b_scale,
+  std::optional<torch::Tensor> topk_weights,
+  torch::Tensor sorted_token_ids, 
+  torch::Tensor expert_ids,
+  torch::Tensor num_tokens_post_pad, 
+  int64_t top_k, // gemm1为topk  gemm2为1  因为gemm1输入为[m, k]  gemm2输入为[m*topk, k]
+  int64_t mode,
+  int64_t delta,
+  int64_t config_m,
+  bool tensorwise_scale
+  ) {
+
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+    const int size_m = input.size(0); 
+    const int EXPERTS = b_qweight.size(0);
+    const int size_n = output.size(2);
+    const int size_k = b_qweight.size(2) * b_qweight.size(1) / size_n;
+    const int topk_size = output.size(1); // 输出为[m, topk_size, n]
+    const int stride_asm = a_scale.stride(0);
+    const int stride_ask = a_scale.stride(1);
+    const int stride_bse = b_scale.stride(0);
+    const int stride_bsn = b_scale.stride(1); 
+    const int stride_bsk = b_scale.stride(2);
+    
+    const uint32_t real_topk = delta;
+    
+    constexpr int GROUP_N = 1;
+    constexpr int GROUP_K = 1;
+    bool is_marlin = true; // weight为[E, N, K]时 代表不进行重排
+    bool first_stage = true;
+    torch::Tensor output_alias = output.alias();
+
+    const float* topk_weights_ptr; // 第一阶段这里为null
+    if (topk_weights.has_value()){
+      topk_weights_ptr = (const float*)topk_weights.value().data_ptr();
+      first_stage = false;
+    }
+
+    int num_pad = 0;
+    if (output.scalar_type() == at::ScalarType::BFloat16){
+    if (input.scalar_type() == at::ScalarType::Char){
+      if(first_stage){
+     
+        int64_t EM = sorted_token_ids.size(0); // 一维线性化的token id
+        GemmParams<char,bhalf_t> params_in(
+          (const char*)input.data_ptr<int8_t>(), 
+          (const char*)b_qweight.data_ptr<int8_t>(), 
+          (bhalf_t*)output_alias.data_ptr(),
+          (float*)a_scale.data_ptr(), 
+          (float*)b_scale.data_ptr(),  
+          topk_weights_ptr,
+          sorted_token_ids.data_ptr<int32_t>(),
+          expert_ids.data_ptr<int32_t>(), 
+          num_pad, //num_tokens_post_pad[0].item<int>(), //这里获取值 会造成device->host的拷贝和一部分空泡
+          num_tokens_post_pad.data_ptr<int32_t>(),
+          size_m,
+          size_n,
+          size_k,
+          stride_asm,
+          stride_ask,
+          stride_bse,
+          stride_bsn,
+          stride_bsk,
+          EM,
+          top_k,
+          real_topk,
+          is_marlin,
+          tensorwise_scale
+        );
+
+        if(config_m <= 512){
+          auto it = kernel_maps_gemm1_decode<bhalf_t>.find(mode);
+          if (it != kernel_maps_gemm1_decode<bhalf_t>.end()) {
+              it->second(params_in);
+          } else {
+              printf("bfloat version gemm1 No matching kernel configuration found, using default settings \n");
+          }
+        }else{ //decode 
+          
+          auto it = kernel_maps_gemm1_prefill<bhalf_t>.find(mode);
+          if ( it != kernel_maps_gemm1_prefill<bhalf_t>.end()) {
+              it->second(params_in);
+              
+          } else {
+              printf("bfloat version gemm1 No matching kernel configuration found, using default settings \n");
+          }
+        }
+        
+        
+      }else{ //gemm2
+        int64_t EM = sorted_token_ids.size(0); // 一维线性化的token id
+          
+        // 使用int8类型处理
+        GemmParams<char,bhalf_t> params_in(
+          (const char*)input.data_ptr<int8_t>(), 
+          (const char*)b_qweight.data_ptr<int8_t>(), 
+          (bhalf_t*)output_alias.data_ptr(),
+          (float*)a_scale.data_ptr(), 
+          (float*)b_scale.data_ptr(),  
+          topk_weights_ptr,
+          sorted_token_ids.data_ptr<int32_t>(),
+          expert_ids.data_ptr<int32_t>(), 
+          num_pad, //num_tokens_post_pad[0].item<int>(),
+          num_tokens_post_pad.data_ptr<int32_t>(),
+          size_m,
+          size_n,
+          size_k,
+          stride_asm,
+          stride_ask,
+          stride_bse,
+          stride_bsn,
+          stride_bsk,
+          EM,
+          top_k,
+          real_topk,
+          is_marlin,
+          tensorwise_scale
+        );
+
+        if(config_m <= 512 ){
+          auto it = kernel_maps_gemm2_decode<bhalf_t>.find(mode);
+          if (it != kernel_maps_gemm2_decode<bhalf_t>.end()) {
+              it->second(params_in);
+          } else {
+              printf("bfloat version gemm2 No matching kernel configuration found, using default settings \n");
+          }
+        }else
+        {
+          
+          auto it = kernel_maps_gemm2_prefill<bhalf_t>.find(mode);
+          if (    it != kernel_maps_gemm2_prefill<bhalf_t>.end()) {
+              it->second(params_in);
+          } else {
+
+              printf("bfloat version gemm2 No matching kernel configuration found, using default settings \n");
+
+          }
+
+        }
+              // hipDeviceSynchronize();
+
+      }
+    } else {
+    }
+    
+  }
+  else if (output.scalar_type() == at::ScalarType::Half)
+  {
+    if (input.scalar_type() == at::ScalarType::Char){
+      if(first_stage){
+     
+        int64_t EM = sorted_token_ids.size(0); // 一维线性化的token id
+        GemmParams<char,half> params_in(
+          (const char*)input.data_ptr<int8_t>(), 
+          (const char*)b_qweight.data_ptr<int8_t>(), 
+          (half*)output_alias.data_ptr(),
+          (float*)a_scale.data_ptr(), 
+          (float*)b_scale.data_ptr(),  
+          topk_weights_ptr,
+          sorted_token_ids.data_ptr<int32_t>(),
+          expert_ids.data_ptr<int32_t>(), 
+          num_pad, //num_tokens_post_pad[0].item<int>(), //这里获取值 会造成device->host的拷贝和一部分空泡
+          num_tokens_post_pad.data_ptr<int32_t>(),
+          size_m,
+          size_n,
+          size_k,
+          stride_asm,
+          stride_ask,
+          stride_bse,
+          stride_bsn,
+          stride_bsk,
+          EM,
+          top_k,
+          real_topk,
+          is_marlin,
+          tensorwise_scale
+        );
+
+        if(config_m <= 512){
+          auto it = kernel_maps_gemm1_decode<half>.find(mode);
+          if (it != kernel_maps_gemm1_decode<half>.end()) {
+              it->second(params_in);
+          } else {
+              printf("half version gemm1 No matching kernel configuration found, using default settings \n");
+          }
+        }else{ //decode 
+          auto it = kernel_maps_gemm1_prefill<half>.find(mode);
+          if ( it != kernel_maps_gemm1_prefill<half>.end()) {
+              it->second(params_in);
+              
+          } else {
+              printf("half version gemm1 No matching kernel configuration found \n");
+
+          }
+        }
+        
+        
+      }else{ //gemm2
+        int64_t EM = sorted_token_ids.size(0); // 一维线性化的token id
+          
+        // 使用int8类型处理
+        GemmParams<char,half> params_in(
+          (const char*)input.data_ptr<int8_t>(), 
+          (const char*)b_qweight.data_ptr<int8_t>(), 
+          (half*)output_alias.data_ptr(),
+          (float*)a_scale.data_ptr(), 
+          (float*)b_scale.data_ptr(),  
+          topk_weights_ptr,
+          sorted_token_ids.data_ptr<int32_t>(),
+          expert_ids.data_ptr<int32_t>(), 
+          num_pad, //num_tokens_post_pad[0].item<int>(),
+          num_tokens_post_pad.data_ptr<int32_t>(),
+          size_m,
+          size_n,
+          size_k,
+          stride_asm,
+          stride_ask,
+          stride_bse,
+          stride_bsn,
+          stride_bsk,
+          EM,
+          top_k,
+          real_topk,
+          is_marlin,
+          tensorwise_scale
+        );
+
+        if(config_m <= 512 ){
+          auto it = kernel_maps_gemm2_decode<half>.find(mode);
+          if (it != kernel_maps_gemm2_decode<half>.end()) {
+              it->second(params_in);
+          } else {
+              printf("half version gemm2 No matching kernel configuration found, using default settings \n");
+          }
+        }else
+        {
+          // mode =86;
+          auto it = kernel_maps_gemm2_prefill<half>.find(mode);
+          if (  it != kernel_maps_gemm2_prefill<half>.end()) {
+              it->second(params_in);
+          } else {
+
+              printf("half version gemm2  No matching kernel configuration found \n");
+
+          }
+
+        }
+              // hipDeviceSynchronize();
+
+      }
+    } else {
+      TORCH_CHECK(false, "moe_w8a8_gemm only supports int8");
+    }
+  }
+
+    return output;
+}
+
+torch::Tensor moe_c_moe_gemm_marlin_w8a8(torch::Tensor input,
+  torch::Tensor b_qweight,
+  torch::Tensor output,
+  torch::Tensor a_scale,
+  torch::Tensor b_scale,
+  std::optional<torch::Tensor> topk_weights,
+  torch::Tensor sorted_token_ids, 
+  torch::Tensor expert_ids,
+  torch::Tensor num_tokens_post_pad, 
+  int64_t top_k,
+  int64_t mode,
+  int64_t delta,
+  int64_t config_m
+  ) {
+    return moe_c_moe_gemm_marlin_w8a8_impl(input, b_qweight, output, a_scale,
+      b_scale, topk_weights, sorted_token_ids, expert_ids, num_tokens_post_pad,
+      top_k, mode, delta, config_m, false);
+}
+
+torch::Tensor moe_c_moe_gemm_marlin_w8a8_tensorwise(torch::Tensor input,
+  torch::Tensor b_qweight,
+  torch::Tensor output,
+  torch::Tensor a_scale,
+  torch::Tensor b_scale,
+  std::optional<torch::Tensor> topk_weights,
+  torch::Tensor sorted_token_ids, 
+  torch::Tensor expert_ids,
+  torch::Tensor num_tokens_post_pad, 
+  int64_t top_k,
+  int64_t mode,
+  int64_t delta,
+  int64_t config_m
+  ) {
+    return moe_c_moe_gemm_marlin_w8a8_impl(input, b_qweight, output, a_scale,
+      b_scale, topk_weights, sorted_token_ids, expert_ids, num_tokens_post_pad,
+      top_k, mode, delta, config_m, true);
+}
+
+torch::Tensor moe_c_moe_w8a8_gemm_block_wise(torch::Tensor input, torch::Tensor a_scales,torch::Tensor output,
+                             torch::Tensor b_qweight, torch::Tensor b_scales,
+                             std::optional<torch::Tensor> b_qzeros,
+                             std::optional<torch::Tensor> topk_weights,
+                             torch::Tensor sorted_token_ids,
+                             torch::Tensor expert_ids,
+                             torch::Tensor num_tokens_post_pad, int64_t group_size_n, int64_t group_size_k, int64_t top_k,
+                             int64_t BLOCK_SIZE_m, int64_t BLOCK_SIZE_n,
+                             int64_t BLOCK_SIZE_k, int64_t kloops, int64_t nloops, int64_t bit ) {
+  
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  const int size_m = input.size(0);
+  const int size_n = b_qweight.size(1);
+  const int size_k = input.size(1);
+  
+  int64_t BLOCK_SIZE_N = 64;
+  int64_t BLOCK_SIZE_K_MIN =4*1024/BLOCK_SIZE_m;
+  int64_t BLOCK_SIZE_K_MAX =8*1024/BLOCK_SIZE_m;
+  int64_t BLOCK_SIZE_K = std::min(BLOCK_SIZE_K_MAX,size_k);
+
+  int BLOCK_SIZE_M_MAX = std::min(16, size_m);
+  int BLOCK_SIZE_N_MAX_roofline = 64;
+  int BLOCK_SIZE_N_MAX = std::min(BLOCK_SIZE_N_MAX_roofline, size_n);
+
+  // BLOCK_SIZE_K = std::min(128, BLOCK_SIZE_K);
+  BLOCK_SIZE_K = 128;
+
+  // int block_size_m_loops = 1;// std::min(1,BLOCK_SIZE_M_MAX/BLOCK_SIZE_m);
+  int block_size_m_loops = 1;
+  int block_size_k_loops = kloops;
+  // int block_size_n_loops = BLOCK_SIZE_N_MAX/BLOCK_SIZE_N;
+  int block_size_n_loops = nloops;
+  // int* dev_d_w = nullptr;
+  // hipMalloc((void**)&dev_d_w, 16*64*sizeof(int));
+  // }//for debug
+  int d_w_out[16*64]; 
+  
+  int64_t EM = sorted_token_ids.size(0);
+  if (size_m <= BLOCK_SIZE_m) {
+    EM = min(EM, size_m * BLOCK_SIZE_m * top_k);
+  }
+  const int num_token_blocks = (EM + BLOCK_SIZE_m*block_size_m_loops - 1) / (BLOCK_SIZE_m*block_size_m_loops);
+
+  const uint32_t* b_qzeros_ptr;
+  if (b_qzeros.has_value())
+    b_qzeros_ptr = (const uint32_t*)b_qzeros.value().data_ptr<uint8_t>();
+  const float* topk_weights_ptr;
+  if (topk_weights.has_value())
+    topk_weights_ptr = (const float*)topk_weights.value().data_ptr();
+
+  int groups_per_block_row = BLOCK_SIZE_K / group_size_k;
+  TORCH_CHECK(bit == 4 || bit == 8, "bit must be 4 or 8");
+  TORCH_CHECK(size_k % BLOCK_SIZE_K == 0,
+              "size_k must divisible by BLOCK_SIZE_K");
+  TORCH_CHECK(BLOCK_SIZE_K % group_size_k == 0,
+              "BLOCK_SIZE_K must divisible by group_size_k");
+  TORCH_CHECK(BLOCK_SIZE_m <= 64, "BLOCK_SIZE_m must less or equal to 64");
+  TORCH_CHECK(groups_per_block_row == 1 || groups_per_block_row == 2 ||
+                  groups_per_block_row == 4 || groups_per_block_row == 8,
+              "BLOCK_SIZE_K // group_size must be one of [1, 2, 4, 8]");
+  
+  bool use_atomic = (size_k != BLOCK_SIZE_K*block_size_k_loops);
+
+  
+
+
+  std::optional<torch::Tensor> output_fp32;
+
+  if (use_atomic){
+
+    output_fp32 = torch::zeros(output.sizes(),output.options().dtype(torch::kFloat32));
+    // output_fp32->zero_(); 
+  } 
+  float milliseconds = 0;
+  cudaEvent_t start, stop;
+  const char* find_best = std::getenv("WHICH_TO_TEST");
+  if (find_best) {
+    
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start);        // 记录开始
+  }
+  // if (true/* input.scalar_type() == at::ScalarType::QInt8 */) {
+
+  //   BIT_SWITCH(bit, BIT, [&]{
+  //     TOPK_SWITCH(top_k, TOPK, [&]{
+  //       BLOCK_M_SWITCH(BLOCK_SIZE_m, BLOCK_SIZE_M_, [&]{
+  //         BLOCK_N_SWITCH(BLOCK_SIZE_N, BLOCK_SIZE_N_, [&]{
+  //           BLOCK_K_SWITCH(BLOCK_SIZE_K, BLOCK_SIZE_K_, [&]{
+  //             // BOOL_SWITCH(b_qzeros.has_value(), has_zp, [&]{
+  //               BOOL_SWITCH(topk_weights.has_value(), mul_topk_weight, [&]{
+  //                 GROUP_SIZE_N_SWITCH(group_size_n, GROUP_SIZE_N, [&]{
+  //                   GROUP_SIZE_K_SWITCH(group_size_k, GROUP_SIZE_K, [&]{
+  //                     BLOCK_SIZE_M_LOOPS_SWITCH(block_size_m_loops , BLOCK_SIZE_M_LOOPS, [&]{
+  //                     BLOCK_SIZE_N_LOOPS_SWITCH(block_size_n_loops , BLOCK_SIZE_N_LOOPS, [&]{
+  //                       BLOCK_SIZE_K_LOOPS_SWITCH(block_size_k_loops , BLOCK_SIZE_K_LOOPS, [&]{
+  //                         BOOL_SWITCH(use_atomic , USE_ATOMIC, [&]{
+  //                   run_moe_w8a8_gemm_block_wise<half, 8, TOPK, BLOCK_SIZE_M_, BLOCK_SIZE_N_, BLOCK_SIZE_K_, false, mul_topk_weight, GROUP_SIZE_N, GROUP_SIZE_K, BLOCK_SIZE_M_LOOPS, BLOCK_SIZE_N_LOOPS, BLOCK_SIZE_K_LOOPS, USE_ATOMIC,256>(
+                    
+  //                     (const uint32_t*)input.data_ptr<int8_t>(),
+  //                     // (const half*)d_input,
+  //                     (const float*)a_scales.data_ptr(),
+  //                     use_atomic ?(float*)output_fp32->data_ptr():(float*)output.data_ptr(),
+  //                     // (float*)output_fp32->data_ptr(),
+  //                     (const uint32_t*)b_qweight.data_ptr<int8_t>(),
+  //                     // (const uint32_t*)d_w_test,
+  //                     ( int*)&d_w_out[0], /*for debug*/ /*使用时需修改为device端地址，这里仅为占位使用*/
+  //                     // (const half*)b_scales.data_ptr<at::Half>(), 
+  //                     (const float*)b_scales.data_ptr(),
+  //                     // (const half*)d_scale, 
+  //                     b_qzeros_ptr,
+  //                     // (const uint32_t*)d_scale,
+  //                     topk_weights_ptr, 
+  //                     sorted_token_ids.data_ptr<int32_t>(),
+  //                     expert_ids.data_ptr<int32_t>(), 
+  //                     num_tokens_post_pad.data_ptr<int32_t>(), 
+  //                     // num_tokens_post_pad_value<int32_t>(),
+  //                     // num_tokens_post_pad_data_ptr[0],
+  //                     num_token_blocks, 
+  //                     size_m, 
+  //                     size_n,
+  //                     size_k
+  //                     );
+  //                     });              
+  //                     });
+  //                   });
+  //                 });
+  //               });
+  //             });
+  //           });
+  //         });
+  //       });
+  //     });
+  //   });
+  // });
+  // } else {
+  // }
+
+  if (find_best) {
+  cudaEventRecord(stop);         // 记录结束
+  cudaEventSynchronize(stop);    // 等待 kernel 执行完成
+
+  
+  cudaEventElapsedTime(&milliseconds, start, stop); // 计算时间
+  std::ofstream ofs("./w8a8_kernel_1_timecost", std::ios::app); // 追加写入
+  if (ofs.is_open()) {
+      ofs << milliseconds << std::endl;
+      ofs.close();
+  }
+}
+  
+  
+
+  if (use_atomic){
+    output.copy_(output_fp32->to(torch::kFloat16));
+  }
+  cudaEventDestroy(start);
+  cudaEventDestroy(stop);
+  // hipDeviceSynchronize();
+  // hipMemcpy(&d_w_out[0], dev_d_w, 16*64 * sizeof(int), hipMemcpyDeviceToHost);
+  // for(int i =0;i<16;i++){
+  //   for(int j = 0;j<64 ;j++){
+  //   }
+  // }
+  // hipFree(dev_d_w);
+  // }
+  return output;
+  
+}
+
+torch::Tensor moe_c_moe_w8a8_gemm_block_wise_kernel2(torch::Tensor input, torch::Tensor a_scales,torch::Tensor output,
+                             torch::Tensor b_qweight, torch::Tensor b_scales,
+                             std::optional<torch::Tensor> b_qzeros,
+                             std::optional<torch::Tensor> topk_weights,
+                             torch::Tensor sorted_token_ids,
+                             torch::Tensor expert_ids,
+                             torch::Tensor num_tokens_post_pad, int64_t group_size_n, int64_t group_size_k, int64_t top_k,
+                             int64_t BLOCK_SIZE_m, int64_t BLOCK_SIZE_n,
+                             int64_t BLOCK_SIZE_k, int64_t kloops, int64_t nloops, int64_t bit ) {
+  
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+
+  const int size_m = input.size(0);
+  const int size_n = b_qweight.size(1);
+  const int size_k = input.size(1);
+  
+  int64_t BLOCK_SIZE_N = 64;
+  int64_t BLOCK_SIZE_K_MIN =4*1024/BLOCK_SIZE_m;
+  int64_t BLOCK_SIZE_K_MAX =8*1024/BLOCK_SIZE_m;
+  int64_t BLOCK_SIZE_K = std::min(BLOCK_SIZE_K_MAX,size_k);
+
+  int BLOCK_SIZE_M_MAX = std::min(16, size_m);
+  int BLOCK_SIZE_N_MAX_roofline = 64;
+  int BLOCK_SIZE_N_MAX = std::min(BLOCK_SIZE_N_MAX_roofline, size_n);
+
+  // BLOCK_SIZE_K = std::min(128, BLOCK_SIZE_K);
+  BLOCK_SIZE_K = 128;
+
+  // int block_size_m_loops = 1;// std::min(1,BLOCK_SIZE_M_MAX/BLOCK_SIZE_m);
+  int block_size_m_loops = 1;
+  int block_size_k_loops =kloops;
+  // int block_size_n_loops = BLOCK_SIZE_N_MAX/BLOCK_SIZE_N;
+  int block_size_n_loops = nloops;
+  // int* dev_d_w = nullptr;
+  // hipMalloc((void**)&dev_d_w, 16*64*sizeof(int));
+  // }//for debug
+  int d_w_out[16*64]; 
+  
+  int64_t EM = sorted_token_ids.size(0);
+  if (size_m <= BLOCK_SIZE_m) {
+    EM = min(EM, size_m * BLOCK_SIZE_m * top_k);
+  }
+  const int num_token_blocks = (EM + BLOCK_SIZE_m*block_size_m_loops - 1) / (BLOCK_SIZE_m*block_size_m_loops);
+
+  const uint32_t* b_qzeros_ptr;
+  if (b_qzeros.has_value())
+    b_qzeros_ptr = (const uint32_t*)b_qzeros.value().data_ptr<uint8_t>();
+  const float* topk_weights_ptr;
+  if (topk_weights.has_value())
+    topk_weights_ptr = (const float*)topk_weights.value().data_ptr();
+
+  int groups_per_block_row = BLOCK_SIZE_K / group_size_k;
+  TORCH_CHECK(bit == 4 || bit == 8, "bit must be 4 or 8");
+  TORCH_CHECK(size_k % BLOCK_SIZE_K == 0,
+              "size_k must divisible by BLOCK_SIZE_K");
+  TORCH_CHECK(BLOCK_SIZE_K % group_size_k == 0,
+              "BLOCK_SIZE_K must divisible by group_size_k");
+  TORCH_CHECK(BLOCK_SIZE_m <= 64, "BLOCK_SIZE_m must less or equal to 64");
+  TORCH_CHECK(groups_per_block_row == 1 || groups_per_block_row == 2 ||
+                  groups_per_block_row == 4 || groups_per_block_row == 8,
+              "BLOCK_SIZE_K // group_size must be one of [1, 2, 4, 8]");
+  
+  bool use_atomic = (size_k != BLOCK_SIZE_K*block_size_k_loops);
+
+  
+
+
+  std::optional<torch::Tensor> output_fp32;
+
+  if (use_atomic){
+
+    output_fp32 = torch::zeros(output.sizes(),output.options().dtype(torch::kFloat32));
+    // output_fp32->zero_(); 
+  } 
+  float milliseconds = 0;
+  cudaEvent_t start, stop;
+  const char* find_best = std::getenv("WHICH_TO_TEST");
+    if (find_best) {
+      
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    cudaEventRecord(start);        // 记录开始
+    }
+  // if (true/* input.scalar_type() == at::ScalarType::QInt8 */) {
+
+  //   BIT_SWITCH(bit, BIT, [&]{
+  //     TOPK_SWITCH(top_k, TOPK, [&]{
+  //       BLOCK_M_SWITCH(BLOCK_SIZE_m, BLOCK_SIZE_M_, [&]{
+  //         BLOCK_N_SWITCH(BLOCK_SIZE_N, BLOCK_SIZE_N_, [&]{
+  //           BLOCK_K_SWITCH(BLOCK_SIZE_K, BLOCK_SIZE_K_, [&]{
+  //             // BOOL_SWITCH(b_qzeros.has_value(), has_zp, [&]{
+  //               BOOL_SWITCH(topk_weights.has_value(), mul_topk_weight, [&]{
+  //                 GROUP_SIZE_N_SWITCH(group_size_n, GROUP_SIZE_N, [&]{
+  //                   GROUP_SIZE_K_SWITCH(group_size_k, GROUP_SIZE_K, [&]{
+  //                     BLOCK_SIZE_M_LOOPS_SWITCH(block_size_m_loops , BLOCK_SIZE_M_LOOPS, [&]{
+  //                     BLOCK_SIZE_N_LOOPS_SWITCH(block_size_n_loops , BLOCK_SIZE_N_LOOPS, [&]{
+  //                       BLOCK_SIZE_K_LOOPS_SWITCH(block_size_k_loops , BLOCK_SIZE_K_LOOPS, [&]{
+  //                         BOOL_SWITCH(use_atomic , USE_ATOMIC, [&]{
+  //                   run_moe_w8a8_gemm_block_wise_kernel2<half, 8, TOPK, BLOCK_SIZE_M_, BLOCK_SIZE_N_, BLOCK_SIZE_K_, false, mul_topk_weight, GROUP_SIZE_N, GROUP_SIZE_K, BLOCK_SIZE_M_LOOPS, BLOCK_SIZE_N_LOOPS, BLOCK_SIZE_K_LOOPS, USE_ATOMIC,256>(
+                    
+  //                     (const uint32_t*)input.data_ptr<int8_t>(),
+  //                     // (const half*)d_input,
+  //                     (const float*)a_scales.data_ptr(),
+  //                     use_atomic ?(float*)output_fp32->data_ptr():(float*)output.data_ptr(),
+  //                     // (float*)output_fp32->data_ptr(),
+  //                     (const uint32_t*)b_qweight.data_ptr<int8_t>(),
+  //                     // (const uint32_t*)d_w_test,
+  //                     ( int*)&d_w_out[0], /*for debug*/ /*使用时需修改为device端地址，这里仅为占位使用*/
+  //                     // (const half*)b_scales.data_ptr<at::Half>(), 
+  //                     (const float*)b_scales.data_ptr(),
+  //                     // (const half*)d_scale, 
+  //                     b_qzeros_ptr,
+  //                     // (const uint32_t*)d_scale,
+  //                     topk_weights_ptr, 
+  //                     sorted_token_ids.data_ptr<int32_t>(),
+  //                     expert_ids.data_ptr<int32_t>(), 
+  //                     num_tokens_post_pad.data_ptr<int32_t>(), 
+  //                     // num_tokens_post_pad_value<int32_t>(),
+  //                     // num_tokens_post_pad_data_ptr[0],
+  //                     num_token_blocks, 
+  //                     size_m, 
+  //                     size_n,
+  //                     size_k
+  //                     );
+  //                     });              
+  //                     });
+  //                   });
+  //                 });
+  //               });
+  //             });
+  //           });
+  //         });
+  //       });
+  //     });
+  //   });
+  // });
+  // } else {
+  // }
+
+  if (find_best) {
+  cudaEventRecord(stop);         // 记录结束
+  cudaEventSynchronize(stop);    // 等待 kernel 执行完成
+
+  
+  cudaEventElapsedTime(&milliseconds, start, stop); // 计算时间
+  std::ofstream ofs("./w8a8_kerne2_1_timecost", std::ios::app); // 追加写入
+  if (ofs.is_open()) {
+      ofs << milliseconds << std::endl;
+      ofs.close();
+  }
+}
+  
+  
+
+  if (use_atomic){
+    output.copy_(output_fp32->to(torch::kFloat16));
+  }
+
+  cudaEventDestroy(start);
+  cudaEventDestroy(stop);
+  // hipDeviceSynchronize();
+  // hipMemcpy(&d_w_out[0], dev_d_w, 16*64 * sizeof(int), hipMemcpyDeviceToHost);
+  // for(int i =0;i<16;i++){
+  //   for(int j = 0;j<64 ;j++){
+  //   }
+  // }
+  // hipFree(dev_d_w);
+  // }
+  return output;
+  
+}
+
+TORCH_LIBRARY_FRAGMENT(moe_wna16, m) {
+  m.def(
+      "moe_c_moe_w8a8_gemm_block_wise("
+      "Tensor input, Tensor a_scales, Tensor! output, Tensor b_qweight, "
+      "Tensor b_scales, Tensor? b_qzeros, Tensor? topk_weights, "
+      "Tensor sorted_token_ids, Tensor expert_ids, Tensor num_tokens_post_pad, "
+      "int group_size_n, int group_size_k, int top_k, int BLOCK_SIZE_M, "
+      "int BLOCK_SIZE_N, int BLOCK_SIZE_K, int kloops, int nloops, "
+      "int bit) -> Tensor");
+  m.impl(
+      "moe_c_moe_w8a8_gemm_block_wise",
+      torch::kCUDA,
+      &moe_c_moe_w8a8_gemm_block_wise);
+
+  m.def(
+      "moe_c_moe_w8a8_gemm_block_wise_kernel2("
+      "Tensor input, Tensor a_scales, Tensor! output, Tensor b_qweight, "
+      "Tensor b_scales, Tensor? b_qzeros, Tensor? topk_weights, "
+      "Tensor sorted_token_ids, Tensor expert_ids, Tensor num_tokens_post_pad, "
+      "int group_size_n, int group_size_k, int top_k, int BLOCK_SIZE_M, "
+      "int BLOCK_SIZE_N, int BLOCK_SIZE_K, int kloops, int nloops, "
+      "int bit) -> Tensor");
+  m.impl(
+      "moe_c_moe_w8a8_gemm_block_wise_kernel2",
+      torch::kCUDA,
+      &moe_c_moe_w8a8_gemm_block_wise_kernel2);
+
+  m.def(
+      "moe_c_moe_gemm_marlin_w8a8("
+      "Tensor input, Tensor b_qweight, Tensor output, Tensor a_scale, "
+      "Tensor b_scale, Tensor? topk_weights, Tensor sorted_token_ids, "
+      "Tensor expert_ids, Tensor num_tokens_post_pad, int top_k, int mode, "
+      "int delta, int size_m) -> Tensor");
+  m.impl(
+      "moe_c_moe_gemm_marlin_w8a8",
+      torch::kCUDA,
+      &moe_c_moe_gemm_marlin_w8a8);
+
+  m.def(
+      "moe_c_moe_gemm_marlin_w8a8_tensorwise("
+      "Tensor input, Tensor b_qweight, Tensor output, Tensor a_scale, "
+      "Tensor b_scale, Tensor? topk_weights, Tensor sorted_token_ids, "
+      "Tensor expert_ids, Tensor num_tokens_post_pad, int top_k, int mode, "
+      "int delta, int size_m) -> Tensor");
+  m.impl(
+      "moe_c_moe_gemm_marlin_w8a8_tensorwise",
+      torch::kCUDA,
+      &moe_c_moe_gemm_marlin_w8a8_tensorwise);
+}

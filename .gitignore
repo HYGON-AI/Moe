@@ -1,0 +1,11 @@
+build/
+moe_c/
+
+__pycache__
+
+*.log
+*.csv
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
