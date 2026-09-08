@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
+
 # Test for get_aiter_moe_config and aiter_moe with W8A16 (int8 weight, fp16/bf16 activation)
 #
 # Mirrors test_aiter_moe_with_config_w16a16.py but for the INT8_W8A16 quant

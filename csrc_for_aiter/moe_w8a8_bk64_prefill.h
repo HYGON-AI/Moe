@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #ifndef MOE_W8A8_FLAT_ROUTE_HELPERS

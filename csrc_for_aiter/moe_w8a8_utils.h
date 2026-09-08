@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+// SPDX-License-Identifier: MIT
+
 #ifndef MOE_W8A8_UTILS_HIP_H
 #define MOE_W8A8_UTILS_HIP_H
 

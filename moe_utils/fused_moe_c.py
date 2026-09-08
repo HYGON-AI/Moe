@@ -1,4 +1,5 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Fused MoE kernel."""
 import functools
 import json
@@ -2534,16 +2535,12 @@ def get_config_file_name(E: int,
                          block_shape: Optional[List[int]] = None,
                          is_bottom: bool = False,
                          use_moe_wna16_cuda: bool = False) -> str:
-    device_name = get_device_name()
-    # device_name = "BW200"
-    if device_name == 'BW200' or device_name.upper().startswith('BW'):
-        device_name = 'BW200'
     dtype_selector = "" if not dtype else f",dtype={dtype}"
     is_bottom_selector = ("" if is_bottom == False else ",is_bottom=True")
     block_shape_selector = ("" if not block_shape or not all(block_shape) else
                             f",block_shape={block_shape}").replace(" ", "")
     is_cuda_kernel_selector = ("" if use_moe_wna16_cuda == False else ",is_cuda_kernel=True")
-    return f"E={E},N={N},device_name={device_name}{dtype_selector}{is_bottom_selector}{block_shape_selector}{is_cuda_kernel_selector}.json"  # noqa: E501
+    return f"E={E},N={N}{dtype_selector}{is_bottom_selector}{block_shape_selector}{is_cuda_kernel_selector}.json"  # noqa: E501
 
 
 def _get_gfx_version() -> str:

@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
+
 # Test for get_aiter_moe_config and aiter_moe with w8a8 tensor-wise quantization
 
 import argparse

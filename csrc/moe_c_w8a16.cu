@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+// SPDX-License-Identifier: MIT
+
 #include "moe_c_common.h"
 
 torch::Tensor moe_c_moe_gemm_marlin_w8a16(torch::Tensor input,

@@ -1,3 +1,4 @@
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 // SPDX-License-Identifier: MIT
 
 #include "moe_c_wfp4a8_common.h"

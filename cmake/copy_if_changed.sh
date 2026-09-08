@@ -1,4 +1,6 @@
 #!/bin/bash
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 
 SOURCE_DIR=$1
 TARGET_DIR=$2

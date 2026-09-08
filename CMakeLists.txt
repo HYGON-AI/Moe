@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
+
 
 cmake_minimum_required(VERSION 3.10)
 
@@ -179,6 +182,7 @@ function(add_moe_c_precision_target TARGET_NAME OUTPUT_NAME ENTRY_NAME)
     set(PRECISION_CU "${BUILD_CSRC_DIR}/${ENTRY_NAME}.cu")
     set(PRECISION_HIP "${BUILD_CSRC_DIR}/${ENTRY_NAME}.hip")
     set(PRECISION_OBJECT "${CMAKE_BINARY_DIR}/csrc/${TARGET_NAME}.o")
+    set(PRECISION_ASM "${CMAKE_BINARY_DIR}/csrc/${TARGET_NAME}.s")
     add_custom_command(
         OUTPUT ${PRECISION_HIP}
         COMMAND bash ${CMAKE_SOURCE_DIR}/cmake/ensure_hip_entry.sh ${PRECISION_CU} ${PRECISION_HIP}
@@ -193,6 +197,14 @@ function(add_moe_c_precision_target TARGET_NAME OUTPUT_NAME ENTRY_NAME)
     )
     add_custom_target(${TARGET_NAME}_kernel_compile DEPENDS ${PRECISION_OBJECT})
     add_dependencies(${TARGET_NAME}_kernel_compile hipify)
+    add_custom_command(
+        OUTPUT ${PRECISION_ASM}
+        COMMAND ${MOE_C_HIP_COMPILER_PATH} ${HIP_COMPILE_FLAGS} -x hip -S ${PRECISION_HIP} -o ${PRECISION_ASM}
+        DEPENDS ${PRECISION_HIP}
+        COMMENT "Building ${TARGET_NAME} assembly from ${PRECISION_HIP}"
+    )
+    add_custom_target(${TARGET_NAME}_asm DEPENDS ${PRECISION_ASM})
+    add_dependencies(${TARGET_NAME}_asm hipify)
 
     set_source_files_properties(${PRECISION_OBJECT} PROPERTIES GENERATED TRUE)
     add_library(${TARGET_NAME} SHARED EXCLUDE_FROM_ALL)

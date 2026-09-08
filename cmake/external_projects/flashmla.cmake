@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
+
 include(FetchContent)
 
 # If FLASH_MLA_SRC_DIR is set, flash-mla is installed from that directory 

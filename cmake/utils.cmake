@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
+
 #
 # Attempt to find the python package that uses the same python executable as
 # `EXECUTABLE` and is one of the `SUPPORTED_VERSIONS`.

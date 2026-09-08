@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
+
 include(FetchContent)
 
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
