@@ -1,0 +1,23 @@
+name: Quality Gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hygon-pr-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: Checks
+    uses: HYGON-AI/quality-gate/.github/workflows/pr-quality-gate.yml@0983098c334900cf848e4eabf79483b28abf0253
+    # Reuse the isolated CI Runner pool.  The reusable workflow accepts a JSON
+    # label array; Runner-group selection is managed by GitHub, not this input.
+    permissions:
+      contents: read
