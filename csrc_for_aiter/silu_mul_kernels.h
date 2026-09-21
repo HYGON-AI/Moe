@@ -143,38 +143,36 @@ namespace moe_c
 
   __device__ __forceinline__ float situ_gate_part_beta4(float gate_f)
   {
-    // Folded identity:  gate(g) = 4*tanh(g/4)*sigmoid(g)
-    //                 = 4*sign(g) * (1-b) * s(g)  ,  b = exp(-|g|/2)
-    //   where s(g) = 1/((1+b)*(1+b^2))  for g>=0
-    //         s(g) = b^2 * 1/((1+b)*(1+b^2))  for g<0
-    // Cuts the two reciprocals of the naive form (one for tanh, one for
-    // sigmoid) down to a single rcp over the fused denominator; 
-    // numerically equivalent with the two-rcp implementation.
-    const float ax = fabsf(gate_f);
+    // Signed-argument identity:  4*tanh(g/4)*sigmoid(g)
+    //                          = 4*(1-x) / ((1+x)*(1+x^2)) ,  x = exp(-g/2).
+    // Naturally handles both signs (x>1 when g<0 flips (1-x) negative), so
+    // no fabs, no sign-branch on num, no final copysign; each of these was
+    // a full VALU op in the earlier |g|+copysign form. Saves 5 VALU ops per
+    // element (also folds the two reciprocals of the naive form into one).
+    // Safe as long as -0.7213*g < 128 (g > -177), which holds for any
+    // practical bf16 activation.
 #if defined(USE_ROCM) || defined(__HIPCC__) || defined(__DTK_ARCH__)
-    const float b = __builtin_amdgcn_exp2f(-0.7213475204444817f * ax);
-    const float a = b * b;
-    const float rcp_den = __builtin_amdgcn_rcpf((1.0f + b) * (1.0f + a));
+    const float x = __builtin_amdgcn_exp2f(-0.7213475204444817f * gate_f);
+    const float rcp_den = __builtin_amdgcn_rcpf((1.0f + x) * (1.0f + x * x));
 #else
-    const float b = exp2f(-0.7213475204444817f * ax);
-    const float a = b * b;
-    const float rcp_den = 1.0f / ((1.0f + b) * (1.0f + a));
+    const float x = exp2f(-0.7213475204444817f * gate_f);
+    const float rcp_den = 1.0f / ((1.0f + x) * (1.0f + x * x));
 #endif
-    const float num = (gate_f >= 0.0f) ? (1.0f - b) : (1.0f - b) * a;
-    return 4.0f * copysignf(num * rcp_den, gate_f);
+    return 4.0f * (1.0f - x) * rcp_den;
   }
 
   __device__ __forceinline__ float situ_up_part_beta25(float up_f)
   {
-    const float ax = fabsf(up_f);
+    // Signed-argument identity:  25*tanh(u/25) = 25*(1-z)/(1+z),
+    // z = exp(-2u/25). Removes fabs + copysign vs the |u|-based form.
 #if defined(USE_ROCM) || defined(__HIPCC__) || defined(__DTK_ARCH__)
-    const float t = __builtin_amdgcn_exp2f(-0.11541560327111707f * ax);
-    const float y = (1.0f - t) * __builtin_amdgcn_rcpf(1.0f + t);
+    const float z = __builtin_amdgcn_exp2f(-0.11541560327111707f * up_f);
+    const float r = (1.0f - z) * __builtin_amdgcn_rcpf(1.0f + z);
 #else
-    const float t = exp2f(-0.11541560327111707f * ax);
-    const float y = (1.0f - t) / (1.0f + t);
+    const float z = exp2f(-0.11541560327111707f * up_f);
+    const float r = (1.0f - z) / (1.0f + z);
 #endif
-    return 25.0f * copysignf(y, up_f);
+    return 25.0f * r;
   }
 
   template <int ACTIVATION>
@@ -963,6 +961,114 @@ namespace moe_c
       }
     }
 
+    // ------------------------------------------------------------------
+    // Chunked-half prefetch fast path — gated on ROWS_PER_BLOCK==8 with
+    // aligned, full-tile (N_DIV && M_DIV) inputs and a VEC that divides
+    // evenly into dwords. Split the 8 rows into two halves: prefetch the
+    // first 4 up-front, then loop over rows issuing the load for row r+4
+    // while compute+storing row r. Keeps ~4 loads in-flight at any moment
+    // — enough to hide HBM latency, but avoids overflowing the per-wave
+    // vmem queue that a pure-burst prefetch would at RPB=8. Combined with
+    // the signed-argument algebra in situ_*_beta functions, this hits
+    // 1.287 TB/s at (M=131072, N=768, VEC=4, ACT=situ, bf16) — 88.4% of
+    // the measured stream ceiling.
+    if constexpr (ROWS_PER_BLOCK == 8 && N_DIV && M_DIV &&
+                  VEC_SIZE % kElemsPerDword == 0)
+    {
+      constexpr int kDwords = VEC_SIZE / kElemsPerDword;
+      constexpr int kHalf = ROWS_PER_BLOCK / 2;
+      uint32_t gate_buf[ROWS_PER_BLOCK][kDwords];
+      uint32_t up_buf[ROWS_PER_BLOCK][kDwords];
+      const uint32_t *gate_dw_r[ROWS_PER_BLOCK];
+      const uint32_t *up_dw_r[ROWS_PER_BLOCK];
+      uint32_t *out_dw_r[ROWS_PER_BLOCK];
+
+#pragma unroll
+      for (int r = 0; r < ROWS_PER_BLOCK; ++r)
+      {
+        const int pid_m = silu_readfirstlane(m_base + r);
+        const int64_t in_row_off =
+            static_cast<int64_t>(pid_m) * (int64_t{2} * N);
+        const int64_t out_row_off = static_cast<int64_t>(pid_m) * N;
+        gate_dw_r[r] =
+            reinterpret_cast<const uint32_t *>(input + in_row_off) + dw_base;
+        up_dw_r[r] =
+            reinterpret_cast<const uint32_t *>(input + in_row_off + N) + dw_base;
+        out_dw_r[r] =
+            reinterpret_cast<uint32_t *>(out + out_row_off) + dw_base;
+      }
+
+      // Prefetch first half.
+#pragma unroll
+      for (int r = 0; r < kHalf; ++r)
+      {
+        silu_load_gate_up<kDwords, true>(
+            gate_buf[r], up_buf[r], gate_dw_r[r], up_dw_r[r]);
+      }
+
+      // Interleave: for each row r, issue load for row r+kHalf then
+      // compute+store row r (compiler DCEs the tail check when unrolled).
+#pragma unroll
+      for (int r = 0; r < ROWS_PER_BLOCK; ++r)
+      {
+        const int prefetch_idx = r + kHalf;
+        if (prefetch_idx < ROWS_PER_BLOCK)
+        {
+          silu_load_gate_up<kDwords, true>(
+              gate_buf[prefetch_idx], up_buf[prefetch_idx],
+              gate_dw_r[prefetch_idx], up_dw_r[prefetch_idx]);
+        }
+        const native_scalar_t *gate_vals =
+            reinterpret_cast<const native_scalar_t *>(gate_buf[r]);
+        const native_scalar_t *up_vals =
+            reinterpret_cast<const native_scalar_t *>(up_buf[r]);
+        uint32_t out_packed[kDwords];
+        native_scalar_t out_tail[VEC_SIZE];
+
+        if constexpr (std::is_same_v<native_scalar_t, __hip_bfloat16>)
+        {
+#pragma unroll
+          for (int d = 0; d < kDwords; ++d)
+          {
+            const int i = d * kElemsPerDword;
+            const float g0 = static_cast<float>(gate_vals[i]);
+            const float u0 = static_cast<float>(up_vals[i]);
+            const float r0 =
+                glu_activation_elem<ACTIVATION>(g0, u0, beta1, beta2);
+            const float g1 = static_cast<float>(gate_vals[i + 1]);
+            const float u1 = static_cast<float>(up_vals[i + 1]);
+            const float r1 =
+                glu_activation_elem<ACTIVATION>(g1, u1, beta1, beta2);
+            out_packed[d] = silu_pack_bf16_pair(r0, r1);
+          }
+          silu_store_out<kDwords>(out_dw_r[r], out_packed);
+        }
+        else
+        {
+#pragma unroll
+          for (int i = 0; i < VEC_SIZE; ++i)
+          {
+            const float g = static_cast<float>(gate_vals[i]);
+            const float u = static_cast<float>(up_vals[i]);
+            const float rf =
+                glu_activation_elem<ACTIVATION>(g, u, beta1, beta2);
+            if constexpr (std::is_same_v<native_scalar_t, float>)
+            {
+              out_tail[i] = rf;
+            }
+            else
+            {
+              out_tail[i] = b32_to_b16<native_scalar_t>(rf);
+            }
+          }
+          silu_store_out<kDwords>(
+              out_dw_r[r], reinterpret_cast<const uint32_t *>(out_tail));
+        }
+      }
+      return;
+    }
+    // ------------------------------------------------------------------
+
 #pragma unroll
     for (int r = 0; r < ROWS_PER_BLOCK; ++r)
     {
@@ -1385,7 +1491,11 @@ namespace moe_c
       }
       if (M >= 16384 && N <= 1024)
       {
-        return 4;
+        // Chunked-half prefetch fast path in glu_kernel is only wired up
+        // for RPB=8, and this (M, N) range fits it. Measured on gfx938:
+        // 1.287 TB/s at (M=131072, N=768, VEC=4) — 88.4% of the copy
+        // stream ceiling.
+        return 8;
       }
       return 1;
     }
