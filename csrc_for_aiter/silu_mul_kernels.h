@@ -143,23 +143,25 @@ namespace moe_c
 
   __device__ __forceinline__ float situ_gate_part_beta4(float gate_f)
   {
+    // Folded identity:  gate(g) = 4*tanh(g/4)*sigmoid(g)
+    //                 = 4*sign(g) * (1-b) * s(g)  ,  b = exp(-|g|/2)
+    //   where s(g) = 1/((1+b)*(1+b^2))  for g>=0
+    //         s(g) = b^2 * 1/((1+b)*(1+b^2))  for g<0
+    // Cuts the two reciprocals of the naive form (one for tanh, one for
+    // sigmoid) down to a single rcp over the fused denominator; 
+    // numerically equivalent with the two-rcp implementation.
     const float ax = fabsf(gate_f);
 #if defined(USE_ROCM) || defined(__HIPCC__) || defined(__DTK_ARCH__)
     const float b = __builtin_amdgcn_exp2f(-0.7213475204444817f * ax);
     const float a = b * b;
-    const float rcp_sigmoid_den = __builtin_amdgcn_rcpf(1.0f + a);
-    const float sigmoid =
-        (gate_f >= 0.0f) ? rcp_sigmoid_den : a * rcp_sigmoid_den;
-    const float tanh_abs = (1.0f - b) * __builtin_amdgcn_rcpf(1.0f + b);
+    const float rcp_den = __builtin_amdgcn_rcpf((1.0f + b) * (1.0f + a));
 #else
     const float b = exp2f(-0.7213475204444817f * ax);
     const float a = b * b;
-    const float rcp_sigmoid_den = 1.0f / (1.0f + a);
-    const float sigmoid =
-        (gate_f >= 0.0f) ? rcp_sigmoid_den : a * rcp_sigmoid_den;
-    const float tanh_abs = (1.0f - b) / (1.0f + b);
+    const float rcp_den = 1.0f / ((1.0f + b) * (1.0f + a));
 #endif
-    return 4.0f * copysignf(tanh_abs, gate_f) * sigmoid;
+    const float num = (gate_f >= 0.0f) ? (1.0f - b) : (1.0f - b) * a;
+    return 4.0f * copysignf(num * rcp_den, gate_f);
   }
 
   __device__ __forceinline__ float situ_up_part_beta25(float up_f)
