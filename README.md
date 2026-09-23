@@ -34,7 +34,8 @@ operators such as Silu-and-mul.
 ```text
 .
 |-- csrc/              # Torch library registration and per-precision .cu entry files
-|-- csrc_for_aiter/    # Kernel implementation headers, configs, intrinsics, and utilities
+|-- csrc_for_aiter/    # Architecture-specific kernel headers, configs, intrinsics, and utilities
+|   `-- 936_938/       # Current gfx936/gfx938-compatible implementation
 |-- moe_utils/         # Python op wrappers, MOE dispatch, golden reference, shuffle, and helpers
 |-- moe_c_configs/     # moe_c configs organized by GPU architecture and quantization type
 |-- op_test/           # Local correctness tests migrated from the AITER MOE CI path
