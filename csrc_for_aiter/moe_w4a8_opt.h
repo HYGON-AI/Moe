@@ -1139,6 +1139,11 @@ __global__ void __launch_bounds__(512, 1) MOE_W4A8_I8_PERCHANNEL_MARLIN_HIP_NT_P
     constexpr int SIZE_K = 768;
     gemm_nt_marlin_prefill_2_w4a8<false, 0, 0, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, GROUP_N, GROUP_K, SIZE_K, Element, scalar_t, n_loop_num>(g_input, g_qweight, input_lds, qweight_lds, g_input_scale, g_weight_scale, size_m, A_reg, B_reg, C_reg, warp_id, size_k, size_k, stride_asm, stride_ask, stride_bse, stride_bsn, stride_bsk, top_k, sorted_token_ids, sorted_token_lens, expert_id, bidx, weight_dot_a_scale, b_scale, tmp, real_topk);
   }
+  else if (size_k == 640)
+  {
+    constexpr int SIZE_K = 640;
+    gemm_nt_marlin_prefill_2_w4a8<false, 0, 0, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, GROUP_N, GROUP_K, SIZE_K, Element, scalar_t, n_loop_num>(g_input, g_qweight, input_lds, qweight_lds, g_input_scale, g_weight_scale, size_m, A_reg, B_reg, C_reg, warp_id, size_k, size_k, stride_asm, stride_ask, stride_bse, stride_bsn, stride_bsk, top_k, sorted_token_ids, sorted_token_lens, expert_id, bidx, weight_dot_a_scale, b_scale, tmp, real_topk);
+  }
   else if (size_k == 512)
   {
     constexpr int SIZE_K = 512;
