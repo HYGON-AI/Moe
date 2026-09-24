@@ -34,7 +34,8 @@ DEFAULT_TOPK = 8
 DEFAULT_DTYPE = "bf16"
 DEFAULT_BUILD_DIR = os.environ.get("MOE_C_BUILD_DIR", "/tmp/moe_c_w4a8_tune_split_build_zxl")
 DEFAULT_OUT = None
-DEFAULT_MAX_NLOOP = 4
+DEFAULT_MAX_NLOOP = 5
+W4A8_MAX_NLOOP = 5
 DEFAULT_WARMUP = 5
 DEFAULT_ITERS = 30
 DEFAULT_TIMEOUT = 600
@@ -90,7 +91,8 @@ def generate_candidates(shape: Shape, max_nloop: int) -> List[Candidate]:
     candidates: List[Candidate] = []
     bm_values = (16, 32, 48, 64)
     bk_values = (64,)
-    n_loop_values = range(1, max(1, max_nloop) + 1)
+    w4a8_max_nloop = min(W4A8_MAX_NLOOP, max(1, max_nloop))
+    n_loop_values = range(1, w4a8_max_nloop + 1)
     original_gemm1_modes = {16: 16, 32: 53, 48: 290, 64: 160}
     original_gemm2_modes = {16: 32, 32: 86, 48: 118, 64: 166}
 
@@ -145,7 +147,7 @@ def generate_candidates(shape: Shape, max_nloop: int) -> List[Candidate]:
                 note="W4A8_GEMM1_N384_ALIAS",
             ))
 
-    supported_gemm2_k = {128, 192, 256, 384, 768, 1536, 3072}
+    supported_gemm2_k = {128, 192, 256, 384, 640, 768, 1536, 3072}
     if shape.n in supported_gemm2_k:
         for bm in bm_values:
             for bk in bk_values:
