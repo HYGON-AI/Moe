@@ -10,6 +10,93 @@
 
 template <
     typename scalar_t,
+    uint16_t WARP_NUM,
+    uint16_t BLOCK_SIZE_M,
+    uint16_t BLOCK_SIZE_N,
+    int N_LOOP_NUM>
+__forceinline__ __device__ void moe_w4a8_zero_remote_expert_output(
+    scalar_t *__restrict__ g_output,
+    const int32_t *__restrict__ sorted_token_ids,
+    uint32_t sorted_token_lens,
+    uint32_t bidx,
+    uint32_t size_m,
+    uint32_t size_n,
+    uint32_t top_k,
+    uint32_t output_offset)
+{
+  constexpr int N_thread = BLOCK_SIZE_N / 8;
+
+  vec_element_8<scalar_t> zero_element_8;
+#pragma unroll
+  for (int i = 0; i < 8; ++i)
+    zero_element_8.data[i] = 0;
+
+  int m_idx = threadIdx.x / N_thread;
+  const int n_idx = threadIdx.x % N_thread;
+  const uint64_t valid_route_count = static_cast<uint64_t>(size_m) * top_k;
+
+  for (; m_idx < BLOCK_SIZE_M; m_idx += (WARP_NUM * 64) / N_thread)
+  {
+    const uint32_t sorted_idx = std::min(
+        bidx * BLOCK_SIZE_M + m_idx,
+        static_cast<uint32_t>(sorted_token_lens - 1));
+    const int32_t flat_route_id = sorted_token_ids[sorted_idx];
+    if (flat_route_id < 0 || static_cast<uint64_t>(flat_route_id) >= valid_route_count)
+      continue;
+
+#pragma unroll
+    for (int n_loop = 0; n_loop < N_LOOP_NUM; ++n_loop)
+    {
+      const uint32_t local_col = n_loop * BLOCK_SIZE_N + n_idx * 8;
+      if (output_offset + local_col >= size_n)
+        continue;
+      *reinterpret_cast<vec_element_8<scalar_t> *>(
+          &g_output[static_cast<uint64_t>(flat_route_id) * size_n + local_col]) = zero_element_8;
+    }
+  }
+}
+
+template <
+    typename scalar_t,
+    uint16_t BLOCK_SIZE_N>
+__forceinline__ __device__ void moe_w4a8_zero_remote_expert_output_runtime(
+    scalar_t *__restrict__ output,
+    const int32_t *__restrict__ sorted_token_ids,
+    uint32_t sorted_token_lens,
+    uint32_t bidx,
+    uint32_t size_m,
+    uint32_t size_n,
+    uint32_t top_k,
+    uint32_t block_size_m,
+    uint32_t n_base,
+    uint32_t n_loop)
+{
+  const uint32_t tile_n = BLOCK_SIZE_N * n_loop;
+  const uint32_t tid = threadIdx.x;
+  const uint32_t lane_n = tid % 32;
+  const uint32_t lane_m = tid / 32;
+  const uint64_t valid_route_count = static_cast<uint64_t>(size_m) * top_k;
+
+  for (uint32_t n_inner = lane_n; n_inner < tile_n; n_inner += 32)
+  {
+    const uint32_t n = n_base + n_inner;
+    if (n >= size_n)
+      continue;
+    for (uint32_t m_idx = lane_m; m_idx < block_size_m; m_idx += 8)
+    {
+      const uint32_t sorted_idx = bidx * block_size_m + m_idx;
+      if (sorted_idx >= sorted_token_lens)
+        continue;
+      const int32_t flat_route_id = sorted_token_ids[sorted_idx];
+      if (flat_route_id < 0 || static_cast<uint64_t>(flat_route_id) >= valid_route_count)
+        continue;
+      output[static_cast<uint64_t>(flat_route_id) * size_n + n] = b32_to_b16<scalar_t>(0.0f);
+    }
+  }
+}
+
+template <
+    typename scalar_t,
     typename Element,
     uint16_t WARP_NUM,
     uint16_t BLOCK_SIZE_M,
@@ -65,29 +152,8 @@ __global__ void __launch_bounds__(512, 1) MOE_W4A8_I8_PERCHANNEL_MARLIN_HIP_NT_D
 
   if (expert_id == -1)
   { // EP算法处理 epxert_id为-1 写回0
-    const int tid = threadIdx.x;
-    constexpr int N_thread = BLOCK_SIZE_N / 8; // N方向需要的线程数 使用dwordx4即8个bf16
-
-    vec_element_8<scalar_t> zero_element_8;
-
-#pragma unroll
-    for (int i = 0; i < 8; ++i)
-      zero_element_8.data[i] = 0;
-
-    int m_idx = threadIdx.x / N_thread;
-    int n_idx = threadIdx.x % N_thread;
-    for (; m_idx < BLOCK_SIZE_M; m_idx += (WARP_NUM * 64) / N_thread)
-    {
-      const int32_t sorted_token_ids_element = sorted_token_ids[std::min(bidx * BLOCK_SIZE_M + m_idx, int(sorted_token_lens - 1))];
-      int token_ids = sorted_token_ids_element & 0x00FFFFFF;
-      int topk_ids = (sorted_token_ids_element & 0xFF000000) >> 24;
-      int token_index = token_ids * real_topk /* top_k */ + topk_ids;
-
-      if (topk_ids < real_topk)
-      {
-        *reinterpret_cast<vec_element_8<scalar_t> *>(&g_output[token_index * size_n + n_idx * 8]) = zero_element_8;
-      }
-    }
+    moe_w4a8_zero_remote_expert_output<scalar_t, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, 1>(
+        g_output, sorted_token_ids, sorted_token_lens, bidx, size_m, size_n, top_k, output_offset);
     return;
   }
 
@@ -307,28 +373,8 @@ __global__ void __launch_bounds__(512, 1) MOE_W4A8_I8_PERCHANNEL_MARLIN_HIP_NT_D
 
   if (expert_id == -1)
   { // EP算法处理 epxert_id为-1 写回0
-    const int tid = threadIdx.x;
-    constexpr int N_thread = BLOCK_SIZE_N / 8; // N方向需要的线程数 使用dwordx4即8个bf16
-    vec_element_8<scalar_t> zero_element_8;
-
-#pragma unroll
-    for (int i = 0; i < 8; ++i)
-      zero_element_8.data[i] = 0;
-
-    int m_idx = threadIdx.x / N_thread;
-    int n_idx = threadIdx.x % N_thread;
-    for (; m_idx < BLOCK_SIZE_M; m_idx += (WARP_NUM * 64) / N_thread)
-    {
-      const int32_t sorted_token_ids_element = sorted_token_ids[std::min(bidx * BLOCK_SIZE_M + m_idx, int(sorted_token_lens - 1))];
-      const int32_t token_ids = sorted_token_ids_element & 0x00FFFFFF;
-      const int32_t topk_ids = sorted_token_ids_element & 0xFF000000;
-      int token_index = token_ids * real_topk /* top_k */ + topk_ids;
-
-      if (topk_ids < real_topk)
-      {
-        *reinterpret_cast<vec_element_8<scalar_t> *>(&g_output[(token_index)*size_n + n_idx * 8]) = zero_element_8;
-      }
-    }
+    moe_w4a8_zero_remote_expert_output<scalar_t, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, n_loop_num>(
+        g_output, sorted_token_ids, sorted_token_lens, bidx, size_m, size_n, top_k, output_offset);
     return;
   }
 
@@ -576,28 +622,8 @@ __global__ void __launch_bounds__(512, 1) MOE_W4A8_I8_PERCHANNEL_MARLIN_HIP_NT_P
 
   if (expert_id == -1)
   { // EP算法处理 epxert_id为-1 写回0
-    const int tid = threadIdx.x;
-    constexpr int N_thread = BLOCK_SIZE_N / 8; // N方向需要的线程数 使用dwordx4即8个bf16
-    vec_element_8<scalar_t> zero_element_8;
-
-#pragma unroll
-    for (int i = 0; i < 8; ++i)
-      zero_element_8.data[i] = 0;
-
-    int m_idx = threadIdx.x / N_thread;
-    int n_idx = threadIdx.x % N_thread;
-    for (; m_idx < BLOCK_SIZE_M; m_idx += (WARP_NUM * 64) / N_thread)
-    {
-      const int32_t sorted_token_ids_element = sorted_token_ids[std::min(bidx * BLOCK_SIZE_M + m_idx, int(sorted_token_lens - 1))];
-      const int32_t token_ids = sorted_token_ids_element & 0x00FFFFFF;
-      const int32_t topk_ids = sorted_token_ids_element & 0xFF000000;
-      int token_index = token_ids * real_topk /* top_k */ + topk_ids;
-
-      if (topk_ids < real_topk)
-      {
-        *reinterpret_cast<vec_element_8<scalar_t> *>(&g_output[(token_index)*size_n + n_idx * 8]) = zero_element_8;
-      }
-    }
+    moe_w4a8_zero_remote_expert_output<scalar_t, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, n_loop_num>(
+        g_output, sorted_token_ids, sorted_token_lens, bidx, size_m, size_n, top_k, output_offset);
     return;
   }
 
@@ -800,28 +826,8 @@ __global__ void __launch_bounds__(512, 1) MOE_W4A8_I8_PERCHANNEL_MARLIN_HIP_NT_P
 
   if (expert_id == -1)
   { // EP算法处理 epxert_id为-1 写回0
-    const int tid = threadIdx.x;
-    constexpr int N_thread = BLOCK_SIZE_N / 8; // N方向需要的线程数 使用dwordx4即8个bf16
-    vec_element_8<scalar_t> zero_element_8;
-
-#pragma unroll
-    for (int i = 0; i < 8; ++i)
-      zero_element_8.data[i] = 0;
-
-    int m_idx = threadIdx.x / N_thread;
-    int n_idx = threadIdx.x % N_thread;
-    for (; m_idx < BLOCK_SIZE_M; m_idx += (WARP_NUM * 64) / N_thread)
-    {
-      const int32_t sorted_token_ids_element = sorted_token_ids[std::min(bidx * BLOCK_SIZE_M + m_idx, int(sorted_token_lens - 1))];
-      const int32_t token_ids = sorted_token_ids_element & 0x00FFFFFF;
-      const int32_t topk_ids = sorted_token_ids_element & 0xFF000000;
-      int token_index = token_ids * real_topk /* top_k */ + topk_ids;
-
-      if (topk_ids < real_topk)
-      {
-        *reinterpret_cast<vec_element_8<scalar_t> *>(&g_output[(token_index)*size_n + n_idx * 8]) = zero_element_8;
-      }
-    }
+    moe_w4a8_zero_remote_expert_output<scalar_t, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, n_loop_num>(
+        g_output, sorted_token_ids, sorted_token_lens, bidx, size_m, size_n, top_k, output_offset);
     return;
   }
 
@@ -1025,28 +1031,8 @@ __global__ void __launch_bounds__(512, 1) MOE_W4A8_I8_PERCHANNEL_MARLIN_HIP_NT_P
 
   if (expert_id == -1)
   { // EP算法处理 epxert_id为-1 写回0
-    const int tid = threadIdx.x;
-    constexpr int N_thread = BLOCK_SIZE_N / 8; // N方向需要的线程数 使用dwordx4即8个bf16
-    vec_element_8<scalar_t> zero_element_8;
-
-#pragma unroll
-    for (int i = 0; i < 8; ++i)
-      zero_element_8.data[i] = 0;
-
-    int m_idx = threadIdx.x / N_thread;
-    int n_idx = threadIdx.x % N_thread;
-    for (; m_idx < BLOCK_SIZE_M; m_idx += (WARP_NUM * 64) / N_thread)
-    {
-      const int32_t sorted_token_ids_element = sorted_token_ids[std::min(bidx * BLOCK_SIZE_M + m_idx, int(sorted_token_lens - 1))];
-      const int32_t token_ids = sorted_token_ids_element & 0x00FFFFFF;
-      const int32_t topk_ids = sorted_token_ids_element & 0xFF000000;
-      int token_index = token_ids * real_topk /* top_k */ + topk_ids;
-
-      if (topk_ids < real_topk)
-      {
-        *reinterpret_cast<vec_element_8<scalar_t> *>(&g_output[(token_index)*size_n + n_idx * 8]) = zero_element_8;
-      }
-    }
+    moe_w4a8_zero_remote_expert_output<scalar_t, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, n_loop_num>(
+        g_output, sorted_token_ids, sorted_token_lens, bidx, size_m, size_n, top_k, output_offset);
     return;
   }
 
@@ -1284,22 +1270,9 @@ __global__ void __launch_bounds__(256, 1) MOE_W4A8_I8_PERCHANNEL_MARLIN_HIP_NT_P
   const int32_t expert_id = expert_ids[bidx];
   if (expert_id < 0)
   {
-    for (uint32_t n_inner = lane_n; n_inner < tile_n; n_inner += 32)
-    {
-      const uint32_t n = n_base + n_inner;
-      if (n >= size_n)
-        continue;
-      for (uint32_t m_idx = lane_m; m_idx < block_size_m; m_idx += 8)
-      {
-        const uint32_t sorted_idx = bidx * block_size_m + m_idx;
-        if (sorted_idx >= sorted_token_lens)
-          continue;
-        const int32_t sorted_token_id = sorted_token_ids[sorted_idx];
-        if (sorted_token_id >= static_cast<int32_t>(size_m * top_k))
-          continue;
-        output[static_cast<uint64_t>(sorted_token_id) * size_n + n] = b32_to_b16<scalar_t>(0.0f);
-      }
-    }
+    moe_w4a8_zero_remote_expert_output_runtime<scalar_t, BLOCK_SIZE_N>(
+        output, sorted_token_ids, sorted_token_lens, bidx, size_m, size_n, top_k,
+        block_size_m, n_base, n_loop);
     return;
   }
 
