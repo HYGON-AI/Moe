@@ -50,7 +50,7 @@ template <bool Is_store_A,
           typename scalar_t,
           int SIZE_K,
           int N_LOOP_NUM = 1>
-__forceinline__ __device__ void gemm_nt_marlin_prefill_n160_fp8_bk64(
+__forceinline__ __device__ void gemm_nt_marlin_prefill_flat_route_fp8_bk64(
     const Element *input_ptr,
     const Element *weight_ptr,
     Element *A_lds,
@@ -482,7 +482,7 @@ template <bool Is_store_A,
           typename ElementAccum = int32_t,
           int SIZE_K,
           int N_LOOP_NUM = 4>
-__forceinline__ __device__ void gemm_nt_marlin_prefill_2_n160_fp8_bk64(
+__forceinline__ __device__ void gemm_nt_marlin_prefill_2_flat_route_fp8_bk64(
     const Element *input_ptr,
     const Element *weight_ptr,
     Element *A_lds,

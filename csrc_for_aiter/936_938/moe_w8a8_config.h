@@ -6,7 +6,10 @@
 
 #include <unordered_map>
 #include <functional>
-#define MOE_THRESHOLD 128
+
+#define MOE_W8A8_MODE(STAGE, SORTING, FAMILY, BM, PROFILE) \
+    ((STAGE) * 10000000 + (SORTING) * 1000000 + (FAMILY) * 100000 + \
+     ((BM) / 16) * 1000 + (PROFILE))
 
 template <typename T, typename T_hidden = bhalf_t>
 struct GemmParams
@@ -101,10 +104,10 @@ template <int BLOCK_SIZE_M, int BLOCK_SIZE_N, int BLOCK_SIZE_K, int WARP_M, int 
 void launch_moe_w8a8_second_stage_prefill(const GemmParams<T, T_hidden> &params);
 
 template <int BLOCK_SIZE_M, int BLOCK_SIZE_N, int BLOCK_SIZE_K, int WARP_M, int WARP_N, int WARP_K, int STAGES, int N_LOOP_NUM, typename T, typename T_hidden>
-void launch_moe_w8a8_prefill_up_int8_bk128_nloop(const GemmParams<T, T_hidden> &params);
+void launch_moe_w8a8_prefill_up_int8_bk64_nloop(const GemmParams<T, T_hidden> &params);
 
 template <int BLOCK_SIZE_M, int BLOCK_SIZE_N, int BLOCK_SIZE_K, int WARP_M, int WARP_N, int WARP_K, int STAGES, int N_LOOP_NUM, typename T, typename T_hidden>
-void launch_moe_w8a8_prefill_down_int8_bk128_nloop(const GemmParams<T, T_hidden> &params);
+void launch_moe_w8a8_prefill_down_int8_bk64_nloop(const GemmParams<T, T_hidden> &params);
 
 template <int BLOCK_SIZE_M, int BLOCK_SIZE_N, int BLOCK_SIZE_K, int WARP_M, int WARP_N, int WARP_K, int STAGES, typename T, typename T_hidden>
 void launch_moe_w8a8_first_stage_decode_fp8(const GemmParams<T, T_hidden> &params);
@@ -125,366 +128,305 @@ template <int BLOCK_SIZE_M, int BLOCK_SIZE_N, int BLOCK_SIZE_K, int WARP_M, int 
 void launch_moe_w8a8_second_stage_prefill_fp8_nloop(const GemmParams<T, T_hidden> &params);
 
 template <int BLOCK_SIZE_M, int BLOCK_SIZE_N, int BLOCK_SIZE_K, int WARP_M, int WARP_N, int WARP_K, int STAGES, int N_LOOP_NUM, typename T, typename T_hidden>
-void launch_moe_w8a8_prefill_up_fp8_bk128_nloop(const GemmParams<T, T_hidden> &params);
+void launch_moe_w8a8_prefill_up_fp8_bk64_nloop(const GemmParams<T, T_hidden> &params);
 
 template <int BLOCK_SIZE_M, int BLOCK_SIZE_N, int BLOCK_SIZE_K, int WARP_M, int WARP_N, int WARP_K, int STAGES, int N_LOOP_NUM, typename T, typename T_hidden>
-void launch_moe_w8a8_prefill_down_fp8_bk128_nloop(const GemmParams<T, T_hidden> &params);
+void launch_moe_w8a8_prefill_down_fp8_bk64_nloop(const GemmParams<T, T_hidden> &params);
 
 template <typename scalar_t>
 using KernelFunc = std::function<void(const GemmParams<char, scalar_t> &)>;
 
-template <typename scalar_t>
-static std::unordered_map<int, KernelFunc<scalar_t>> kernel_maps_gemm1_decode = {
+#define MOE_W8A8_INT8_PREFILL_UP_BK64_NLOOP_ENTRY(BM, N_LOOP_NUM) \
+    {MOE_W8A8_MODE(1, 0, 2, BM, 100 + (N_LOOP_NUM)), [](const GemmParams<char, scalar_t> &p) \
+     { launch_moe_w8a8_prefill_up_int8_bk64_nloop<BM, 128, 64, BM, 32, 64, 2, N_LOOP_NUM>(p); }}
 
-    {98, [](const GemmParams<char, scalar_t> &p)
+#define MOE_W8A8_INT8_PREFILL_UP_BK64_NLOOP12_ENTRIES(BM) \
+    MOE_W8A8_INT8_PREFILL_UP_BK64_NLOOP_ENTRY(BM, 1), \
+    MOE_W8A8_INT8_PREFILL_UP_BK64_NLOOP_ENTRY(BM, 2)
+
+#define MOE_W8A8_INT8_PREFILL_DOWN_BK64_NLOOP_ENTRY(BM, N_LOOP_NUM) \
+    {MOE_W8A8_MODE(2, 0, 2, BM, 100 + (N_LOOP_NUM)), [](const GemmParams<char, scalar_t> &p) \
+     { launch_moe_w8a8_prefill_down_int8_bk64_nloop<BM, 128, 64, BM, 32, 64, 2, N_LOOP_NUM>(p); }}
+
+#define MOE_W8A8_INT8_PREFILL_DOWN_BK64_NLOOP4_ENTRIES \
+    MOE_W8A8_INT8_PREFILL_DOWN_BK64_NLOOP_ENTRY(32, 4), \
+    MOE_W8A8_INT8_PREFILL_DOWN_BK64_NLOOP_ENTRY(48, 4), \
+    MOE_W8A8_INT8_PREFILL_DOWN_BK64_NLOOP_ENTRY(64, 4)
+
+#define MOE_W8A8_INT8_PREFILL_DOWN_BK64_NLOOP12_ENTRIES(BM) \
+    MOE_W8A8_INT8_PREFILL_DOWN_BK64_NLOOP_ENTRY(BM, 1), \
+    MOE_W8A8_INT8_PREFILL_DOWN_BK64_NLOOP_ENTRY(BM, 2)
+
+template <typename scalar_t>
+// These maps consume CK-sorting packed token metadata.  Keep the layout in
+// the name: a moe_align mode must never silently alias one of these entries.
+static std::unordered_map<int, KernelFunc<scalar_t>> kernel_maps_gemm1_decode_ck_sorting = {
+
+    {MOE_W8A8_MODE(1, 0, 0, 16, 101), [](const GemmParams<char, scalar_t> &p)
      { launch_moe_w8a8_first_stage_decode<16, 64, 1024, 16, 64, 128, 1>(p); }},
-    {121, [](const GemmParams<char, scalar_t> &p)
+    {MOE_W8A8_MODE(1, 0, 0, 16, 102), [](const GemmParams<char, scalar_t> &p)
      { launch_moe_w8a8_first_stage_decode<16, 16, 512, 16, 16, 128, 4>(p); }},
-    {122, [](const GemmParams<char, scalar_t> &p)
+    {MOE_W8A8_MODE(1, 0, 0, 16, 103), [](const GemmParams<char, scalar_t> &p)
      { launch_moe_w8a8_first_stage_decode<16, 16, 1024, 16, 16, 256, 4>(p); }},
 };
 
 template <typename scalar_t>
-static std::unordered_map<int, KernelFunc<scalar_t>> kernel_maps_gemm2_decode = {
-    {38, [](const GemmParams<char, scalar_t> &p)
+static std::unordered_map<int, KernelFunc<scalar_t>> kernel_maps_gemm2_decode_ck_sorting = {
+    {MOE_W8A8_MODE(2, 0, 0, 16, 101), [](const GemmParams<char, scalar_t> &p)
      { launch_moe_w8a8_second_stage_decode<16, 128, 64, 16, 32, 64, 2>(p); }},
-    {42, [](const GemmParams<char, scalar_t> &p)
+    {MOE_W8A8_MODE(2, 0, 0, 16, 102), [](const GemmParams<char, scalar_t> &p)
      { launch_moe_w8a8_second_stage_decode<16, 256, 64, 16, 64, 64, 2>(p); }},
-    {43, [](const GemmParams<char, scalar_t> &p)
+    {MOE_W8A8_MODE(2, 0, 0, 16, 103), [](const GemmParams<char, scalar_t> &p)
      { launch_moe_w8a8_second_stage_decode<16, 512, 64, 16, 64, 64, 2>(p); }},
-    {46, [](const GemmParams<char, scalar_t> &p)
+    {MOE_W8A8_MODE(2, 0, 0, 16, 104), [](const GemmParams<char, scalar_t> &p)
      { launch_moe_w8a8_second_stage_decode<16, 512, 64, 16, 128, 64, 2>(p); }},
 };
 
 template <typename scalar_t>
-static std::unordered_map<int, KernelFunc<scalar_t>> kernel_maps_gemm1_prefill = {
+static std::unordered_map<int, KernelFunc<scalar_t>> kernel_maps_gemm1_prefill_ck_sorting = {
 
-    {146, [](const GemmParams<char, scalar_t> &p)
+    {MOE_W8A8_MODE(1, 0, 1, 32, 201), [](const GemmParams<char, scalar_t> &p)
      { launch_moe_w8a8_first_stage_prefill<32, 128, 64, 32, 128, 64, 1>(p); }},
 
-    {159, [](const GemmParams<char, scalar_t> &p)
+    {MOE_W8A8_MODE(1, 0, 1, 32, 202), [](const GemmParams<char, scalar_t> &p)
      { launch_moe_w8a8_first_stage_prefill<32, 128, 64, 32, 128, 64, 2>(p); }},
-    {160, [](const GemmParams<char, scalar_t> &p)
+    {MOE_W8A8_MODE(1, 0, 1, 32, 203), [](const GemmParams<char, scalar_t> &p)
      { launch_moe_w8a8_first_stage_prefill<32, 256, 64, 32, 128, 64, 2>(p); }},
 
-    {183, [](const GemmParams<char, scalar_t> &p)
+    {MOE_W8A8_MODE(1, 0, 1, 32, 204), [](const GemmParams<char, scalar_t> &p)
      { launch_moe_w8a8_first_stage_prefill<32, 64, 128, 32, 64, 64, 1>(p); }},
 
-    {200321, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_prefill_up_int8_bk128_nloop<32, 128, 64, 32, 32, 64, 2, 1>(p); }},
-    {200322, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_prefill_up_int8_bk128_nloop<32, 128, 64, 32, 32, 64, 2, 2>(p); }},
-    {200481, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_prefill_up_int8_bk128_nloop<48, 128, 64, 48, 32, 64, 2, 1>(p); }},
-    {200482, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_prefill_up_int8_bk128_nloop<48, 128, 64, 48, 32, 64, 2, 2>(p); }},
-    {200641, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_prefill_up_int8_bk128_nloop<64, 128, 64, 64, 32, 64, 2, 1>(p); }},
-    {200642, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_prefill_up_int8_bk128_nloop<64, 128, 64, 64, 32, 64, 2, 2>(p); }},
+    MOE_W8A8_INT8_PREFILL_UP_BK64_NLOOP12_ENTRIES(32),
+    MOE_W8A8_INT8_PREFILL_UP_BK64_NLOOP12_ENTRIES(48),
+    MOE_W8A8_INT8_PREFILL_UP_BK64_NLOOP12_ENTRIES(64),
 
 };
 
 template <typename scalar_t>
-static std::unordered_map<int, KernelFunc<scalar_t>> kernel_maps_gemm2_prefill = {
-    {86, [](const GemmParams<char, scalar_t> &p)
+static std::unordered_map<int, KernelFunc<scalar_t>> kernel_maps_gemm2_prefill_ck_sorting = {
+    {MOE_W8A8_MODE(2, 0, 1, 32, 201), [](const GemmParams<char, scalar_t> &p)
      { launch_moe_w8a8_second_stage_prefill<32, 128, 64, 32, 32, 64, 2>(p); }},
-    {166, [](const GemmParams<char, scalar_t> &p)
+    {MOE_W8A8_MODE(2, 0, 1, 64, 202), [](const GemmParams<char, scalar_t> &p)
      { launch_moe_w8a8_second_stage_prefill<64, 128, 64, 64, 32, 64, 2>(p); }},
 
-    {200324, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_prefill_down_int8_bk128_nloop<32, 128, 64, 32, 32, 64, 2, 4>(p); }},
-    {200484, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_prefill_down_int8_bk128_nloop<48, 128, 64, 48, 32, 64, 2, 4>(p); }},
-    {200644, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_prefill_down_int8_bk128_nloop<64, 128, 64, 64, 32, 64, 2, 4>(p); }},
-    {201321, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_prefill_down_int8_bk128_nloop<32, 128, 64, 32, 32, 64, 2, 1>(p); }},
-    {201322, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_prefill_down_int8_bk128_nloop<32, 128, 64, 32, 32, 64, 2, 2>(p); }},
-    {201481, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_prefill_down_int8_bk128_nloop<48, 128, 64, 48, 32, 64, 2, 1>(p); }},
-    {201482, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_prefill_down_int8_bk128_nloop<48, 128, 64, 48, 32, 64, 2, 2>(p); }},
-    {201641, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_prefill_down_int8_bk128_nloop<64, 128, 64, 64, 32, 64, 2, 1>(p); }},
-    {201642, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_prefill_down_int8_bk128_nloop<64, 128, 64, 64, 32, 64, 2, 2>(p); }},
+    MOE_W8A8_INT8_PREFILL_DOWN_BK64_NLOOP4_ENTRIES,
+    MOE_W8A8_INT8_PREFILL_DOWN_BK64_NLOOP12_ENTRIES(32),
+    MOE_W8A8_INT8_PREFILL_DOWN_BK64_NLOOP12_ENTRIES(48),
+    MOE_W8A8_INT8_PREFILL_DOWN_BK64_NLOOP12_ENTRIES(64),
 
 };
 
 template <typename scalar_t>
-static std::unordered_map<int, KernelFunc<scalar_t>> kernel_maps_gemm1_decode_fp8 = {
-    {60098, [](const GemmParams<char, scalar_t> &p)
+static std::unordered_map<int, KernelFunc<scalar_t>> kernel_maps_gemm1_decode_fp8_ck_sorting = {
+    {MOE_W8A8_MODE(1, 0, 0, 16, 101), [](const GemmParams<char, scalar_t> &p)
      { launch_moe_w8a8_first_stage_decode_fp8<16, 64, 1024, 16, 64, 128, 1>(p); }},
-    {60121, [](const GemmParams<char, scalar_t> &p)
+    {MOE_W8A8_MODE(1, 0, 0, 16, 102), [](const GemmParams<char, scalar_t> &p)
      { launch_moe_w8a8_first_stage_decode_fp8<16, 16, 512, 16, 16, 128, 4>(p); }},
+    {MOE_W8A8_MODE(1, 0, 0, 16, 103), [](const GemmParams<char, scalar_t> &p)
+     { launch_moe_w8a8_first_stage_decode_fp8<16, 64, 256, 16, 64, 128, 2>(p); }},
+    {MOE_W8A8_MODE(1, 0, 0, 32, 101), [](const GemmParams<char, scalar_t> &p)
+     { launch_moe_w8a8_first_stage_decode_fp8<32, 128, 64, 32, 32, 64, 2>(p); }},
 };
 
 template <typename scalar_t>
-static std::unordered_map<int, KernelFunc<scalar_t>> kernel_maps_gemm2_decode_fp8 = {
-    {60038, [](const GemmParams<char, scalar_t> &p)
+static std::unordered_map<int, KernelFunc<scalar_t>> kernel_maps_gemm2_decode_fp8_ck_sorting = {
+    {MOE_W8A8_MODE(2, 0, 0, 16, 101), [](const GemmParams<char, scalar_t> &p)
      { launch_moe_w8a8_second_stage_decode_fp8<16, 128, 64, 16, 32, 64, 2>(p); }},
-    {60042, [](const GemmParams<char, scalar_t> &p)
+    {MOE_W8A8_MODE(2, 0, 0, 16, 102), [](const GemmParams<char, scalar_t> &p)
      { launch_moe_w8a8_second_stage_decode_fp8<16, 256, 64, 16, 64, 64, 2>(p); }},
-    {60043, [](const GemmParams<char, scalar_t> &p)
+    {MOE_W8A8_MODE(2, 0, 0, 16, 103), [](const GemmParams<char, scalar_t> &p)
      { launch_moe_w8a8_second_stage_decode_fp8<16, 512, 64, 16, 64, 64, 2>(p); }},
-    {60046, [](const GemmParams<char, scalar_t> &p)
+    {MOE_W8A8_MODE(2, 0, 0, 16, 104), [](const GemmParams<char, scalar_t> &p)
      { launch_moe_w8a8_second_stage_decode_fp8<16, 512, 64, 16, 128, 64, 2>(p); }},
+    {MOE_W8A8_MODE(2, 0, 0, 32, 101), [](const GemmParams<char, scalar_t> &p)
+     { launch_moe_w8a8_second_stage_decode_fp8<32, 128, 64, 32, 32, 64, 2>(p); }},
 };
 
 template <typename scalar_t>
-static std::unordered_map<int, KernelFunc<scalar_t>> kernel_maps_gemm1_prefill_fp8 = {
-    {80322, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_fp8_nloop<32, 128, 64, 32, 32, 64, 2, 2>(p); }},
-    {80642, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_fp8_nloop<64, 128, 64, 64, 32, 64, 2, 2>(p); }},
-    {80804, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_fp8_nloop<80, 128, 64, 80, 32, 64, 2, 4>(p); }},
-    {80964, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_fp8_nloop<96, 128, 64, 96, 32, 64, 2, 4>(p); }},
-    {81282, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_fp8_nloop<128, 128, 64, 128, 32, 64, 2, 2>(p); }},
-    {80321, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_fp8_nloop<32, 128, 64, 32, 32, 64, 2, 1>(p); }},
-    {80325, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_fp8_nloop<32, 128, 64, 32, 32, 64, 2, 5>(p); }},
-    {80481, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_fp8_nloop<48, 128, 64, 48, 32, 64, 2, 1>(p); }},
-    {80482, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_fp8_nloop<48, 128, 64, 48, 32, 64, 2, 2>(p); }},
-    {80485, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_fp8_nloop<48, 128, 64, 48, 32, 64, 2, 5>(p); }},
-    {80641, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_fp8_nloop<64, 128, 64, 64, 32, 64, 2, 1>(p); }},
-    {80645, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_fp8_nloop<64, 128, 64, 64, 32, 64, 2, 5>(p); }},
-    {80801, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_fp8_nloop<80, 128, 64, 80, 32, 64, 2, 1>(p); }},
-    {80802, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_fp8_nloop<80, 128, 64, 80, 32, 64, 2, 2>(p); }},
-    {80805, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_fp8_nloop<80, 128, 64, 80, 32, 64, 2, 5>(p); }},
-    {80961, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_fp8_nloop<96, 128, 64, 96, 32, 64, 2, 1>(p); }},
-    {80962, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_fp8_nloop<96, 128, 64, 96, 32, 64, 2, 2>(p); }},
-    {80965, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_fp8_nloop<96, 128, 64, 96, 32, 64, 2, 5>(p); }},
-    {81281, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_fp8_nloop<128, 128, 64, 128, 32, 64, 2, 1>(p); }},
-    {81285, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_fp8_nloop<128, 128, 64, 128, 32, 64, 2, 5>(p); }},
-    {100322, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_prefill_up_fp8_bk128_nloop<32, 128, 64, 32, 32, 64, 2, 2>(p); }},
-    {100482, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_prefill_up_fp8_bk128_nloop<48, 128, 64, 48, 32, 64, 2, 2>(p); }},
-    {100642, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_prefill_up_fp8_bk128_nloop<64, 128, 64, 64, 32, 64, 2, 2>(p); }},
-    {100321, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_prefill_up_fp8_bk128_nloop<32, 128, 64, 32, 32, 64, 2, 1>(p); }},
-    {100325, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_prefill_up_fp8_bk128_nloop<32, 128, 64, 32, 32, 64, 2, 5>(p); }},
-    {100481, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_prefill_up_fp8_bk128_nloop<48, 128, 64, 48, 32, 64, 2, 1>(p); }},
-    {100485, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_prefill_up_fp8_bk128_nloop<48, 128, 64, 48, 32, 64, 2, 5>(p); }},
-    {100641, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_prefill_up_fp8_bk128_nloop<64, 128, 64, 64, 32, 64, 2, 1>(p); }},
-    {100645, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_prefill_up_fp8_bk128_nloop<64, 128, 64, 64, 32, 64, 2, 5>(p); }},
-    {146, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_fp8<32, 128, 64, 32, 128, 64, 1>(p); }},
-    {71146, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_fp8<32, 128, 64, 32, 128, 64, 1>(p); }},
-    {159, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_fp8<32, 128, 64, 32, 64, 64, 2>(p); }},
-    {71159, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_fp8<32, 128, 64, 32, 64, 64, 2>(p); }},
-    {160, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_fp8<32, 256, 64, 32, 128, 64, 2>(p); }},
-    {71160, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_fp8<32, 256, 64, 32, 128, 64, 2>(p); }},
-    {162, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_fp8<48, 128, 64, 48, 32, 64, 2>(p); }},
-    {165, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_fp8<80, 128, 64, 80, 32, 64, 2>(p); }},
-    {166, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_fp8<96, 128, 64, 96, 32, 64, 2>(p); }},
-    {183, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_fp8<32, 64, 128, 32, 64, 64, 1>(p); }},
-    {71183, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_fp8<32, 64, 128, 32, 64, 64, 1>(p); }},
+static std::unordered_map<int, KernelFunc<scalar_t>> kernel_maps_gemm1_prefill_fp8_moe_align = {
+        {MOE_W8A8_MODE(1, 1, 1, 32, 102), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_first_stage_prefill_fp8_nloop<32, 128, 64, 32, 32, 64, 2, 2>(p); }},
+
+        {MOE_W8A8_MODE(1, 1, 1, 64, 102), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_first_stage_prefill_fp8_nloop<64, 128, 64, 64, 32, 64, 2, 2>(p); }},
+
+        {MOE_W8A8_MODE(1, 1, 1, 80, 104), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_first_stage_prefill_fp8_nloop<80, 128, 64, 80, 32, 64, 2, 4>(p); }},
+
+        {MOE_W8A8_MODE(1, 1, 1, 96, 104), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_first_stage_prefill_fp8_nloop<96, 128, 64, 96, 32, 64, 2, 4>(p); }},
+
+        {MOE_W8A8_MODE(1, 1, 1, 128, 102), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_first_stage_prefill_fp8_nloop<128, 128, 64, 128, 32, 64, 2, 2>(p); }},
+
+        {MOE_W8A8_MODE(1, 1, 1, 32, 101), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_first_stage_prefill_fp8_nloop<32, 128, 64, 32, 32, 64, 2, 1>(p); }},
+
+        {MOE_W8A8_MODE(1, 1, 1, 32, 105), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_first_stage_prefill_fp8_nloop<32, 128, 64, 32, 32, 64, 2, 5>(p); }},
+
+        {MOE_W8A8_MODE(1, 1, 1, 48, 101), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_first_stage_prefill_fp8_nloop<48, 128, 64, 48, 32, 64, 2, 1>(p); }},
+
+        {MOE_W8A8_MODE(1, 1, 1, 48, 102), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_first_stage_prefill_fp8_nloop<48, 128, 64, 48, 32, 64, 2, 2>(p); }},
+
+        {MOE_W8A8_MODE(1, 1, 1, 48, 105), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_first_stage_prefill_fp8_nloop<48, 128, 64, 48, 32, 64, 2, 5>(p); }},
+
+        {MOE_W8A8_MODE(1, 1, 1, 64, 101), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_first_stage_prefill_fp8_nloop<64, 128, 64, 64, 32, 64, 2, 1>(p); }},
+
+        {MOE_W8A8_MODE(1, 1, 1, 64, 105), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_first_stage_prefill_fp8_nloop<64, 128, 64, 64, 32, 64, 2, 5>(p); }},
+
+        {MOE_W8A8_MODE(1, 1, 1, 80, 101), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_first_stage_prefill_fp8_nloop<80, 128, 64, 80, 32, 64, 2, 1>(p); }},
+
+        {MOE_W8A8_MODE(1, 1, 1, 80, 102), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_first_stage_prefill_fp8_nloop<80, 128, 64, 80, 32, 64, 2, 2>(p); }},
+
+        {MOE_W8A8_MODE(1, 1, 1, 80, 105), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_first_stage_prefill_fp8_nloop<80, 128, 64, 80, 32, 64, 2, 5>(p); }},
+
+        {MOE_W8A8_MODE(1, 1, 1, 96, 101), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_first_stage_prefill_fp8_nloop<96, 128, 64, 96, 32, 64, 2, 1>(p); }},
+
+        {MOE_W8A8_MODE(1, 1, 1, 96, 102), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_first_stage_prefill_fp8_nloop<96, 128, 64, 96, 32, 64, 2, 2>(p); }},
+
+        {MOE_W8A8_MODE(1, 1, 1, 96, 105), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_first_stage_prefill_fp8_nloop<96, 128, 64, 96, 32, 64, 2, 5>(p); }},
+
+        {MOE_W8A8_MODE(1, 1, 1, 128, 101), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_first_stage_prefill_fp8_nloop<128, 128, 64, 128, 32, 64, 2, 1>(p); }},
+
+        {MOE_W8A8_MODE(1, 1, 1, 128, 105), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_first_stage_prefill_fp8_nloop<128, 128, 64, 128, 32, 64, 2, 5>(p); }},
 };
 
 template <typename scalar_t>
-static std::unordered_map<int, KernelFunc<scalar_t>> kernel_maps_gemm2_prefill_fp8 = {
-    {80324, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_second_stage_prefill_fp8_nloop<32, 128, 64, 32, 32, 64, 2, 4>(p); }},
-    {80642, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_second_stage_prefill_fp8_nloop<64, 128, 64, 64, 32, 64, 2, 2>(p); }},
-    {80804, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_second_stage_prefill_fp8_nloop<80, 128, 64, 80, 32, 64, 2, 4>(p); }},
-    {80964, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_second_stage_prefill_fp8_nloop<96, 128, 64, 96, 32, 64, 2, 4>(p); }},
-    {81282, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_second_stage_prefill_fp8_nloop<128, 128, 64, 128, 32, 64, 2, 2>(p); }},
-    {80321, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_second_stage_prefill_fp8_nloop<32, 128, 64, 32, 32, 64, 2, 1>(p); }},
-    {80322, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_second_stage_prefill_fp8_nloop<32, 128, 64, 32, 32, 64, 2, 2>(p); }},
-    {80481, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_second_stage_prefill_fp8_nloop<48, 128, 64, 48, 32, 64, 2, 1>(p); }},
-    {80482, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_second_stage_prefill_fp8_nloop<48, 128, 64, 48, 32, 64, 2, 2>(p); }},
-    {80484, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_second_stage_prefill_fp8_nloop<48, 128, 64, 48, 32, 64, 2, 4>(p); }},
-    {80641, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_second_stage_prefill_fp8_nloop<64, 128, 64, 64, 32, 64, 2, 1>(p); }},
-    {80644, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_second_stage_prefill_fp8_nloop<64, 128, 64, 64, 32, 64, 2, 4>(p); }},
-    {80801, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_second_stage_prefill_fp8_nloop<80, 128, 64, 80, 32, 64, 2, 1>(p); }},
-    {80802, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_second_stage_prefill_fp8_nloop<80, 128, 64, 80, 32, 64, 2, 2>(p); }},
-    {80961, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_second_stage_prefill_fp8_nloop<96, 128, 64, 96, 32, 64, 2, 1>(p); }},
-    {80962, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_second_stage_prefill_fp8_nloop<96, 128, 64, 96, 32, 64, 2, 2>(p); }},
-    {81281, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_second_stage_prefill_fp8_nloop<128, 128, 64, 128, 32, 64, 2, 1>(p); }},
-    {81284, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_second_stage_prefill_fp8_nloop<128, 128, 64, 128, 32, 64, 2, 4>(p); }},
-    {100324, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_prefill_down_fp8_bk128_nloop<32, 128, 64, 32, 32, 64, 2, 4>(p); }},
-    {100484, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_prefill_down_fp8_bk128_nloop<48, 128, 64, 48, 32, 64, 2, 4>(p); }},
-    {100644, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_prefill_down_fp8_bk128_nloop<64, 128, 64, 64, 32, 64, 2, 4>(p); }},
-    {100321, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_prefill_down_fp8_bk128_nloop<32, 128, 64, 32, 32, 64, 2, 1>(p); }},
-    {100322, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_prefill_down_fp8_bk128_nloop<32, 128, 64, 32, 32, 64, 2, 2>(p); }},
-    {100481, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_prefill_down_fp8_bk128_nloop<48, 128, 64, 48, 32, 64, 2, 1>(p); }},
-    {100482, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_prefill_down_fp8_bk128_nloop<48, 128, 64, 48, 32, 64, 2, 2>(p); }},
-    {100641, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_prefill_down_fp8_bk128_nloop<64, 128, 64, 64, 32, 64, 2, 1>(p); }},
-    {100642, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_prefill_down_fp8_bk128_nloop<64, 128, 64, 64, 32, 64, 2, 2>(p); }},
-    {86, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_second_stage_prefill_fp8<96, 128, 64, 96, 32, 64, 2>(p); }},
-    {71086, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_second_stage_prefill_fp8<96, 128, 64, 96, 32, 64, 2>(p); }},
-    {165, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_second_stage_prefill_fp8<48, 128, 64, 48, 32, 64, 2>(p); }},
-    {168, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_second_stage_prefill_fp8<80, 128, 64, 80, 32, 64, 2>(p); }},
-    {71168, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_second_stage_prefill_fp8<80, 128, 64, 80, 32, 64, 2>(p); }},
-    {169, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_second_stage_prefill_fp8<96, 128, 64, 96, 32, 64, 2>(p); }},
-};
+static std::unordered_map<int, KernelFunc<scalar_t>> kernel_maps_gemm1_prefill_fp8_ck_sorting = {
+        {MOE_W8A8_MODE(1, 0, 2, 32, 102), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_prefill_up_fp8_bk64_nloop<32, 128, 64, 32, 32, 64, 2, 2>(p); }},
 
-template <int BLOCK_SIZE_M, int BLOCK_SIZE_N, int BLOCK_SIZE_K, int WARP_M, int WARP_N, int WARP_K, int STAGES, typename T, typename T_hidden>
-void launch_moe_w8a8_first_stage_decode_n160_fp8(const GemmParams<T, T_hidden> &params);
+        {MOE_W8A8_MODE(1, 0, 2, 48, 102), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_prefill_up_fp8_bk64_nloop<48, 128, 64, 48, 32, 64, 2, 2>(p); }},
 
-template <int BLOCK_SIZE_M, int BLOCK_SIZE_N, int BLOCK_SIZE_K, int WARP_M, int WARP_N, int WARP_K, int STAGES, typename T, typename T_hidden>
-void launch_moe_w8a8_second_stage_decode_n160_fp8(const GemmParams<T, T_hidden> &params);
+        {MOE_W8A8_MODE(1, 0, 2, 64, 102), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_prefill_up_fp8_bk64_nloop<64, 128, 64, 64, 32, 64, 2, 2>(p); }},
 
-template <int BLOCK_SIZE_M, int BLOCK_SIZE_N, int BLOCK_SIZE_K, int WARP_M, int WARP_N, int WARP_K, int STAGES, typename T, typename T_hidden>
-void launch_moe_w8a8_first_stage_prefill_n160_fp8(const GemmParams<T, T_hidden> &params);
+        {MOE_W8A8_MODE(1, 0, 2, 32, 101), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_prefill_up_fp8_bk64_nloop<32, 128, 64, 32, 32, 64, 2, 1>(p); }},
 
-template <int BLOCK_SIZE_M, int BLOCK_SIZE_N, int BLOCK_SIZE_K, int WARP_M, int WARP_N, int WARP_K, int STAGES, typename T, typename T_hidden>
-void launch_moe_w8a8_second_stage_prefill_n160_fp8(const GemmParams<T, T_hidden> &params);
+        {MOE_W8A8_MODE(1, 0, 2, 32, 105), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_prefill_up_fp8_bk64_nloop<32, 128, 64, 32, 32, 64, 2, 5>(p); }},
 
-template <typename scalar_t>
-static std::unordered_map<int, KernelFunc<scalar_t>> kernel_maps_gemm1_decode_n160_fp8 = {
-    {60062, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_decode_n160_fp8<16, 32, 512, 16, 32, 64, 2>(p); }},
-    {60069, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_decode_n160_fp8<16, 128, 256, 16, 128, 64, 2>(p); }},
-    {60072, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_decode_n160_fp8<16, 16, 128, 16, 16, 64, 4>(p); }},
-    {60075, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_decode_n160_fp8<16, 32, 64, 16, 32, 64, 4>(p); }},
-    {60077, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_decode_n160_fp8<16, 32, 256, 16, 32, 64, 4>(p); }},
-    {60081, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_decode_n160_fp8<16, 64, 256, 16, 64, 64, 4>(p); }},
-    {60092, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_decode_n160_fp8<16, 32, 256, 16, 32, 128, 1>(p); }},
-    {60098, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_decode_n160_fp8<16, 64, 1024, 16, 64, 128, 1>(p); }},
-    {60121, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_decode_n160_fp8<16, 16, 512, 16, 16, 128, 4>(p); }},
-    {60125, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_decode_n160_fp8<16, 32, 512, 16, 32, 128, 4>(p); }},
+        {MOE_W8A8_MODE(1, 0, 2, 48, 101), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_prefill_up_fp8_bk64_nloop<48, 128, 64, 48, 32, 64, 2, 1>(p); }},
+
+        {MOE_W8A8_MODE(1, 0, 2, 48, 105), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_prefill_up_fp8_bk64_nloop<48, 128, 64, 48, 32, 64, 2, 5>(p); }},
+
+        {MOE_W8A8_MODE(1, 0, 2, 64, 101), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_prefill_up_fp8_bk64_nloop<64, 128, 64, 64, 32, 64, 2, 1>(p); }},
+
+        {MOE_W8A8_MODE(1, 0, 2, 64, 105), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_prefill_up_fp8_bk64_nloop<64, 128, 64, 64, 32, 64, 2, 5>(p); }},
 };
 
 template <typename scalar_t>
-static std::unordered_map<int, KernelFunc<scalar_t>> kernel_maps_gemm2_decode_n160_fp8 = {
-    {60038, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_second_stage_decode_n160_fp8<16, 128, 64, 16, 32, 64, 2>(p); }},
-    {60039, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_second_stage_decode_n160_fp8<16, 256, 64, 16, 32, 64, 2>(p); }},
-    {60042, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_second_stage_decode_n160_fp8<16, 256, 64, 16, 64, 64, 2>(p); }},
-    {60043, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_second_stage_decode_n160_fp8<16, 512, 64, 16, 64, 64, 2>(p); }},
-    {60046, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_second_stage_decode_n160_fp8<16, 512, 64, 16, 128, 64, 2>(p); }},
+static std::unordered_map<int, KernelFunc<scalar_t>> kernel_maps_gemm2_prefill_fp8_moe_align = {
+        {MOE_W8A8_MODE(2, 1, 1, 32, 104), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_second_stage_prefill_fp8_nloop<32, 128, 64, 32, 32, 64, 2, 4>(p); }},
+
+        {MOE_W8A8_MODE(2, 1, 1, 64, 102), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_second_stage_prefill_fp8_nloop<64, 128, 64, 64, 32, 64, 2, 2>(p); }},
+
+        {MOE_W8A8_MODE(2, 1, 1, 80, 104), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_second_stage_prefill_fp8_nloop<80, 128, 64, 80, 32, 64, 2, 4>(p); }},
+
+        {MOE_W8A8_MODE(2, 1, 1, 96, 104), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_second_stage_prefill_fp8_nloop<96, 128, 64, 96, 32, 64, 2, 4>(p); }},
+
+        {MOE_W8A8_MODE(2, 1, 1, 128, 102), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_second_stage_prefill_fp8_nloop<128, 128, 64, 128, 32, 64, 2, 2>(p); }},
+
+        {MOE_W8A8_MODE(2, 1, 1, 32, 101), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_second_stage_prefill_fp8_nloop<32, 128, 64, 32, 32, 64, 2, 1>(p); }},
+
+        {MOE_W8A8_MODE(2, 1, 1, 32, 102), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_second_stage_prefill_fp8_nloop<32, 128, 64, 32, 32, 64, 2, 2>(p); }},
+
+        {MOE_W8A8_MODE(2, 1, 1, 48, 101), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_second_stage_prefill_fp8_nloop<48, 128, 64, 48, 32, 64, 2, 1>(p); }},
+
+        {MOE_W8A8_MODE(2, 1, 1, 48, 102), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_second_stage_prefill_fp8_nloop<48, 128, 64, 48, 32, 64, 2, 2>(p); }},
+
+        {MOE_W8A8_MODE(2, 1, 1, 48, 104), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_second_stage_prefill_fp8_nloop<48, 128, 64, 48, 32, 64, 2, 4>(p); }},
+
+        {MOE_W8A8_MODE(2, 1, 1, 64, 101), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_second_stage_prefill_fp8_nloop<64, 128, 64, 64, 32, 64, 2, 1>(p); }},
+
+        {MOE_W8A8_MODE(2, 1, 1, 64, 104), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_second_stage_prefill_fp8_nloop<64, 128, 64, 64, 32, 64, 2, 4>(p); }},
+
+        {MOE_W8A8_MODE(2, 1, 1, 80, 101), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_second_stage_prefill_fp8_nloop<80, 128, 64, 80, 32, 64, 2, 1>(p); }},
+
+        {MOE_W8A8_MODE(2, 1, 1, 80, 102), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_second_stage_prefill_fp8_nloop<80, 128, 64, 80, 32, 64, 2, 2>(p); }},
+
+        {MOE_W8A8_MODE(2, 1, 1, 96, 101), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_second_stage_prefill_fp8_nloop<96, 128, 64, 96, 32, 64, 2, 1>(p); }},
+
+        {MOE_W8A8_MODE(2, 1, 1, 96, 102), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_second_stage_prefill_fp8_nloop<96, 128, 64, 96, 32, 64, 2, 2>(p); }},
+
+        {MOE_W8A8_MODE(2, 1, 1, 128, 101), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_second_stage_prefill_fp8_nloop<128, 128, 64, 128, 32, 64, 2, 1>(p); }},
+
+        {MOE_W8A8_MODE(2, 1, 1, 128, 104), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_second_stage_prefill_fp8_nloop<128, 128, 64, 128, 32, 64, 2, 4>(p); }},
 };
 
 template <typename scalar_t>
-static std::unordered_map<int, KernelFunc<scalar_t>> kernel_maps_gemm1_prefill_n160_fp8 = {
-    {146, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_n160_fp8<32, 128, 64, 32, 128, 64, 1>(p); }},
-    {159, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_n160_fp8<32, 128, 64, 32, 32, 64, 2>(p); }},
-    {70159, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_n160_fp8<32, 128, 64, 32, 32, 64, 2>(p); }},
-    {160, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_n160_fp8<32, 256, 64, 32, 128, 64, 2>(p); }},
-    {70160, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_n160_fp8<32, 256, 64, 32, 128, 64, 2>(p); }},
-    {162, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_n160_fp8<48, 128, 64, 48, 32, 64, 2>(p); }},
-    {70162, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_n160_fp8<48, 128, 64, 48, 32, 64, 2>(p); }},
-    {165, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_n160_fp8<80, 128, 64, 80, 32, 64, 2>(p); }},
-    {70165, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_n160_fp8<80, 128, 64, 80, 32, 64, 2>(p); }},
-    {166, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_n160_fp8<96, 128, 64, 96, 32, 64, 2>(p); }},
-    {70166, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_n160_fp8<96, 128, 64, 96, 32, 64, 2>(p); }},
-    {183, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_n160_fp8<32, 64, 128, 32, 64, 64, 1>(p); }},
-    {70183, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_first_stage_prefill_n160_fp8<32, 64, 128, 32, 64, 64, 1>(p); }},
+static std::unordered_map<int, KernelFunc<scalar_t>> kernel_maps_gemm2_prefill_fp8_ck_sorting = {
+        {MOE_W8A8_MODE(2, 0, 2, 32, 104), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_prefill_down_fp8_bk64_nloop<32, 128, 64, 32, 32, 64, 2, 4>(p); }},
+
+        {MOE_W8A8_MODE(2, 0, 2, 48, 104), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_prefill_down_fp8_bk64_nloop<48, 128, 64, 48, 32, 64, 2, 4>(p); }},
+
+        {MOE_W8A8_MODE(2, 0, 2, 64, 104), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_prefill_down_fp8_bk64_nloop<64, 128, 64, 64, 32, 64, 2, 4>(p); }},
+
+        {MOE_W8A8_MODE(2, 0, 2, 32, 101), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_prefill_down_fp8_bk64_nloop<32, 128, 64, 32, 32, 64, 2, 1>(p); }},
+
+        {MOE_W8A8_MODE(2, 0, 2, 32, 102), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_prefill_down_fp8_bk64_nloop<32, 128, 64, 32, 32, 64, 2, 2>(p); }},
+
+        {MOE_W8A8_MODE(2, 0, 2, 48, 101), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_prefill_down_fp8_bk64_nloop<48, 128, 64, 48, 32, 64, 2, 1>(p); }},
+
+        {MOE_W8A8_MODE(2, 0, 2, 48, 102), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_prefill_down_fp8_bk64_nloop<48, 128, 64, 48, 32, 64, 2, 2>(p); }},
+
+        {MOE_W8A8_MODE(2, 0, 2, 64, 101), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_prefill_down_fp8_bk64_nloop<64, 128, 64, 64, 32, 64, 2, 1>(p); }},
+
+        {MOE_W8A8_MODE(2, 0, 2, 64, 102), [](const GemmParams<char, scalar_t> &p)
+         { launch_moe_w8a8_prefill_down_fp8_bk64_nloop<64, 128, 64, 64, 32, 64, 2, 2>(p); }},
 };
 
-template <typename scalar_t>
-static std::unordered_map<int, KernelFunc<scalar_t>> kernel_maps_gemm2_prefill_n160_fp8 = {
-    {86, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_second_stage_prefill_n160_fp8<32, 128, 64, 32, 32, 64, 2>(p); }},
-    {70086, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_second_stage_prefill_n160_fp8<32, 128, 64, 32, 32, 64, 2>(p); }},
-    {165, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_second_stage_prefill_n160_fp8<48, 128, 64, 48, 32, 64, 2>(p); }},
-    {70165, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_second_stage_prefill_n160_fp8<48, 128, 64, 48, 32, 64, 2>(p); }},
-    {168, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_second_stage_prefill_n160_fp8<80, 128, 64, 80, 32, 64, 2>(p); }},
-    {70168, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_second_stage_prefill_n160_fp8<80, 128, 64, 80, 32, 64, 2>(p); }},
-    {169, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_second_stage_prefill_n160_fp8<96, 128, 64, 96, 32, 64, 2>(p); }},
-    {70169, [](const GemmParams<char, scalar_t> &p)
-     { launch_moe_w8a8_second_stage_prefill_n160_fp8<96, 128, 64, 96, 32, 64, 2>(p); }},
-};
+#undef MOE_W8A8_INT8_PREFILL_DOWN_BK64_NLOOP12_ENTRIES
+#undef MOE_W8A8_INT8_PREFILL_DOWN_BK64_NLOOP4_ENTRIES
+#undef MOE_W8A8_INT8_PREFILL_DOWN_BK64_NLOOP_ENTRY
+#undef MOE_W8A8_INT8_PREFILL_UP_BK64_NLOOP12_ENTRIES
+#undef MOE_W8A8_INT8_PREFILL_UP_BK64_NLOOP_ENTRY
+#undef MOE_W8A8_MODE
 
 #endif

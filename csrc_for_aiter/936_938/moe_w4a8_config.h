@@ -6,7 +6,10 @@
 
 #include <unordered_map>
 #include <functional>
-#define MOE_THRESHOLD 1024
+
+#define MOE_W4A8_MODE(STAGE, SORTING, FAMILY, BM, PROFILE) \
+    ((STAGE) * 10000000 + (SORTING) * 1000000 + (FAMILY) * 100000 + \
+     ((BM) / 16) * 1000 + (PROFILE))
 
 template <typename T, typename T_hidden = bhalf_t>
 struct GemmParams_w4a8
@@ -97,33 +100,11 @@ void launch_moe_w4a8_second_stage_prefill(const GemmParams_w4a8<T, T_hidden> &pa
 template <int BLOCK_SIZE_M, int BLOCK_SIZE_N, int BLOCK_SIZE_K, int WARP_M, int WARP_N, int WARP_K, int STAGES, typename T, typename T_hidden>
 void launch_moe_w4a8_first_stage_prefill_GEMM1N256(const GemmParams_w4a8<T, T_hidden> &params);
 
-template <int BLOCK_SIZE_M, int BLOCK_SIZE_N, int BLOCK_SIZE_K, int WARP_M, int WARP_N, int WARP_K, int STAGES, typename T, typename T_hidden>
-void launch_moe_w4a8_first_stage_prefill_GEMM1N384(const GemmParams_w4a8<T, T_hidden> &params);
-
 template <int N_LOOP_NUM, int BLOCK_SIZE_M, int BLOCK_SIZE_N, int BLOCK_SIZE_K, int WARP_M, int WARP_N, int WARP_K, int STAGES, typename T, typename T_hidden>
 void launch_moe_w4a8_first_stage_prefill_GEMM1Nloop(const GemmParams_w4a8<T, T_hidden> &params);
 
-template <int BLOCK_SIZE_M, int BLOCK_SIZE_N, int BLOCK_SIZE_K, int WARP_M, int WARP_N, int WARP_K, int STAGES, typename T, typename T_hidden>
-void launch_moe_w4a8_second_stage_prefill_K192(const GemmParams_w4a8<T, T_hidden> &params);
-
 template <int FIXED_SIZE_K, int N_LOOP_NUM, int BLOCK_SIZE_M, int BLOCK_SIZE_N, int BLOCK_SIZE_K, int WARP_M, int WARP_N, int WARP_K, int STAGES, typename T, typename T_hidden>
 void launch_moe_w4a8_second_stage_prefill_fixed_k(const GemmParams_w4a8<T, T_hidden> &params);
-
-template <typename T, typename T_hidden>
-void launch_moe_w4a8_first_stage_prefill_general(
-    const GemmParams_w4a8<T, T_hidden> &params,
-    uint32_t block_size_m,
-    uint32_t block_size_n,
-    uint32_t block_size_k,
-    uint32_t n_loop);
-
-template <typename T, typename T_hidden>
-void launch_moe_w4a8_second_stage_prefill_general(
-    const GemmParams_w4a8<T, T_hidden> &params,
-    uint32_t block_size_m,
-    uint32_t block_size_n,
-    uint32_t block_size_k,
-    uint32_t n_loop);
 
 template <typename scalar_t>
 using KernelFunc_w4a8 = std::function<void(const GemmParams_w4a8<char, scalar_t> &)>;
@@ -131,18 +112,14 @@ using KernelFunc_w4a8 = std::function<void(const GemmParams_w4a8<char, scalar_t>
 #define W4A8_GEMM1_NLOOP_BN128_ENTRY(MODE, BM, BK, N_LOOP) \
     {MODE, [](const GemmParams_w4a8<char, scalar_t> &p) { launch_moe_w4a8_first_stage_prefill_GEMM1Nloop<N_LOOP, BM, 128, BK, BM, 32, BK, 2>(p); }}
 
-#define W4A8_GEMM1_NLOOP_BN128_TUNE_ENTRY(BM, BK, N_LOOP) \
-    W4A8_GEMM1_NLOOP_BN128_ENTRY(310000 + (BK) * 1000 + (N_LOOP) * 100 + (BM), BM, BK, N_LOOP)
+#define W4A8_GEMM1_NLOOP_BN128_MODE_ENTRY(BM, BK, N_LOOP) \
+    W4A8_GEMM1_NLOOP_BN128_ENTRY(MOE_W4A8_MODE(1, 1, 2, BM, 100 + (N_LOOP)), BM, BK, N_LOOP)
 
-#define W4A8_GEMM1_NLOOP_BN128_TUNE_ENTRIES_FOR_BM(BM) \
-    W4A8_GEMM1_NLOOP_BN128_TUNE_ENTRY(BM, 64, 1), W4A8_GEMM1_NLOOP_BN128_TUNE_ENTRY(BM, 64, 2), W4A8_GEMM1_NLOOP_BN128_TUNE_ENTRY(BM, 64, 3), W4A8_GEMM1_NLOOP_BN128_TUNE_ENTRY(BM, 64, 4), W4A8_GEMM1_NLOOP_BN128_TUNE_ENTRY(BM, 64, 5)
+#define W4A8_GEMM1_NLOOP_BN128_MODE_ENTRIES_FOR_BM(BM) \
+    W4A8_GEMM1_NLOOP_BN128_MODE_ENTRY(BM, 64, 1), W4A8_GEMM1_NLOOP_BN128_MODE_ENTRY(BM, 64, 2), W4A8_GEMM1_NLOOP_BN128_MODE_ENTRY(BM, 64, 3), W4A8_GEMM1_NLOOP_BN128_MODE_ENTRY(BM, 64, 4), W4A8_GEMM1_NLOOP_BN128_MODE_ENTRY(BM, 64, 5)
 
-#define W4A8_GEMM1_NLOOP_BN128_TUNE_ENTRIES \
-    W4A8_GEMM1_NLOOP_BN128_TUNE_ENTRIES_FOR_BM(16), W4A8_GEMM1_NLOOP_BN128_TUNE_ENTRIES_FOR_BM(32), W4A8_GEMM1_NLOOP_BN128_TUNE_ENTRIES_FOR_BM(48), W4A8_GEMM1_NLOOP_BN128_TUNE_ENTRIES_FOR_BM(64)
-
-#define W4A8_GEMM1_N384_ALIAS_ENTRIES                                                               \
-    W4A8_GEMM1_NLOOP_BN128_ENTRY(31316, 16, 64, 3), W4A8_GEMM1_NLOOP_BN128_ENTRY(31332, 32, 64, 3), \
-        W4A8_GEMM1_NLOOP_BN128_ENTRY(31348, 48, 64, 3), W4A8_GEMM1_NLOOP_BN128_ENTRY(31364, 64, 64, 3)
+#define W4A8_GEMM1_NLOOP_BN128_MODE_ENTRIES \
+    W4A8_GEMM1_NLOOP_BN128_MODE_ENTRIES_FOR_BM(16), W4A8_GEMM1_NLOOP_BN128_MODE_ENTRIES_FOR_BM(32), W4A8_GEMM1_NLOOP_BN128_MODE_ENTRIES_FOR_BM(48), W4A8_GEMM1_NLOOP_BN128_MODE_ENTRIES_FOR_BM(64)
 
 #define W4A8_GEMM2_DOWN_RUNTIME_K_ENTRY(MODE, BM, BK, N_LOOP) \
     {MODE, [](const GemmParams_w4a8<char, scalar_t> &p) { launch_moe_w4a8_second_stage_prefill_fixed_k<0, N_LOOP, BM, 128, BK, BM, 32, BK, 2>(p); }}
@@ -150,134 +127,109 @@ using KernelFunc_w4a8 = std::function<void(const GemmParams_w4a8<char, scalar_t>
 #define W4A8_GEMM2_DOWN_K192_FASTPATH_ENTRY(MODE, BM, BK, N_LOOP) \
     {MODE, [](const GemmParams_w4a8<char, scalar_t> &p) { launch_moe_w4a8_second_stage_prefill_fixed_k<192, N_LOOP, BM, 128, BK, BM, 32, BK, 2>(p); }}
 
-#define W4A8_GEMM2_DOWN_RUNTIME_K_TUNE_ENTRY(BM, BK, N_LOOP) \
-    W4A8_GEMM2_DOWN_RUNTIME_K_ENTRY(320000 + (BK) * 1000 + (N_LOOP) * 100 + (BM), BM, BK, N_LOOP)
+#define W4A8_GEMM2_DOWN_RUNTIME_K_MODE_ENTRY(BM, BK, N_LOOP) \
+    W4A8_GEMM2_DOWN_RUNTIME_K_ENTRY(MOE_W4A8_MODE(2, 1, 2, BM, 100 + (N_LOOP)), BM, BK, N_LOOP)
 
-#define W4A8_GEMM2_DOWN_K192_FASTPATH_TUNE_ENTRY(BM, BK, N_LOOP) \
-    W4A8_GEMM2_DOWN_K192_FASTPATH_ENTRY(330000 + (BK) * 1000 + (N_LOOP) * 100 + (BM), BM, BK, N_LOOP)
+#define W4A8_GEMM2_DOWN_K192_FASTPATH_MODE_ENTRY(BM, BK, N_LOOP) \
+    W4A8_GEMM2_DOWN_K192_FASTPATH_ENTRY(MOE_W4A8_MODE(2, 1, 3, BM, 100 + (N_LOOP)), BM, BK, N_LOOP)
 
-#define W4A8_GEMM2_DOWN_RUNTIME_K_TUNE_ENTRIES_FOR_BM(BM)                                             \
-    W4A8_GEMM2_DOWN_RUNTIME_K_TUNE_ENTRY(BM, 64, 1), W4A8_GEMM2_DOWN_RUNTIME_K_TUNE_ENTRY(BM, 64, 2), \
-        W4A8_GEMM2_DOWN_RUNTIME_K_TUNE_ENTRY(BM, 64, 3), W4A8_GEMM2_DOWN_RUNTIME_K_TUNE_ENTRY(BM, 64, 4), \
-        W4A8_GEMM2_DOWN_RUNTIME_K_TUNE_ENTRY(BM, 64, 5)
+#define W4A8_GEMM2_DOWN_RUNTIME_K_MODE_ENTRIES_FOR_BM(BM)                                             \
+    W4A8_GEMM2_DOWN_RUNTIME_K_MODE_ENTRY(BM, 64, 1), W4A8_GEMM2_DOWN_RUNTIME_K_MODE_ENTRY(BM, 64, 2), \
+        W4A8_GEMM2_DOWN_RUNTIME_K_MODE_ENTRY(BM, 64, 3), W4A8_GEMM2_DOWN_RUNTIME_K_MODE_ENTRY(BM, 64, 4)
 
-#define W4A8_GEMM2_DOWN_K192_FASTPATH_TUNE_ENTRIES_FOR_BM(BM)                                                 \
-    W4A8_GEMM2_DOWN_K192_FASTPATH_TUNE_ENTRY(BM, 64, 1), W4A8_GEMM2_DOWN_K192_FASTPATH_TUNE_ENTRY(BM, 64, 2), \
-        W4A8_GEMM2_DOWN_K192_FASTPATH_TUNE_ENTRY(BM, 64, 3), W4A8_GEMM2_DOWN_K192_FASTPATH_TUNE_ENTRY(BM, 64, 4), \
-        W4A8_GEMM2_DOWN_K192_FASTPATH_TUNE_ENTRY(BM, 64, 5)
+#define W4A8_GEMM2_DOWN_K192_FASTPATH_MODE_ENTRIES_FOR_BM(BM)                                                 \
+    W4A8_GEMM2_DOWN_K192_FASTPATH_MODE_ENTRY(BM, 64, 1), W4A8_GEMM2_DOWN_K192_FASTPATH_MODE_ENTRY(BM, 64, 2), \
+        W4A8_GEMM2_DOWN_K192_FASTPATH_MODE_ENTRY(BM, 64, 3), W4A8_GEMM2_DOWN_K192_FASTPATH_MODE_ENTRY(BM, 64, 4)
 
-#define W4A8_GEMM2_DOWN_RUNTIME_K_TUNE_ENTRIES                                                            \
-    W4A8_GEMM2_DOWN_RUNTIME_K_TUNE_ENTRIES_FOR_BM(16), W4A8_GEMM2_DOWN_RUNTIME_K_TUNE_ENTRIES_FOR_BM(32), \
-        W4A8_GEMM2_DOWN_RUNTIME_K_TUNE_ENTRIES_FOR_BM(48), W4A8_GEMM2_DOWN_RUNTIME_K_TUNE_ENTRIES_FOR_BM(64)
+#define W4A8_GEMM2_DOWN_RUNTIME_K_MODE_ENTRIES                                                            \
+    W4A8_GEMM2_DOWN_RUNTIME_K_MODE_ENTRIES_FOR_BM(16), W4A8_GEMM2_DOWN_RUNTIME_K_MODE_ENTRIES_FOR_BM(32), \
+        W4A8_GEMM2_DOWN_RUNTIME_K_MODE_ENTRIES_FOR_BM(48), W4A8_GEMM2_DOWN_RUNTIME_K_MODE_ENTRIES_FOR_BM(64)
 
-#define W4A8_GEMM2_DOWN_K192_FASTPATH_TUNE_ENTRIES                                                                \
-    W4A8_GEMM2_DOWN_K192_FASTPATH_TUNE_ENTRIES_FOR_BM(16), W4A8_GEMM2_DOWN_K192_FASTPATH_TUNE_ENTRIES_FOR_BM(32), \
-        W4A8_GEMM2_DOWN_K192_FASTPATH_TUNE_ENTRIES_FOR_BM(48), W4A8_GEMM2_DOWN_K192_FASTPATH_TUNE_ENTRIES_FOR_BM(64)
-
-#define W4A8_GEMM2_DOWN_RUNTIME_K_NL4_ALIAS_ENTRIES                                                       \
-    W4A8_GEMM2_DOWN_RUNTIME_K_ENTRY(41316, 16, 64, 4), W4A8_GEMM2_DOWN_RUNTIME_K_ENTRY(41332, 32, 64, 4), \
-        W4A8_GEMM2_DOWN_RUNTIME_K_ENTRY(41348, 48, 64, 4), W4A8_GEMM2_DOWN_RUNTIME_K_ENTRY(41364, 64, 64, 4)
+#define W4A8_GEMM2_DOWN_K192_FASTPATH_MODE_ENTRIES                                                                \
+    W4A8_GEMM2_DOWN_K192_FASTPATH_MODE_ENTRIES_FOR_BM(16), W4A8_GEMM2_DOWN_K192_FASTPATH_MODE_ENTRIES_FOR_BM(32), \
+        W4A8_GEMM2_DOWN_K192_FASTPATH_MODE_ENTRIES_FOR_BM(48), W4A8_GEMM2_DOWN_K192_FASTPATH_MODE_ENTRIES_FOR_BM(64)
 
 template <typename scalar_t>
 static std::unordered_map<int, KernelFunc_w4a8<scalar_t>> kernel_maps_gemm1_decode_w4a8 = {
-    {121, [](const GemmParams_w4a8<char, scalar_t> &p)
-     { launch_moe_w4a8_first_stage_decode<16, 32, 512, 16, 32, 128, 4>(p); }},
-    {122, [](const GemmParams_w4a8<char, scalar_t> &p)
-     { launch_moe_w4a8_first_stage_decode<16, 128, 64, 16, 32, 64, 4>(p); }},
-
-    {123, [](const GemmParams_w4a8<char, scalar_t> &p)
-     { launch_moe_w4a8_first_stage_decode<16, 32, 64, 16, 32, 64, 4>(p); }},
-
-    {124, [](const GemmParams_w4a8<char, scalar_t> &p)
+    {MOE_W4A8_MODE(1, 1, 0, 16, 104), [](const GemmParams_w4a8<char, scalar_t> &p)
      { launch_moe_w4a8_first_stage_decode<16, 32, 512, 16, 32, 128, 2>(p); }},
-    {125, [](const GemmParams_w4a8<char, scalar_t> &p)
-     { launch_moe_w4a8_first_stage_decode<16, 128, 64, 16, 32, 64, 2>(p); }},
-    {126, [](const GemmParams_w4a8<char, scalar_t> &p)
-     { launch_moe_w4a8_first_stage_decode<16, 32, 256, 16, 32, 64, 2>(p); }},
-    {127, [](const GemmParams_w4a8<char, scalar_t> &p)
-     { launch_moe_w4a8_first_stage_decode<16, 32, 256, 16, 32, 64, 4>(p); }},
-    W4A8_GEMM1_NLOOP_BN128_TUNE_ENTRIES,
-    W4A8_GEMM1_N384_ALIAS_ENTRIES,
+    W4A8_GEMM1_NLOOP_BN128_MODE_ENTRIES,
 
 };
 
 template <typename scalar_t>
 static std::unordered_map<int, KernelFunc_w4a8<scalar_t>> kernel_maps_gemm2_decode_w4a8 = {
 
-    {32, [](const GemmParams_w4a8<char, scalar_t> &p)
+    {MOE_W4A8_MODE(2, 1, 0, 16, 101), [](const GemmParams_w4a8<char, scalar_t> &p)
      { launch_moe_w4a8_second_stage_decode<16, 128, 64, 16, 32, 64, 2>(p); }},
-    {86, [](const GemmParams_w4a8<char, scalar_t> &p)
+    {MOE_W4A8_MODE(2, 1, 0, 32, 102), [](const GemmParams_w4a8<char, scalar_t> &p)
      { launch_moe_w4a8_second_stage_decode<32, 128, 64, 32, 32, 64, 2>(p); }},
-    {118, [](const GemmParams_w4a8<char, scalar_t> &p)
+    {MOE_W4A8_MODE(2, 1, 0, 48, 103), [](const GemmParams_w4a8<char, scalar_t> &p)
      { launch_moe_w4a8_second_stage_decode<48, 128, 64, 48, 32, 64, 2>(p); }},
-    {166, [](const GemmParams_w4a8<char, scalar_t> &p)
+    {MOE_W4A8_MODE(2, 1, 0, 64, 104), [](const GemmParams_w4a8<char, scalar_t> &p)
      { launch_moe_w4a8_second_stage_decode<64, 128, 64, 64, 32, 64, 2>(p); }},
-    W4A8_GEMM2_DOWN_RUNTIME_K_TUNE_ENTRIES,
-    W4A8_GEMM2_DOWN_K192_FASTPATH_TUNE_ENTRIES,
-    W4A8_GEMM2_DOWN_RUNTIME_K_NL4_ALIAS_ENTRIES,
+    W4A8_GEMM2_DOWN_RUNTIME_K_MODE_ENTRIES,
+    W4A8_GEMM2_DOWN_K192_FASTPATH_MODE_ENTRIES,
 
 };
 
 template <typename scalar_t>
 static std::unordered_map<int, KernelFunc_w4a8<scalar_t>> kernel_maps_gemm1_prefill_w4a8 = {
-    {16, [](const GemmParams_w4a8<char, scalar_t> &p)
+    {MOE_W4A8_MODE(1, 1, 1, 16, 201), [](const GemmParams_w4a8<char, scalar_t> &p)
      { launch_moe_w4a8_first_stage_prefill<16, 128, 64, 16, 32, 64, 2>(p); }},
-    {53, [](const GemmParams_w4a8<char, scalar_t> &p)
+    {MOE_W4A8_MODE(1, 1, 1, 32, 202), [](const GemmParams_w4a8<char, scalar_t> &p)
      { launch_moe_w4a8_first_stage_prefill<32, 128, 64, 32, 32, 64, 2>(p); }},
-    {160, [](const GemmParams_w4a8<char, scalar_t> &p)
+    {MOE_W4A8_MODE(1, 1, 1, 64, 204), [](const GemmParams_w4a8<char, scalar_t> &p)
      { launch_moe_w4a8_first_stage_prefill<64, 128, 64, 64, 32, 64, 2>(p); }},
-    {290, [](const GemmParams_w4a8<char, scalar_t> &p)
+    {MOE_W4A8_MODE(1, 1, 1, 48, 203), [](const GemmParams_w4a8<char, scalar_t> &p)
      { launch_moe_w4a8_first_stage_prefill<48, 128, 64, 48, 32, 64, 2>(p); }},
-    W4A8_GEMM1_NLOOP_BN128_TUNE_ENTRIES,
-    W4A8_GEMM1_N384_ALIAS_ENTRIES,
+    W4A8_GEMM1_NLOOP_BN128_MODE_ENTRIES,
 
 };
 
 template <typename scalar_t>
 static std::unordered_map<int, KernelFunc_w4a8<scalar_t>> kernel_maps_gemm1_prefill_w4a8_gemm1n256 = {
-    {16, [](const GemmParams_w4a8<char, scalar_t> &p)
+    {MOE_W4A8_MODE(1, 1, 1, 16, 201), [](const GemmParams_w4a8<char, scalar_t> &p)
      { launch_moe_w4a8_first_stage_prefill_GEMM1N256<16, 128, 64, 16, 32, 64, 2>(p); }},
-    {53, [](const GemmParams_w4a8<char, scalar_t> &p)
+    {MOE_W4A8_MODE(1, 1, 1, 32, 202), [](const GemmParams_w4a8<char, scalar_t> &p)
      { launch_moe_w4a8_first_stage_prefill_GEMM1N256<32, 128, 64, 32, 32, 64, 2>(p); }},
-    {160, [](const GemmParams_w4a8<char, scalar_t> &p)
+    {MOE_W4A8_MODE(1, 1, 1, 64, 204), [](const GemmParams_w4a8<char, scalar_t> &p)
      { launch_moe_w4a8_first_stage_prefill_GEMM1N256<64, 128, 64, 64, 32, 64, 2>(p); }},
-    {290, [](const GemmParams_w4a8<char, scalar_t> &p)
+    {MOE_W4A8_MODE(1, 1, 1, 48, 203), [](const GemmParams_w4a8<char, scalar_t> &p)
      { launch_moe_w4a8_first_stage_prefill_GEMM1N256<48, 128, 64, 48, 32, 64, 2>(p); }},
-    W4A8_GEMM1_NLOOP_BN128_TUNE_ENTRIES,
-    W4A8_GEMM1_N384_ALIAS_ENTRIES,
+    W4A8_GEMM1_NLOOP_BN128_MODE_ENTRIES,
 
 };
 
 template <typename scalar_t>
 static std::unordered_map<int, KernelFunc_w4a8<scalar_t>> kernel_maps_gemm2_prefill_w4a8 = {
 
-    {32, [](const GemmParams_w4a8<char, scalar_t> &p)
+    {MOE_W4A8_MODE(2, 1, 1, 16, 201), [](const GemmParams_w4a8<char, scalar_t> &p)
      { launch_moe_w4a8_second_stage_prefill<16, 128, 64, 16, 32, 64, 2>(p); }},
-    {86, [](const GemmParams_w4a8<char, scalar_t> &p)
+    {MOE_W4A8_MODE(2, 1, 1, 32, 202), [](const GemmParams_w4a8<char, scalar_t> &p)
      { launch_moe_w4a8_second_stage_prefill<32, 128, 64, 32, 32, 64, 2>(p); }},
-    {118, [](const GemmParams_w4a8<char, scalar_t> &p)
+    {MOE_W4A8_MODE(2, 1, 1, 48, 203), [](const GemmParams_w4a8<char, scalar_t> &p)
      { launch_moe_w4a8_second_stage_prefill<48, 128, 64, 48, 32, 64, 2>(p); }},
-    {166, [](const GemmParams_w4a8<char, scalar_t> &p)
+    {MOE_W4A8_MODE(2, 1, 1, 64, 204), [](const GemmParams_w4a8<char, scalar_t> &p)
      { launch_moe_w4a8_second_stage_prefill<64, 128, 64, 64, 32, 64, 2>(p); }},
-    W4A8_GEMM2_DOWN_RUNTIME_K_TUNE_ENTRIES,
-    W4A8_GEMM2_DOWN_K192_FASTPATH_TUNE_ENTRIES,
-    W4A8_GEMM2_DOWN_RUNTIME_K_NL4_ALIAS_ENTRIES,
+    W4A8_GEMM2_DOWN_RUNTIME_K_MODE_ENTRIES,
+    W4A8_GEMM2_DOWN_K192_FASTPATH_MODE_ENTRIES,
 
 };
 
 #undef W4A8_GEMM1_NLOOP_BN128_ENTRY
-#undef W4A8_GEMM1_NLOOP_BN128_TUNE_ENTRY
-#undef W4A8_GEMM1_NLOOP_BN128_TUNE_ENTRIES_FOR_BM
-#undef W4A8_GEMM1_NLOOP_BN128_TUNE_ENTRIES
-#undef W4A8_GEMM1_N384_ALIAS_ENTRIES
+#undef W4A8_GEMM1_NLOOP_BN128_MODE_ENTRY
+#undef W4A8_GEMM1_NLOOP_BN128_MODE_ENTRIES_FOR_BM
+#undef W4A8_GEMM1_NLOOP_BN128_MODE_ENTRIES
 #undef W4A8_GEMM2_DOWN_RUNTIME_K_ENTRY
 #undef W4A8_GEMM2_DOWN_K192_FASTPATH_ENTRY
-#undef W4A8_GEMM2_DOWN_RUNTIME_K_TUNE_ENTRY
-#undef W4A8_GEMM2_DOWN_K192_FASTPATH_TUNE_ENTRY
-#undef W4A8_GEMM2_DOWN_RUNTIME_K_TUNE_ENTRIES_FOR_BM
-#undef W4A8_GEMM2_DOWN_K192_FASTPATH_TUNE_ENTRIES_FOR_BM
-#undef W4A8_GEMM2_DOWN_RUNTIME_K_TUNE_ENTRIES
-#undef W4A8_GEMM2_DOWN_K192_FASTPATH_TUNE_ENTRIES
-#undef W4A8_GEMM2_DOWN_RUNTIME_K_NL4_ALIAS_ENTRIES
+#undef W4A8_GEMM2_DOWN_RUNTIME_K_MODE_ENTRY
+#undef W4A8_GEMM2_DOWN_K192_FASTPATH_MODE_ENTRY
+#undef W4A8_GEMM2_DOWN_RUNTIME_K_MODE_ENTRIES_FOR_BM
+#undef W4A8_GEMM2_DOWN_K192_FASTPATH_MODE_ENTRIES_FOR_BM
+#undef W4A8_GEMM2_DOWN_RUNTIME_K_MODE_ENTRIES
+#undef W4A8_GEMM2_DOWN_K192_FASTPATH_MODE_ENTRIES
+
+#undef MOE_W4A8_MODE
 
 #endif

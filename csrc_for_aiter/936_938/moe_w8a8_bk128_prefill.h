@@ -21,7 +21,7 @@ template <bool Is_store_A,
           int SIZE_K,
           int N_LOOP_NUM = 1,
           bool UseRealK = false>
-__forceinline__ __device__ void gemm_nt_marlin_prefill_up_fp8_bk128(
+__forceinline__ __device__ void gemm_nt_marlin_prefill_up_fp8_bk64(
     const Element *input_ptr,
     const Element *weight_ptr,
     Element *A_lds,
@@ -269,6 +269,8 @@ __forceinline__ __device__ void gemm_nt_marlin_prefill_up_fp8_bk128(
                 }
             }
 
+            // Finish every wave's LDS reads before the next prefetch overwrites it.
+            asm volatile("s_barrier" ::: "memory");
             k_start_b = warp_k_id * WARP_K * size_n + kloop * (WARP_K * 2) * size_n;
 
             n_loop++;
@@ -719,7 +721,7 @@ template <bool Is_store_A,
           typename ElementAccum = int32_t,
           int SIZE_K,
           int N_LOOP_NUM = 4>
-__forceinline__ __device__ void gemm_nt_marlin_prefill_down_fp8_bk128(
+__forceinline__ __device__ void gemm_nt_marlin_prefill_down_fp8_bk64(
     const Element *input_ptr,
     const Element *weight_ptr,
     Element *A_lds,
@@ -1397,37 +1399,37 @@ __global__ void __launch_bounds__(512, 1) MOE_W8A8_I8_PERCHANNEL_MARLIN_HIP_NT_P
         constexpr int SIZE_K = 1280;
         if (real_size_k == size_k)
         {
-            gemm_nt_marlin_prefill_up_fp8_bk128<false, 0, 0, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, GROUP_N, GROUP_K, Element, scalar_t, SIZE_K, n_loop_num, false>(g_input, g_qweight, input_lds, qweight_lds, g_input_scale, g_weight_scale, size_m, A_reg, B_reg, C_reg, warp_id, size_k, size_n, stride_asm, stride_ask, stride_bse, stride_bsn, stride_bsk, top_k, sorted_token_ids, sorted_token_lens, expert_id, bidx, sorted_token_ids_element_store, tok_ids_store, token_index_store, nullptr, nullptr, real_topk, size_k);
+            gemm_nt_marlin_prefill_up_fp8_bk64<false, 0, 0, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, GROUP_N, GROUP_K, Element, scalar_t, SIZE_K, n_loop_num, false>(g_input, g_qweight, input_lds, qweight_lds, g_input_scale, g_weight_scale, size_m, A_reg, B_reg, C_reg, warp_id, size_k, size_n, stride_asm, stride_ask, stride_bse, stride_bsn, stride_bsk, top_k, sorted_token_ids, sorted_token_lens, expert_id, bidx, sorted_token_ids_element_store, tok_ids_store, token_index_store, nullptr, nullptr, real_topk, size_k);
         }
         else
         {
-            gemm_nt_marlin_prefill_up_fp8_bk128<false, 0, 0, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, GROUP_N, GROUP_K, Element, scalar_t, SIZE_K, n_loop_num, true>(g_input, g_qweight, input_lds, qweight_lds, g_input_scale, g_weight_scale, size_m, A_reg, B_reg, C_reg, warp_id, real_size_k, size_n, stride_asm, stride_ask, stride_bse, stride_bsn, stride_bsk, top_k, sorted_token_ids, sorted_token_lens, expert_id, bidx, sorted_token_ids_element_store, tok_ids_store, token_index_store, nullptr, nullptr, real_topk, real_size_k);
+            gemm_nt_marlin_prefill_up_fp8_bk64<false, 0, 0, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, GROUP_N, GROUP_K, Element, scalar_t, SIZE_K, n_loop_num, true>(g_input, g_qweight, input_lds, qweight_lds, g_input_scale, g_weight_scale, size_m, A_reg, B_reg, C_reg, warp_id, real_size_k, size_n, stride_asm, stride_ask, stride_bse, stride_bsn, stride_bsk, top_k, sorted_token_ids, sorted_token_lens, expert_id, bidx, sorted_token_ids_element_store, tok_ids_store, token_index_store, nullptr, nullptr, real_topk, real_size_k);
         }
     }
     else if (size_k == 4096)
     {
         constexpr int SIZE_K = 4096;
-        gemm_nt_marlin_prefill_up_fp8_bk128<false, 0, 0, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, GROUP_N, GROUP_K, Element, scalar_t, SIZE_K, n_loop_num>(g_input, g_qweight, input_lds, qweight_lds, g_input_scale, g_weight_scale, size_m, A_reg, B_reg, C_reg, warp_id, size_k, size_n, stride_asm, stride_ask, stride_bse, stride_bsn, stride_bsk, top_k, sorted_token_ids, sorted_token_lens, expert_id, bidx, sorted_token_ids_element_store, tok_ids_store, token_index_store, nullptr, nullptr, real_topk, size_k);
+        gemm_nt_marlin_prefill_up_fp8_bk64<false, 0, 0, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, GROUP_N, GROUP_K, Element, scalar_t, SIZE_K, n_loop_num>(g_input, g_qweight, input_lds, qweight_lds, g_input_scale, g_weight_scale, size_m, A_reg, B_reg, C_reg, warp_id, size_k, size_n, stride_asm, stride_ask, stride_bse, stride_bsn, stride_bsk, top_k, sorted_token_ids, sorted_token_lens, expert_id, bidx, sorted_token_ids_element_store, tok_ids_store, token_index_store, nullptr, nullptr, real_topk, size_k);
     }
     else if (size_k == 6144)
     {
         constexpr int SIZE_K = 6144;
-        gemm_nt_marlin_prefill_up_fp8_bk128<false, 0, 0, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, GROUP_N, GROUP_K, Element, scalar_t, SIZE_K, n_loop_num>(g_input, g_qweight, input_lds, qweight_lds, g_input_scale, g_weight_scale, size_m, A_reg, B_reg, C_reg, warp_id, size_k, size_n, stride_asm, stride_ask, stride_bse, stride_bsn, stride_bsk, top_k, sorted_token_ids, sorted_token_lens, expert_id, bidx, sorted_token_ids_element_store, tok_ids_store, token_index_store, nullptr, nullptr, real_topk, size_k);
+        gemm_nt_marlin_prefill_up_fp8_bk64<false, 0, 0, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, GROUP_N, GROUP_K, Element, scalar_t, SIZE_K, n_loop_num>(g_input, g_qweight, input_lds, qweight_lds, g_input_scale, g_weight_scale, size_m, A_reg, B_reg, C_reg, warp_id, size_k, size_n, stride_asm, stride_ask, stride_bse, stride_bsn, stride_bsk, top_k, sorted_token_ids, sorted_token_lens, expert_id, bidx, sorted_token_ids_element_store, tok_ids_store, token_index_store, nullptr, nullptr, real_topk, size_k);
     }
     else if (size_k == 7168)
     {
         constexpr int SIZE_K = 7168;
-        gemm_nt_marlin_prefill_up_fp8_bk128<false, 0, 0, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, GROUP_N, GROUP_K, Element, scalar_t, SIZE_K, n_loop_num>(g_input, g_qweight, input_lds, qweight_lds, g_input_scale, g_weight_scale, size_m, A_reg, B_reg, C_reg, warp_id, size_k, size_n, stride_asm, stride_ask, stride_bse, stride_bsn, stride_bsk, top_k, sorted_token_ids, sorted_token_lens, expert_id, bidx, sorted_token_ids_element_store, tok_ids_store, token_index_store, nullptr, nullptr, real_topk, size_k);
+        gemm_nt_marlin_prefill_up_fp8_bk64<false, 0, 0, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, GROUP_N, GROUP_K, Element, scalar_t, SIZE_K, n_loop_num>(g_input, g_qweight, input_lds, qweight_lds, g_input_scale, g_weight_scale, size_m, A_reg, B_reg, C_reg, warp_id, size_k, size_n, stride_asm, stride_ask, stride_bse, stride_bsn, stride_bsk, top_k, sorted_token_ids, sorted_token_lens, expert_id, bidx, sorted_token_ids_element_store, tok_ids_store, token_index_store, nullptr, nullptr, real_topk, size_k);
     }
     else if (size_k == 3072)
     {
         constexpr int SIZE_K = 3072;
-        gemm_nt_marlin_prefill_up_fp8_bk128<false, 0, 0, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, GROUP_N, GROUP_K, Element, scalar_t, SIZE_K, n_loop_num>(g_input, g_qweight, input_lds, qweight_lds, g_input_scale, g_weight_scale, size_m, A_reg, B_reg, C_reg, warp_id, size_k, size_n, stride_asm, stride_ask, stride_bse, stride_bsn, stride_bsk, top_k, sorted_token_ids, sorted_token_lens, expert_id, bidx, sorted_token_ids_element_store, tok_ids_store, token_index_store, nullptr, nullptr, real_topk, size_k);
+        gemm_nt_marlin_prefill_up_fp8_bk64<false, 0, 0, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, GROUP_N, GROUP_K, Element, scalar_t, SIZE_K, n_loop_num>(g_input, g_qweight, input_lds, qweight_lds, g_input_scale, g_weight_scale, size_m, A_reg, B_reg, C_reg, warp_id, size_k, size_n, stride_asm, stride_ask, stride_bse, stride_bsn, stride_bsk, top_k, sorted_token_ids, sorted_token_lens, expert_id, bidx, sorted_token_ids_element_store, tok_ids_store, token_index_store, nullptr, nullptr, real_topk, size_k);
     }
     else if (size_k == 2048)
     {
         constexpr int SIZE_K = 2048;
-        gemm_nt_marlin_prefill_up_fp8_bk128<false, 0, 0, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, GROUP_N, GROUP_K, Element, scalar_t, SIZE_K, n_loop_num>(g_input, g_qweight, input_lds, qweight_lds, g_input_scale, g_weight_scale, size_m, A_reg, B_reg, C_reg, warp_id, size_k, size_n, stride_asm, stride_ask, stride_bse, stride_bsn, stride_bsk, top_k, sorted_token_ids, sorted_token_lens, expert_id, bidx, sorted_token_ids_element_store, tok_ids_store, token_index_store, nullptr, nullptr, real_topk, size_k);
+        gemm_nt_marlin_prefill_up_fp8_bk64<false, 0, 0, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, GROUP_N, GROUP_K, Element, scalar_t, SIZE_K, n_loop_num>(g_input, g_qweight, input_lds, qweight_lds, g_input_scale, g_weight_scale, size_m, A_reg, B_reg, C_reg, warp_id, size_k, size_n, stride_asm, stride_ask, stride_bse, stride_bsn, stride_bsk, top_k, sorted_token_ids, sorted_token_lens, expert_id, bidx, sorted_token_ids_element_store, tok_ids_store, token_index_store, nullptr, nullptr, real_topk, size_k);
     }
     __builtin_amdgcn_sched_barrier(0);
 
@@ -1606,7 +1608,7 @@ __global__ void __launch_bounds__(512, 1) MOE_W8A8_I8_PERCHANNEL_MARLIN_HIP_NT_P
 
     constexpr int n_loop_num = N_LOOP_NUM;
 
-    if (size_k != 128 && size_k != 256 && size_k != 320 && size_k != 384 && size_k != 512 &&
+    if (size_k != 128 && size_k != 192 && size_k != 256 && size_k != 320 && size_k != 384 && size_k != 512 &&
         size_k != 640 && size_k != 768 && size_k != 1024 && size_k != 1280 &&
         size_k != 1536 && size_k != 2048)
     {
@@ -1667,57 +1669,62 @@ __global__ void __launch_bounds__(512, 1) MOE_W8A8_I8_PERCHANNEL_MARLIN_HIP_NT_P
     if (size_k == 128)
     {
         constexpr int SIZE_K = 128;
-        gemm_nt_marlin_prefill_down_fp8_bk128<false, 0, 0, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, GROUP_N, GROUP_K, Element, scalar_t, SIZE_K, n_loop_num>(g_input, g_qweight, input_lds, qweight_lds, g_input_scale, g_weight_scale, size_m, A_reg, B_reg, C_reg, warp_id, size_k, size_n, stride_asm, stride_ask, stride_bse, stride_bsn, stride_bsk, top_k, sorted_token_ids, sorted_token_lens, expert_id, bidx, sorted_token_ids_element_store, tok_ids_store, token_index_store, real_topk);
+        gemm_nt_marlin_prefill_down_fp8_bk64<false, 0, 0, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, GROUP_N, GROUP_K, Element, scalar_t, SIZE_K, n_loop_num>(g_input, g_qweight, input_lds, qweight_lds, g_input_scale, g_weight_scale, size_m, A_reg, B_reg, C_reg, warp_id, size_k, size_n, stride_asm, stride_ask, stride_bse, stride_bsn, stride_bsk, top_k, sorted_token_ids, sorted_token_lens, expert_id, bidx, sorted_token_ids_element_store, tok_ids_store, token_index_store, real_topk);
+    }
+    else if (size_k == 192)
+    {
+        constexpr int SIZE_K = 192;
+        gemm_nt_marlin_prefill_down_fp8_bk64<false, 0, 0, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, GROUP_N, GROUP_K, Element, scalar_t, SIZE_K, n_loop_num>(g_input, g_qweight, input_lds, qweight_lds, g_input_scale, g_weight_scale, size_m, A_reg, B_reg, C_reg, warp_id, size_k, size_n, stride_asm, stride_ask, stride_bse, stride_bsn, stride_bsk, top_k, sorted_token_ids, sorted_token_lens, expert_id, bidx, sorted_token_ids_element_store, tok_ids_store, token_index_store, real_topk);
     }
     else if (size_k == 256)
     {
         constexpr int SIZE_K = 256;
-        gemm_nt_marlin_prefill_down_fp8_bk128<false, 0, 0, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, GROUP_N, GROUP_K, Element, scalar_t, SIZE_K, n_loop_num>(g_input, g_qweight, input_lds, qweight_lds, g_input_scale, g_weight_scale, size_m, A_reg, B_reg, C_reg, warp_id, size_k, size_n, stride_asm, stride_ask, stride_bse, stride_bsn, stride_bsk, top_k, sorted_token_ids, sorted_token_lens, expert_id, bidx, sorted_token_ids_element_store, tok_ids_store, token_index_store, real_topk);
+        gemm_nt_marlin_prefill_down_fp8_bk64<false, 0, 0, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, GROUP_N, GROUP_K, Element, scalar_t, SIZE_K, n_loop_num>(g_input, g_qweight, input_lds, qweight_lds, g_input_scale, g_weight_scale, size_m, A_reg, B_reg, C_reg, warp_id, size_k, size_n, stride_asm, stride_ask, stride_bse, stride_bsn, stride_bsk, top_k, sorted_token_ids, sorted_token_lens, expert_id, bidx, sorted_token_ids_element_store, tok_ids_store, token_index_store, real_topk);
     }
     else if (size_k == 320)
     {
         constexpr int SIZE_K = 320;
-        gemm_nt_marlin_prefill_down_fp8_bk128<false, 0, 0, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, GROUP_N, GROUP_K, Element, scalar_t, SIZE_K, n_loop_num>(g_input, g_qweight, input_lds, qweight_lds, g_input_scale, g_weight_scale, size_m, A_reg, B_reg, C_reg, warp_id, size_k, size_n, stride_asm, stride_ask, stride_bse, stride_bsn, stride_bsk, top_k, sorted_token_ids, sorted_token_lens, expert_id, bidx, sorted_token_ids_element_store, tok_ids_store, token_index_store, real_topk);
+        gemm_nt_marlin_prefill_down_fp8_bk64<false, 0, 0, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, GROUP_N, GROUP_K, Element, scalar_t, SIZE_K, n_loop_num>(g_input, g_qweight, input_lds, qweight_lds, g_input_scale, g_weight_scale, size_m, A_reg, B_reg, C_reg, warp_id, size_k, size_n, stride_asm, stride_ask, stride_bse, stride_bsn, stride_bsk, top_k, sorted_token_ids, sorted_token_lens, expert_id, bidx, sorted_token_ids_element_store, tok_ids_store, token_index_store, real_topk);
     }
     else if (size_k == 384)
     {
         constexpr int SIZE_K = 384;
-        gemm_nt_marlin_prefill_down_fp8_bk128<false, 0, 0, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, GROUP_N, GROUP_K, Element, scalar_t, SIZE_K, n_loop_num>(g_input, g_qweight, input_lds, qweight_lds, g_input_scale, g_weight_scale, size_m, A_reg, B_reg, C_reg, warp_id, size_k, size_n, stride_asm, stride_ask, stride_bse, stride_bsn, stride_bsk, top_k, sorted_token_ids, sorted_token_lens, expert_id, bidx, sorted_token_ids_element_store, tok_ids_store, token_index_store, real_topk);
+        gemm_nt_marlin_prefill_down_fp8_bk64<false, 0, 0, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, GROUP_N, GROUP_K, Element, scalar_t, SIZE_K, n_loop_num>(g_input, g_qweight, input_lds, qweight_lds, g_input_scale, g_weight_scale, size_m, A_reg, B_reg, C_reg, warp_id, size_k, size_n, stride_asm, stride_ask, stride_bse, stride_bsn, stride_bsk, top_k, sorted_token_ids, sorted_token_lens, expert_id, bidx, sorted_token_ids_element_store, tok_ids_store, token_index_store, real_topk);
     }
     else if (size_k == 512)
     {
         constexpr int SIZE_K = 512;
-        gemm_nt_marlin_prefill_down_fp8_bk128<false, 0, 0, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, GROUP_N, GROUP_K, Element, scalar_t, SIZE_K, n_loop_num>(g_input, g_qweight, input_lds, qweight_lds, g_input_scale, g_weight_scale, size_m, A_reg, B_reg, C_reg, warp_id, size_k, size_n, stride_asm, stride_ask, stride_bse, stride_bsn, stride_bsk, top_k, sorted_token_ids, sorted_token_lens, expert_id, bidx, sorted_token_ids_element_store, tok_ids_store, token_index_store, real_topk);
+        gemm_nt_marlin_prefill_down_fp8_bk64<false, 0, 0, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, GROUP_N, GROUP_K, Element, scalar_t, SIZE_K, n_loop_num>(g_input, g_qweight, input_lds, qweight_lds, g_input_scale, g_weight_scale, size_m, A_reg, B_reg, C_reg, warp_id, size_k, size_n, stride_asm, stride_ask, stride_bse, stride_bsn, stride_bsk, top_k, sorted_token_ids, sorted_token_lens, expert_id, bidx, sorted_token_ids_element_store, tok_ids_store, token_index_store, real_topk);
     }
     else if (size_k == 640)
     {
         constexpr int SIZE_K = 640;
-        gemm_nt_marlin_prefill_down_fp8_bk128<false, 0, 0, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, GROUP_N, GROUP_K, Element, scalar_t, SIZE_K, n_loop_num>(g_input, g_qweight, input_lds, qweight_lds, g_input_scale, g_weight_scale, size_m, A_reg, B_reg, C_reg, warp_id, size_k, size_n, stride_asm, stride_ask, stride_bse, stride_bsn, stride_bsk, top_k, sorted_token_ids, sorted_token_lens, expert_id, bidx, sorted_token_ids_element_store, tok_ids_store, token_index_store, real_topk);
+        gemm_nt_marlin_prefill_down_fp8_bk64<false, 0, 0, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, GROUP_N, GROUP_K, Element, scalar_t, SIZE_K, n_loop_num>(g_input, g_qweight, input_lds, qweight_lds, g_input_scale, g_weight_scale, size_m, A_reg, B_reg, C_reg, warp_id, size_k, size_n, stride_asm, stride_ask, stride_bse, stride_bsn, stride_bsk, top_k, sorted_token_ids, sorted_token_lens, expert_id, bidx, sorted_token_ids_element_store, tok_ids_store, token_index_store, real_topk);
     }
     else if (size_k == 768)
     {
         constexpr int SIZE_K = 768;
-        gemm_nt_marlin_prefill_down_fp8_bk128<false, 0, 0, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, GROUP_N, GROUP_K, Element, scalar_t, SIZE_K, n_loop_num>(g_input, g_qweight, input_lds, qweight_lds, g_input_scale, g_weight_scale, size_m, A_reg, B_reg, C_reg, warp_id, size_k, size_n, stride_asm, stride_ask, stride_bse, stride_bsn, stride_bsk, top_k, sorted_token_ids, sorted_token_lens, expert_id, bidx, sorted_token_ids_element_store, tok_ids_store, token_index_store, real_topk);
+        gemm_nt_marlin_prefill_down_fp8_bk64<false, 0, 0, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, GROUP_N, GROUP_K, Element, scalar_t, SIZE_K, n_loop_num>(g_input, g_qweight, input_lds, qweight_lds, g_input_scale, g_weight_scale, size_m, A_reg, B_reg, C_reg, warp_id, size_k, size_n, stride_asm, stride_ask, stride_bse, stride_bsn, stride_bsk, top_k, sorted_token_ids, sorted_token_lens, expert_id, bidx, sorted_token_ids_element_store, tok_ids_store, token_index_store, real_topk);
     }
     else if (size_k == 1024)
     {
         constexpr int SIZE_K = 1024;
-        gemm_nt_marlin_prefill_down_fp8_bk128<false, 0, 0, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, GROUP_N, GROUP_K, Element, scalar_t, SIZE_K, n_loop_num>(g_input, g_qweight, input_lds, qweight_lds, g_input_scale, g_weight_scale, size_m, A_reg, B_reg, C_reg, warp_id, size_k, size_n, stride_asm, stride_ask, stride_bse, stride_bsn, stride_bsk, top_k, sorted_token_ids, sorted_token_lens, expert_id, bidx, sorted_token_ids_element_store, tok_ids_store, token_index_store, real_topk);
+        gemm_nt_marlin_prefill_down_fp8_bk64<false, 0, 0, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, GROUP_N, GROUP_K, Element, scalar_t, SIZE_K, n_loop_num>(g_input, g_qweight, input_lds, qweight_lds, g_input_scale, g_weight_scale, size_m, A_reg, B_reg, C_reg, warp_id, size_k, size_n, stride_asm, stride_ask, stride_bse, stride_bsn, stride_bsk, top_k, sorted_token_ids, sorted_token_lens, expert_id, bidx, sorted_token_ids_element_store, tok_ids_store, token_index_store, real_topk);
     }
     else if (size_k == 1280)
     {
         constexpr int SIZE_K = 1280;
-        gemm_nt_marlin_prefill_down_fp8_bk128<false, 0, 0, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, GROUP_N, GROUP_K, Element, scalar_t, SIZE_K, n_loop_num>(g_input, g_qweight, input_lds, qweight_lds, g_input_scale, g_weight_scale, size_m, A_reg, B_reg, C_reg, warp_id, size_k, size_n, stride_asm, stride_ask, stride_bse, stride_bsn, stride_bsk, top_k, sorted_token_ids, sorted_token_lens, expert_id, bidx, sorted_token_ids_element_store, tok_ids_store, token_index_store, real_topk);
+        gemm_nt_marlin_prefill_down_fp8_bk64<false, 0, 0, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, GROUP_N, GROUP_K, Element, scalar_t, SIZE_K, n_loop_num>(g_input, g_qweight, input_lds, qweight_lds, g_input_scale, g_weight_scale, size_m, A_reg, B_reg, C_reg, warp_id, size_k, size_n, stride_asm, stride_ask, stride_bse, stride_bsn, stride_bsk, top_k, sorted_token_ids, sorted_token_lens, expert_id, bidx, sorted_token_ids_element_store, tok_ids_store, token_index_store, real_topk);
     }
     else if (size_k == 1536)
     {
         constexpr int SIZE_K = 1536;
-        gemm_nt_marlin_prefill_down_fp8_bk128<false, 0, 0, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, GROUP_N, GROUP_K, Element, scalar_t, SIZE_K, n_loop_num>(g_input, g_qweight, input_lds, qweight_lds, g_input_scale, g_weight_scale, size_m, A_reg, B_reg, C_reg, warp_id, size_k, size_n, stride_asm, stride_ask, stride_bse, stride_bsn, stride_bsk, top_k, sorted_token_ids, sorted_token_lens, expert_id, bidx, sorted_token_ids_element_store, tok_ids_store, token_index_store, real_topk);
+        gemm_nt_marlin_prefill_down_fp8_bk64<false, 0, 0, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, GROUP_N, GROUP_K, Element, scalar_t, SIZE_K, n_loop_num>(g_input, g_qweight, input_lds, qweight_lds, g_input_scale, g_weight_scale, size_m, A_reg, B_reg, C_reg, warp_id, size_k, size_n, stride_asm, stride_ask, stride_bse, stride_bsn, stride_bsk, top_k, sorted_token_ids, sorted_token_lens, expert_id, bidx, sorted_token_ids_element_store, tok_ids_store, token_index_store, real_topk);
     }
     else if (size_k == 2048)
     {
         constexpr int SIZE_K = 2048;
-        gemm_nt_marlin_prefill_down_fp8_bk128<false, 0, 0, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, GROUP_N, GROUP_K, Element, scalar_t, SIZE_K, n_loop_num>(g_input, g_qweight, input_lds, qweight_lds, g_input_scale, g_weight_scale, size_m, A_reg, B_reg, C_reg, warp_id, size_k, size_n, stride_asm, stride_ask, stride_bse, stride_bsn, stride_bsk, top_k, sorted_token_ids, sorted_token_lens, expert_id, bidx, sorted_token_ids_element_store, tok_ids_store, token_index_store, real_topk);
+        gemm_nt_marlin_prefill_down_fp8_bk64<false, 0, 0, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, GROUP_N, GROUP_K, Element, scalar_t, SIZE_K, n_loop_num>(g_input, g_qweight, input_lds, qweight_lds, g_input_scale, g_weight_scale, size_m, A_reg, B_reg, C_reg, warp_id, size_k, size_n, stride_asm, stride_ask, stride_bse, stride_bsn, stride_bsk, top_k, sorted_token_ids, sorted_token_lens, expert_id, bidx, sorted_token_ids_element_store, tok_ids_store, token_index_store, real_topk);
     }
 
     float *b_scale_ptr = weight_scale + weight_scale_offset + warp_n_id * WARP_N;
@@ -1823,7 +1830,7 @@ __global__ void __launch_bounds__(512, 1) MOE_W8A8_I8_PERCHANNEL_MARLIN_HIP_NT_P
 }
 
 template <int BLOCK_SIZE_M, int BLOCK_SIZE_N, int BLOCK_SIZE_K, int WARP_M, int WARP_N, int WARP_K, int STAGES, int N_LOOP_NUM, typename T, typename T_hidden>
-void launch_moe_w8a8_prefill_up_fp8_bk128_nloop(const GemmParams<T, T_hidden> &params)
+void launch_moe_w8a8_prefill_up_fp8_bk64_nloop(const GemmParams<T, T_hidden> &params)
 {
     constexpr int WARP_NUM = (BLOCK_SIZE_N / WARP_N) * (BLOCK_SIZE_K / WARP_K); // std::cout<<"WARP_NUM\t"<<WARP_NUM;
     const bool mul_topk_weight = false;
@@ -1874,20 +1881,20 @@ void launch_moe_w8a8_prefill_up_fp8_bk128_nloop(const GemmParams<T, T_hidden> &p
 }
 
 template <int BLOCK_SIZE_M, int BLOCK_SIZE_N, int BLOCK_SIZE_K, int WARP_M, int WARP_N, int WARP_K, int STAGES, typename T, typename T_hidden>
-void launch_moe_w8a8_prefill_up_fp8_bk128(const GemmParams<T, T_hidden> &params)
+void launch_moe_w8a8_prefill_up_fp8_bk64(const GemmParams<T, T_hidden> &params)
 {
     if (params.size_n == 640)
     {
-        launch_moe_w8a8_prefill_up_fp8_bk128_nloop<BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, 1, T, T_hidden>(params);
+        launch_moe_w8a8_prefill_up_fp8_bk64_nloop<BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, 1, T, T_hidden>(params);
     }
     else
     {
-        launch_moe_w8a8_prefill_up_fp8_bk128_nloop<BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, 2, T, T_hidden>(params);
+        launch_moe_w8a8_prefill_up_fp8_bk64_nloop<BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, 2, T, T_hidden>(params);
     }
 }
 
 template <int BLOCK_SIZE_M, int BLOCK_SIZE_N, int BLOCK_SIZE_K, int WARP_M, int WARP_N, int WARP_K, int STAGES, int N_LOOP_NUM, typename T, typename T_hidden>
-void launch_moe_w8a8_prefill_down_fp8_bk128_nloop(const GemmParams<T, T_hidden> &params)
+void launch_moe_w8a8_prefill_down_fp8_bk64_nloop(const GemmParams<T, T_hidden> &params)
 {
     const int WARP_NUM = (BLOCK_SIZE_N / WARP_N) * (BLOCK_SIZE_K / WARP_K);
     const bool mul_topk_weight = true;
@@ -1942,7 +1949,7 @@ void launch_moe_w8a8_prefill_down_fp8_bk128_nloop(const GemmParams<T, T_hidden> 
 }
 
 template <int BLOCK_SIZE_M, int BLOCK_SIZE_N, int BLOCK_SIZE_K, int WARP_M, int WARP_N, int WARP_K, int STAGES, typename T, typename T_hidden>
-void launch_moe_w8a8_prefill_down_fp8_bk128(const GemmParams<T, T_hidden> &params)
+void launch_moe_w8a8_prefill_down_fp8_bk64(const GemmParams<T, T_hidden> &params)
 {
-    launch_moe_w8a8_prefill_down_fp8_bk128_nloop<BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, 4, T, T_hidden>(params);
+    launch_moe_w8a8_prefill_down_fp8_bk64_nloop<BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, 4, T, T_hidden>(params);
 }

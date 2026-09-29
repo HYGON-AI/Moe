@@ -1288,41 +1288,41 @@ __forceinline__ __device__ void gemm_nt_marlin_prefill_w4a8_gemm1n256(
             } // stage end
 
             n_loop--;
-            if (kloop < (size_k / 128) - 1)
+            auto prefetch_next_k = [&]()
             {
-
-                kloop++;
-                k_start = warp_k_id * (WARP_K) + kloop * (128);
-
-                i = 0;
-
-#pragma unroll
-                for (int m_tile = 0; m_tile < WARP_M / MFMA_M; m_tile++)
+                if (kloop < (size_k / 128) - 1)
                 {
+                    __builtin_amdgcn_sched_barrier(0);
+                    asm volatile("s_barrier" ::: "memory");
+                    __builtin_amdgcn_sched_barrier(0);
 #pragma unroll
-                    for (int k_tile = 0; k_tile < WARP_K / READ_K; k_tile++)
+                    for (int stage = 0; stage < 2; stage++)
                     {
-                        inline_buffer_load_dword_lds(A_lds, g_input, (m_tile * (16 /* +2 */) * WARP_K + A_index * 4 * WARP_K) / 4 + (0) * (WARP_M / 16) * (16 /* +2 */) * WARP_K / 4 /* padding */ /* +(index*16)/ 4 */, (k_tile * READ_K + k_start) / 4, (g_row_A[m_tile]) / 4);
+                        const int next_k = warp_k_id * WARP_K + (kloop + 1) * 128 + stage * stage_offset;
+#pragma unroll
+                        for (int m_tile = 0; m_tile < WARP_M / MFMA_M; m_tile++)
+                        {
+#pragma unroll
+                            for (int k_tile = 0; k_tile < WARP_K / READ_K; k_tile++)
+                            {
+                                inline_buffer_load_dword_lds(A_lds, g_input,
+                                    (m_tile * 16 * WARP_K + A_index * 4 * WARP_K + stage * WARP_M * WARP_K) / 4,
+                                    (k_tile * READ_K + next_k) / 4, g_row_A[m_tile] / 4);
+                            }
+                        }
                     }
                 }
-
-                i = 1;
-
-                k_start += stage_offset;
-
-#pragma unroll
-                for (int m_tile = 0; m_tile < WARP_M / MFMA_M; m_tile++)
-                {
-#pragma unroll
-                    for (int k_tile = 0; k_tile < WARP_K / READ_K; k_tile++)
-                    {
-                        inline_buffer_load_dword_lds(A_lds, g_input, (m_tile * (16 /* +2 */) * WARP_K + A_index * 4 * WARP_K) / 4 + (1) * (WARP_M / 16) * (16 /* +2 */) * WARP_K / 4 /* padding */ /* +(index*16)/ 4 */, (k_tile * READ_K + k_start) / 4, (g_row_A[m_tile]) / 4);
-                    }
-                }
-                kloop--;
+            };
+            if constexpr (N_LOOP_NUM > 1)
+            {
+                prefetch_next_k();
+                vmcnt_only_wait((WARP_N / 32) + (2 * (WARP_M / MFMA_M) * (WARP_K / READ_K)));
             }
-
-            vmcnt_only_wait((WARP_N / 32) + (2 * (WARP_M / MFMA_M) * (WARP_K / READ_K)));
+            else
+            {
+                // No next-K loads are outstanding until both A stages are consumed.
+                vmcnt_only_wait(WARP_N / 32);
+            }
 
             if (kloop == (size_k / 128) - 1)
             {
@@ -1381,7 +1381,14 @@ __forceinline__ __device__ void gemm_nt_marlin_prefill_w4a8_gemm1n256(
 
             __builtin_amdgcn_sched_barrier(0);
 
-            vmcnt_wait(2 * (WARP_M / MFMA_M) * (WARP_K / READ_K));
+            if constexpr (N_LOOP_NUM == 1)
+            {
+                vmcnt_wait(0);
+            }
+            else
+            {
+                vmcnt_wait(2 * (WARP_M / MFMA_M) * (WARP_K / READ_K));
+            }
 
             if (kloop == (size_k / 128) - 1)
             {
@@ -1438,8 +1445,10 @@ __forceinline__ __device__ void gemm_nt_marlin_prefill_w4a8_gemm1n256(
                 }
             }
             __builtin_amdgcn_sched_barrier(0);
-
-            __builtin_amdgcn_sched_barrier(0);
+            if constexpr (N_LOOP_NUM == 1)
+            {
+                prefetch_next_k();
+            }
         }
         else if constexpr (STAGE == 1)
         {
@@ -2851,7 +2860,8 @@ __forceinline__ __device__ void gemm_nt_marlin_decode_2_w4a8(
 
             if (kloop < (SIZE_K / 128) - 1)
             {
-
+                // Other waves may still be reading the current A stages.
+                asm volatile("s_barrier" ::: "memory");
                 kloop++;
                 k_start = warp_k_id * (WARP_K) + kloop * (128);
 
