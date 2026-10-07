@@ -104,6 +104,11 @@ def _find_moe_c_config(
 ) -> Optional[Dict[int, Any]]:
     arch = _gfx_version()
     resolved_cu = _resolve_num_cu(arch, num_cu)
+    if dtype in ("fp8_w8a8", "int8_w8a8", "int8_w4a8"):
+        from .fused_moe_c import _find_closest_channelwise_config
+        return _find_closest_channelwise_config(
+            E, N, dtype, is_bottom, K, top_k, resolved_cu, arch,
+            config_root=str(_config_root()))
     suffix = ",is_bottom=True" if is_bottom else ""
     names = []
     if K:

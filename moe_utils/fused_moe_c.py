@@ -2529,6 +2529,89 @@ def invoke_fused_moe_kernel_marlin(A: torch.Tensor,
 
 
 
+
+def _find_closest_channelwise_config(
+    E, N, dtype, is_bottom, K, top_k, num_cu, arch, config_root=None,
+):
+    """Relax K, CU, topk, then E; keep the two stages in the same config pair."""
+    config_root = config_root or _moe_c_config_root()
+    roots = [
+        os.path.join(config_root, arch, dtype),
+        os.path.join(config_root, arch),
+        os.path.join(config_root, dtype),
+        config_root,
+    ]
+    requested = {"K": K, "cu": num_cu, "topk": top_k, "E": E}
+    candidates = []
+    for root_rank, root in enumerate(roots):
+        if not os.path.isdir(root):
+            continue
+        for name in sorted(os.listdir(root)):
+            if not name.endswith(".json"):
+                continue
+            fields = dict(part.split("=", 1) for part in name[:-5].split(",") if "=" in part)
+            if (fields.get("N") != str(N) or fields.get("dtype") != dtype
+                    or "E" not in fields
+                    or fields.get("is_bottom", "False") != str(is_bottom)
+                    or fields.get("gfx_version", arch) != arch):
+                continue
+            if set(fields) - {"N", "dtype", "E", "K", "cu", "topk", "is_bottom", "gfx_version"}:
+                continue
+            try:
+                values = {key: int(fields[key]) if key in fields else None for key in requested}
+            except ValueError:
+                continue
+            level = max(
+                (rank for rank, (key, target) in enumerate(requested.items(), 1)
+                 if target is not None and values[key] != target),
+                default=0,
+            )
+            distances = tuple(
+                abs(values[key] - requested[key])
+                if values[key] is not None and requested[key] is not None
+                else float("inf") if requested[key] is not None else 0
+                for key in ("E", "topk", "cu", "K")
+            )
+            candidates.append(((level, distances, root_rank, name), os.path.join(root, name)))
+    for _, path in sorted(candidates):
+        suffix = ",is_bottom=True.json"
+        pair_path = path[:-len(suffix)] + ".json" if is_bottom else path[:-5] + suffix
+        if not os.path.isfile(pair_path):
+            continue
+        with open(path) as f:
+            config = {int(key): value for key, value in json.load(f).items()}
+        with open(pair_path) as f:
+            pair = {int(key): value for key, value in json.load(f).items()}
+        if not config or not pair:
+            continue
+        # Each stage independently picks the closest M; check every selection boundary.
+        points = set(config) | set(pair)
+        for table in (config, pair):
+            keys = sorted(table)
+            for left, right in zip(keys, keys[1:]):
+                midpoint = (left + right) // 2
+                points.update((midpoint, midpoint + 1))
+        compatible = True
+        for m in points:
+            first = config[min(config, key=lambda key: abs(key - m))]
+            second = pair[min(pair, key=lambda key: abs(key - m))]
+            def routing(row):
+                mode = int(row.get("MODE", 0))
+                if 10000000 <= mode < 30000000:
+                    return (mode // 1000000) % 10
+                return int(row.get("SORTING_METHOD") == "moe_align")
+            if (first.get("BLOCK_SIZE_M") is None
+                    or first["BLOCK_SIZE_M"] != second.get("BLOCK_SIZE_M")
+                    or routing(first) != routing(second)):
+                compatible = False
+                break
+        if compatible:
+            logger.info("Using configuration from %s for MoE layer.", path)
+            return config
+    logger.warning("No matching channelwise config pair: arch=%s dtype=%s N=%s E=%s K=%s topk=%s cu=%s",
+                   arch, dtype, N, E, K, top_k, num_cu)
+    return None
+
 # Adapted from: https://github.com/sgl-project/sglang/pull/2628
 def get_config_file_name(E: int,
                          N: int,
@@ -2832,6 +2915,9 @@ def get_moe_configs_marlin(
     csv_config = _load_fp8_channel_csv_config(E, N, K, dtype, is_bottom, top_k, resolved_cu)
     if csv_config is not None:
         return csv_config
+    if dtype in ("fp8_w8a8", "int8_w8a8", "int8_w4a8"):
+        return _find_closest_channelwise_config(
+            E, N, dtype, is_bottom, K, top_k, resolved_cu, arch)
     json_file_names = []
     if top_k is not None:
         if K is not None:
