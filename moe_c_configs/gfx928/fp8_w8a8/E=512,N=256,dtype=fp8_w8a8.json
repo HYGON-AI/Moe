@@ -1,170 +1,114 @@
 {
     "1": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 60121,
-        "SORTING_METHOD": "ck_sorting",
-        "N_LOOP1": 1
+        "MODE": 10001102
     },
     "2": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 60121,
-        "SORTING_METHOD": "ck_sorting",
-        "N_LOOP1": 1
+        "MODE": 10001102
     },
     "3": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 60121,
-        "SORTING_METHOD": "ck_sorting",
-        "N_LOOP1": 1
+        "MODE": 10001102
     },
     "4": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 60121,
-        "SORTING_METHOD": "ck_sorting",
-        "N_LOOP1": 1
+        "MODE": 10001102
     },
     "5": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 60121,
-        "SORTING_METHOD": "ck_sorting",
-        "N_LOOP1": 1
+        "MODE": 10001102
     },
     "6": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 60121,
-        "SORTING_METHOD": "ck_sorting",
-        "N_LOOP1": 1
+        "MODE": 10001102
     },
     "7": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 60121,
-        "SORTING_METHOD": "ck_sorting",
-        "N_LOOP1": 1
+        "MODE": 10001102
     },
     "8": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 60121,
-        "SORTING_METHOD": "ck_sorting",
-        "N_LOOP1": 1
+        "MODE": 10001102
     },
     "9": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 60121,
-        "SORTING_METHOD": "ck_sorting",
-        "N_LOOP1": 1
+        "MODE": 10001102
     },
     "10": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 60121,
-        "SORTING_METHOD": "ck_sorting",
-        "N_LOOP1": 1
+        "MODE": 10001102
     },
     "11": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 60121,
-        "SORTING_METHOD": "ck_sorting",
-        "N_LOOP1": 1
+        "MODE": 10001102
     },
     "12": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 60121,
-        "SORTING_METHOD": "ck_sorting",
-        "N_LOOP1": 1
+        "MODE": 10001102
     },
     "13": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 60121,
-        "SORTING_METHOD": "ck_sorting",
-        "N_LOOP1": 1
+        "MODE": 10001102
     },
     "14": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 60121,
-        "SORTING_METHOD": "ck_sorting",
-        "N_LOOP1": 1
+        "MODE": 10001102
     },
     "15": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 60121,
-        "SORTING_METHOD": "ck_sorting",
-        "N_LOOP1": 1
+        "MODE": 10001102
     },
     "16": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 60121,
-        "SORTING_METHOD": "ck_sorting",
-        "N_LOOP1": 1
+        "MODE": 10001102
     },
     "32": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 60121,
-        "SORTING_METHOD": "ck_sorting",
-        "N_LOOP1": 1
+        "MODE": 10001102
     },
     "64": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 60121,
-        "SORTING_METHOD": "ck_sorting",
-        "N_LOOP1": 1
+        "MODE": 10001102
     },
     "128": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 60121,
-        "SORTING_METHOD": "ck_sorting",
-        "N_LOOP1": 1
+        "MODE": 10001102
     },
     "256": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 60121,
-        "SORTING_METHOD": "ck_sorting",
-        "N_LOOP1": 1
+        "MODE": 10001102
     },
     "512": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 60098,
-        "SORTING_METHOD": "ck_sorting",
-        "N_LOOP1": 1
+        "MODE": 10001101
     },
     "1024": {
         "BLOCK_SIZE_M": 32,
-        "MODE": 80322,
-        "N_LOOP1": 2,
-        "SORTING_METHOD": "moe_align"
+        "MODE": 11102102
     },
     "2048": {
         "BLOCK_SIZE_M": 64,
-        "MODE": 80642,
-        "N_LOOP1": 2,
-        "SORTING_METHOD": "moe_align"
+        "MODE": 11104102
     },
     "4096": {
         "BLOCK_SIZE_M": 128,
-        "MODE": 81282,
-        "N_LOOP1": 2,
-        "SORTING_METHOD": "moe_align"
+        "MODE": 11108102
     },
     "6144": {
         "BLOCK_SIZE_M": 80,
-        "MODE": 80804,
-        "N_LOOP1": 4,
-        "SORTING_METHOD": "moe_align"
+        "MODE": 11105104
     },
     "8192": {
         "BLOCK_SIZE_M": 96,
-        "MODE": 80964,
-        "N_LOOP1": 4,
-        "SORTING_METHOD": "moe_align"
+        "MODE": 11106104
     },
     "16384": {
         "BLOCK_SIZE_M": 96,
-        "MODE": 80964,
-        "N_LOOP1": 4,
-        "SORTING_METHOD": "moe_align"
+        "MODE": 11106104
     },
     "32768": {
         "BLOCK_SIZE_M": 96,
-        "MODE": 80964,
-        "N_LOOP1": 4,
-        "SORTING_METHOD": "moe_align"
+        "MODE": 11106104
     }
 }
