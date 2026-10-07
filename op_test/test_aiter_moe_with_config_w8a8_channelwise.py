@@ -333,6 +333,10 @@ if __name__ == "__main__":
         action="store_true",
         help="Print detailed compare_tensors output for each executed case.",
     )
+    parser.add_argument("--e", type=int, default=None, help="Number of experts.")
+    parser.add_argument("--n", type=int, default=None, help="Expert hidden/output dimension.")
+    parser.add_argument("--k", type=int, default=None, help="Model/input dimension.")
+    parser.add_argument("--topk", type=int, default=8, help="Top-k experts.")
     args = parser.parse_args()
 
     quant_type = MoeQuantType.FP8_W8A8 if args.quant == "fp8" else MoeQuantType.W8A8
@@ -342,10 +346,10 @@ if __name__ == "__main__":
     # for triton backend, it can run with n=320 in NMZ;
     in_dtype = dtypes.fp8 if quant_type == MoeQuantType.FP8_W8A8 else dtypes.bf16
     out_dtype = dtypes.bf16
-    e = 384 if quant_type == MoeQuantType.FP8_W8A8 else 256
-    topk = 8
-    k = 4096
-    n = 512 if quant_type == MoeQuantType.FP8_W8A8 else 384
+    e = args.e if args.e is not None else (384 if quant_type == MoeQuantType.FP8_W8A8 else 256)
+    topk = args.topk
+    k = args.k if args.k is not None else 4096
+    n = args.n if args.n is not None else (512 if quant_type == MoeQuantType.FP8_W8A8 else 384)
     use_shuffle = 0
 
     logger.info("=" * 60)

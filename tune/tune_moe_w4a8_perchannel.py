@@ -34,8 +34,7 @@ DEFAULT_TOPK = 8
 DEFAULT_DTYPE = "bf16"
 DEFAULT_BUILD_DIR = os.environ.get("MOE_C_BUILD_DIR", "/tmp/moe_c_w4a8_tune_split_build_zxl")
 DEFAULT_OUT = None
-DEFAULT_MAX_NLOOP = 5
-W4A8_MAX_NLOOP = 5
+DEFAULT_MAX_NLOOP = 4
 DEFAULT_WARMUP = 5
 DEFAULT_ITERS = 30
 DEFAULT_TIMEOUT = 600
@@ -59,6 +58,27 @@ class Shape:
     topk: int
     dtype: str
     m_values: List[int]
+    cu: Optional[int] = None
+
+
+def default_cu_for_arch(arch: Optional[str]) -> Optional[int]:
+    if arch == "gfx938":
+        return 72
+    if arch == "gfx936":
+        return 80
+    return None
+
+
+def resolve_cu(arch: Optional[str], cu: Optional[int]) -> Optional[int]:
+    return cu if cu is not None else default_cu_for_arch(arch)
+
+
+def config_file_name(shape: Shape, is_bottom: bool = False) -> str:
+    suffix = ",is_bottom=True" if is_bottom else ""
+    if shape.cu is not None:
+        return (f"E={shape.e},N={shape.n},K={shape.k},topk={shape.topk},"
+                f"cu={shape.cu},dtype=int8_w4a8{suffix}.json")
+    return f"E={shape.e},N={shape.n},K={shape.k},dtype=int8_w4a8{suffix}.json"
 
 
 @dataclass(frozen=True)
@@ -74,142 +94,40 @@ class Candidate:
     warp_k: int
     n_loop: int
     note: str
+    stages: int = 2
+    k_step: int = 128
+    k_tail: Optional[int] = None
+    sorting: int = 1
 
     def config(self) -> Dict[str, int]:
         return {"BLOCK_SIZE_M": int(self.block_size_m), "MODE": int(self.mode)}
 
 
-def n_loop_divides(n_dim: int, block_n: int, n_loop: int) -> bool:
-    return n_loop > 0 and n_dim % (block_n * n_loop) == 0
+def generate_candidates(shape: Shape, max_nloop: int, arch: str = "gfx936") -> List[Candidate]:
+    if __package__:
+        from .tune_moe_hipc import PROFILES, Shape as TuneShape
+    else:
+        from tune_moe_hipc import PROFILES, Shape as TuneShape
 
-
-def candidate_name(gemm: str, kernel: str, k_loop: int, bm: int, n_loop: int) -> str:
-    return f"{gemm}_{kernel}_kloop{k_loop}_bm{bm}_nl{n_loop}"
-
-
-def generate_candidates(shape: Shape, max_nloop: int) -> List[Candidate]:
-    candidates: List[Candidate] = []
-    bm_values = (16, 32, 48, 64)
-    bk_values = (64,)
-    w4a8_max_nloop = min(W4A8_MAX_NLOOP, max(1, max_nloop))
-    n_loop_values = range(1, w4a8_max_nloop + 1)
-    original_gemm1_modes = {16: 16, 32: 53, 48: 290, 64: 160}
-    original_gemm2_modes = {16: 32, 32: 86, 48: 118, 64: 166}
-
-    for bm in bm_values:
-        for bk in bk_values:
-            for n_loop in n_loop_values:
-                if not n_loop_divides(shape.n * 2, 128, n_loop):
-                    continue
-                candidates.append(Candidate(
-                    candidate_id=candidate_name("up", "nloop_bn128", 128, bm, n_loop),
-                    gemm="gemm1",
-                    mode=310000 + bk * 1000 + n_loop * 100 + bm,
-                    block_size_m=bm,
-                    block_size_n=128,
-                    block_size_k=bk,
-                    warp_m=bm,
-                    warp_n=32,
-                    warp_k=bk,
-                    n_loop=n_loop,
-                    note="W4A8_GEMM1_NLOOP_BN128_TUNE_ENTRY",
-                ))
-
-    if shape.n * 2 == 256:
-        for bm in bm_values:
-            candidates.append(Candidate(
-                candidate_id=candidate_name("up", "prefill_n256", 128, bm, 2),
-                gemm="gemm1",
-                mode=original_gemm1_modes[bm],
-                block_size_m=bm,
-                block_size_n=128,
-                block_size_k=64,
-                warp_m=bm,
-                warp_n=32,
-                warp_k=64,
-                n_loop=2,
-                note="W4A8_GEMM1_PREFILL_N256",
-            ))
-
-    if n_loop_divides(shape.n * 2, 128, 3):
-        for bm in bm_values:
-            candidates.append(Candidate(
-                candidate_id=candidate_name("up", "n384_alias", 128, bm, 3),
-                gemm="gemm1",
-                mode=31300 + bm,
-                block_size_m=bm,
-                block_size_n=128,
-                block_size_k=64,
-                warp_m=bm,
-                warp_n=32,
-                warp_k=64,
-                n_loop=3,
-                note="W4A8_GEMM1_N384_ALIAS",
-            ))
-
-    supported_gemm2_k = {128, 192, 256, 384, 640, 768, 1536, 3072}
-    if shape.n in supported_gemm2_k:
-        for bm in bm_values:
-            for bk in bk_values:
-                for n_loop in n_loop_values:
-                    if not n_loop_divides(shape.k, 128, n_loop):
-                        continue
-                    candidates.append(Candidate(
-                        candidate_id=candidate_name("down", "runtime", 128, bm, n_loop),
-                        gemm="gemm2",
-                        mode=320000 + bk * 1000 + n_loop * 100 + bm,
-                        block_size_m=bm,
-                        block_size_n=128,
-                        block_size_k=bk,
-                        warp_m=bm,
-                        warp_n=32,
-                        warp_k=bk,
-                        n_loop=n_loop,
-                        note="W4A8_GEMM2_DOWN_RUNTIME_K_TUNE_ENTRY",
-                    ))
-                    if shape.n == 192:
-                        candidates.append(Candidate(
-                            candidate_id=candidate_name("down", "k192", 64, bm, n_loop),
-                            gemm="gemm2",
-                            mode=330000 + bk * 1000 + n_loop * 100 + bm,
-                            block_size_m=bm,
-                            block_size_n=128,
-                            block_size_k=bk,
-                            warp_m=bm,
-                            warp_n=32,
-                            warp_k=bk,
-                            n_loop=n_loop,
-                            note="W4A8_GEMM2_DOWN_K192_FASTPATH_TUNE_ENTRY",
-                        ))
-        for bm in bm_values:
-            candidates.append(Candidate(
-                candidate_id=candidate_name("down", "prefill", 128, bm, 2),
-                gemm="gemm2",
-                mode=original_gemm2_modes[bm],
-                block_size_m=bm,
-                block_size_n=128,
-                block_size_k=64,
-                warp_m=bm,
-                warp_n=32,
-                warp_k=64,
-                n_loop=2,
-                note="W4A8_GEMM2_DOWN_ORIGINAL_PREFILL",
-            ))
-        for bm in bm_values:
-            candidates.append(Candidate(
-                candidate_id=candidate_name("down", "runtime_alias", 128, bm, 4),
-                gemm="gemm2",
-                mode=41300 + bm,
-                block_size_m=bm,
-                block_size_n=128,
-                block_size_k=64,
-                warp_m=bm,
-                warp_n=32,
-                warp_k=64,
-                n_loop=4,
-                note="W4A8_GEMM2_DOWN_RUNTIME_K_NL4_ALIAS",
-            ))
-
+    profile = PROFILES["int8_w4a8"]
+    tune_shape = TuneShape(shape.e, shape.n, shape.k, shape.topk, 0,
+                          shape.dtype, arch, shape.cu)
+    candidates = []
+    for base_desc in profile.descriptors.values():
+        desc = base_desc.for_shape(tune_shape)
+        if desc.family in (2, 3) and desc.nloop > max_nloop:
+            continue
+        if desc.validate(tune_shape) is not None:
+            continue
+        candidates.append(Candidate(
+            candidate_id=f"g{desc.stage}_f{desc.family}_bm{desc.bm}_bn{desc.bn}_bk{desc.bk}_nl{desc.nloop}",
+            gemm="gemm1" if desc.stage == 1 else "gemm2",
+            mode=desc.mode, block_size_m=desc.bm, block_size_n=desc.bn,
+            block_size_k=desc.bk, warp_m=desc.wm, warp_n=desc.wn,
+            warp_k=desc.wk, n_loop=desc.nloop, note=desc.kernel,
+            stages=desc.stages, k_step=desc.k_step, k_tail=desc.k_tail,
+            sorting=desc.sorting,
+        ))
     return candidates
 
 
@@ -502,7 +420,7 @@ def run_local_child(payload_path: Path) -> int:
     try:
         import torch
         from aiter.test_common import perftest
-        from fused_moe import fused_experts
+        from moe_utils.fused_moe_c import moe_c_fused_experts as fused_experts
 
         torch.set_default_device("cuda")
         data = load_golden_cache(Path(payload["cache_path"]))
@@ -594,7 +512,7 @@ def run_local_batch_child(payload_path: Path) -> int:
     try:
         import torch
         from aiter.test_common import perftest
-        from fused_moe import fused_experts
+        from moe_utils.fused_moe_c import moe_c_fused_experts as fused_experts
 
         torch.set_default_device("cuda")
         data = load_golden_cache(Path(payload["cache_path"]))
@@ -969,149 +887,38 @@ def print_trial_finish(result: Dict[str, Any]) -> None:
 
 def stage_fixed_config(candidates: List[Candidate], bm: int) -> Optional[Dict[str, int]]:
     same_bm = [c for c in candidates if c.block_size_m == bm]
-    priority = (
-        ("W4A8_GEMM2_DOWN_K192_FASTPATH_TUNE_ENTRY", 4),
-        ("W4A8_GEMM2_DOWN_RUNTIME_K_NL4_ALIAS", 4),
-        ("W4A8_GEMM2_DOWN_ORIGINAL_PREFILL", None),
-        ("W4A8_GEMM2_DOWN_K192_FASTPATH_TUNE_ENTRY", None),
-        ("W4A8_GEMM2_DOWN_RUNTIME_K_TUNE_ENTRY", None),
-    )
-    for note, n_loop in priority:
+    for family, nloop in ((3, 4), (2, 4), (1, None), (3, None), (2, None)):
         for candidate in same_bm:
-            if candidate.note == note and (n_loop is None or candidate.n_loop == n_loop):
+            if (candidate.mode // 100_000) % 10 == family and (nloop is None or candidate.n_loop == nloop):
                 return candidate.config()
     return same_bm[0].config() if same_bm else None
 
 
 def run_tune(args) -> None:
-    import torch
-
+    """Tune independent GEMMs through the shared descriptor-based runner."""
+    if args.golden != "torch":
+        raise ValueError("independent GEMM tuning requires the torch matmul golden")
+    if args.perf_only:
+        raise ValueError("independent GEMM tuning requires correctness before timing")
     os.environ["MOE_C_BUILD_DIR"] = args.build_dir
-    os.environ["WHICH_TO_TEST"] = "1"
-    from fused_moe import fused_experts
-
-    logging.getLogger("fused_moe").setLevel(logging.ERROR)
-    torch.set_default_device("cuda")
-
-    shape = Shape(args.e, args.n, args.k, args.topk, args.dtype, args.m)
-    candidates = generate_candidates(shape, args.max_nloop)
-    gemm1_candidates = [c for c in candidates if c.gemm == "gemm1"]
-    gemm2_candidates = [c for c in candidates if c.gemm == "gemm2"]
+    shape = Shape(args.e, args.n, args.k, args.topk, args.dtype, args.m, resolve_cu(args.arch, args.cu))
     out_dir = Path(args.out) if args.out else default_out_dir(shape)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    write_json(out_dir / "candidates.json", {
-        "shape": asdict(shape),
-        "candidates": [asdict(c) for c in candidates],
-        "build_dir": args.build_dir,
-        "golden": args.golden,
-    })
-
-    trials_path = out_dir / "trials.jsonl"
-    final_gemm1: Dict[str, Dict[str, int]] = {}
-    final_gemm2: Dict[str, Dict[str, int]] = {}
-    summary: Dict[str, Any] = {
-        "shape": asdict(shape),
-        "golden": args.golden,
-        "m_results": {},
-        "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-    }
-
-    with trials_path.open("w") as trials:
-        for m in shape.m_values:
-            m_cache = cache_file(out_dir, shape, m, args.golden)
-            if args.perf_only:
-                print(f"PERF_ONLY m={m}", flush=True)
-                data = prepare_low_peak_inputs(shape, m, need_ref=False)
-            else:
-                print(f"TUNE_CACHE m={m} path={m_cache}", flush=True)
-                data = load_or_prepare_golden_cache(shape, m, m_cache, args.route_chunk, args.golden)
-            print(f"{'config':<36} {'mode':>8} {'us':>12}  status", flush=True)
-            m_summary: Dict[str, Any] = {"bm_groups": {}, "best": None}
-            common_bms = sorted({c.block_size_m for c in gemm1_candidates} & {c.block_size_m for c in gemm2_candidates})
-            for bm in common_bms:
-                g1s = [c for c in gemm1_candidates if c.block_size_m == bm]
-                g2s = [c for c in gemm2_candidates if c.block_size_m == bm]
-                fixed_g2 = stage_fixed_config(g2s, bm)
-                if fixed_g2 is None:
-                    m_summary["bm_groups"][str(bm)] = {"failed": "no fixed GEMM2 candidate"}
-                    continue
-
-                g1_results = []
-                for c in g1s:
-                    print_trial_start(c.candidate_id, c.mode)
-                    r = run_trial_inprocess(
-                        shape, m, data, fused_experts, c.config(), fixed_g2, args, f"m{m}_bm{bm}_up_{c.candidate_id}"
-                    )
-                    r["candidate"] = asdict(c)
-                    r["phase"] = "up"
-                    print_trial_finish(r)
-                    trials.write(json.dumps(r) + "\n")
-                    trials.flush()
-                    g1_results.append(r)
-                best_g1 = best_success(g1_results)
-                if best_g1 is None:
-                    m_summary["bm_groups"][str(bm)] = {"failed": "no passing GEMM1 candidate"}
-                    continue
-
-                g2_results = []
-                for c in g2s:
-                    print_trial_start(c.candidate_id, c.mode)
-                    r = run_trial_inprocess(
-                        shape, m, data, fused_experts, best_g1["gemm1_config"], c.config(), args, f"m{m}_bm{bm}_down_{c.candidate_id}"
-                    )
-                    r["candidate"] = asdict(c)
-                    r["phase"] = "down"
-                    print_trial_finish(r)
-                    trials.write(json.dumps(r) + "\n")
-                    trials.flush()
-                    g2_results.append(r)
-                best_g2 = best_success(g2_results)
-                if best_g2 is None:
-                    m_summary["bm_groups"][str(bm)] = {"failed": "no passing GEMM2 candidate", "best_gemm1": best_g1}
-                    continue
-
-                e2e_name = f"m{m}_bm{bm}_e2e"
-                e2e_mode = f"{best_g1['gemm1_config']['MODE']}/{best_g2['gemm2_config']['MODE']}"
-                print_trial_start(e2e_name, e2e_mode)
-                e2e = run_trial_inprocess(
-                    shape, m, data, fused_experts, best_g1["gemm1_config"], best_g2["gemm2_config"], args, f"m{m}_bm{bm}_e2e"
-                )
-                e2e["phase"] = "e2e"
-                print_trial_finish(e2e)
-                trials.write(json.dumps(e2e) + "\n")
-                trials.flush()
-                m_summary["bm_groups"][str(bm)] = {"best_gemm1": best_g1, "best_gemm2": best_g2, "e2e": e2e}
-
-            best = best_success(
-                data["e2e"]
-                for data in m_summary["bm_groups"].values()
-                if isinstance(data, dict) and isinstance(data.get("e2e"), dict)
-            )
-            if best is None:
-                m_summary["best"] = {"failed": "no passing BM group"}
-            else:
-                final_gemm1[str(m)] = best["gemm1_config"]
-                final_gemm2[str(m)] = best["gemm2_config"]
-                m_summary["best"] = best
-            summary["m_results"][str(m)] = m_summary
-            write_json(out_dir / "summary.json", summary)
-            del data
-            if not args.perf_only:
-                unlink_cache(m_cache)
-            torch.cuda.empty_cache()
-
-    summary["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    write_json(out_dir / "summary.json", summary)
-    write_json(out_dir / f"E={shape.e},N={shape.n},K={shape.k},dtype=int8_w4a8.json", final_gemm1)
-    write_json(out_dir / f"E={shape.e},N={shape.n},K={shape.k},dtype=int8_w4a8,is_bottom=True.json", final_gemm2)
-    print(f"wrote tune report to {out_dir / 'summary.json'}")
+    cmd = [sys.executable, str(Path(__file__).with_name("tune_moe_hipc.py")),
+           "--quant", "int8_w4a8", "--arch", args.arch, "--dtype", args.dtype,
+           "--e", str(args.e), "--n", str(args.n), "--k", str(args.k),
+           "--topk", str(args.topk), "--m", *map(str, args.m),
+           "--warmup", str(args.warmup), "--iters", str(args.iters),
+           "--max-nloop", str(args.max_nloop), "--candidate-timeout", str(args.timeout),
+           "--out-dir", str(out_dir), "--bench-direct", "--sweep-direct", "--direct-inprocess"]
+    if shape.cu is not None:
+        cmd.extend(["--cu", str(shape.cu)])
+    subprocess.run(cmd, check=True, cwd=str(Path(__file__).resolve().parents[1]))
 
 
 def bench_config(args) -> None:
     os.environ["MOE_C_BUILD_DIR"] = args.build_dir
     os.environ["WHICH_TO_TEST"] = "1"
-    shape = Shape(args.e, args.n, args.k, args.topk, args.dtype, [args.m])
+    shape = Shape(args.e, args.n, args.k, args.topk, args.dtype, [args.m], resolve_cu(args.arch, args.cu))
     out_dir = Path(args.out) if args.out else default_out_dir(shape)
     m_cache = cache_file(out_dir, shape, args.m, args.golden)
     print(f"TUNE_CACHE m={args.m} path={m_cache}", flush=True)
@@ -1134,6 +941,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--e", type=int, default=DEFAULT_E)
     run.add_argument("--n", type=int, default=DEFAULT_N)
     run.add_argument("--k", type=int, default=DEFAULT_K)
+    run.add_argument("--arch", default="gfx936")
+    run.add_argument("--cu", "--num-cu", dest="cu", type=int, default=None)
     run.add_argument("--topk", type=int, default=DEFAULT_TOPK)
     run.add_argument("--dtype", default=DEFAULT_DTYPE, choices=("bf16", "fp16"))
     run.add_argument("--m", nargs="*", type=int, default=list(DEFAULT_M_VALUES))
@@ -1154,6 +963,8 @@ def build_parser() -> argparse.ArgumentParser:
     bench.add_argument("--e", type=int, default=DEFAULT_E)
     bench.add_argument("--n", type=int, default=DEFAULT_N)
     bench.add_argument("--k", type=int, default=DEFAULT_K)
+    bench.add_argument("--arch", default="gfx936")
+    bench.add_argument("--cu", "--num-cu", dest="cu", type=int, default=None)
     bench.add_argument("--topk", type=int, default=DEFAULT_TOPK)
     bench.add_argument("--dtype", default=DEFAULT_DTYPE, choices=("bf16", "fp16"))
     bench.add_argument("--m", type=int, default=1)

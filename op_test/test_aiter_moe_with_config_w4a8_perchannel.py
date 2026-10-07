@@ -749,6 +749,10 @@ def test_moe_w4a8(m, k, n, e, topk, dtype, show_compare=False):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--tokens", type=int, nargs="+", default=None)
+    parser.add_argument("--e", type=int, default=256, help="Number of experts.")
+    parser.add_argument("--n", type=int, default=256, help="Expert hidden/output dimension.")
+    parser.add_argument("--k", type=int, default=7168, help="Model/input dimension.")
+    parser.add_argument("--topk", type=int, default=8, help="Top-k experts.")
     parser.add_argument("--compare", action="store_true")
     args = parser.parse_args()
 
@@ -764,10 +768,10 @@ if __name__ == "__main__":
     dtype = dtypes.bf16
 
 
-    e = 256
-    topk = 8
-    k = 7168
-    n = 256
+    e = args.e
+    topk = args.topk
+    k = args.k
+    n = args.n
 
     logger.info("=" * 60)
     logger.info("Part 1: Testing get_moe_config for w4a8")
