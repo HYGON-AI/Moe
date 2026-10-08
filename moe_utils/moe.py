@@ -73,6 +73,12 @@ def _gfx_version() -> str:
     return "gfx938"
 
 
+def _resolve_num_cu(arch: Optional[str], num_cu: Optional[int] = None) -> Optional[int]:
+    if num_cu is not None:
+        return num_cu
+    return torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+
+
 def _load_config_file(path: Path) -> Optional[Dict[int, Any]]:
     if not path.exists():
         return None
@@ -93,13 +99,26 @@ def _find_moe_c_config(
     dtype: str,
     is_bottom: bool = False,
     block_size: Optional[int] = None,
+    top_k: Optional[int] = None,
+    num_cu: Optional[int] = None,
 ) -> Optional[Dict[int, Any]]:
     arch = _gfx_version()
+    resolved_cu = _resolve_num_cu(arch, num_cu)
+    if dtype in ("fp8_w8a8", "int8_w8a8", "int8_w4a8"):
+        from .fused_moe_c import _find_closest_channelwise_config
+        return _find_closest_channelwise_config(
+            E, N, dtype, is_bottom, K, top_k, resolved_cu, arch,
+            config_root=str(_config_root()))
     suffix = ",is_bottom=True" if is_bottom else ""
-    names = [
-        f"E={E},N={N},K={K},dtype={dtype}{suffix}.json",
-        f"E={E},N={N},dtype={dtype}{suffix}.json",
-    ]
+    names = []
+    if K:
+        if top_k is not None and resolved_cu is not None:
+            names.append(f"E={E},N={N},K={K},topk={top_k},cu={resolved_cu},dtype={dtype}{suffix}.json")
+    if top_k is not None and resolved_cu is not None:
+        names.append(f"E={E},N={N},topk={top_k},cu={resolved_cu},dtype={dtype}{suffix}.json")
+    if K:
+        names.append(f"E={E},N={N},K={K},dtype={dtype}{suffix}.json")
+    names.append(f"E={E},N={N},dtype={dtype}{suffix}.json")
     category = _moe_c_config_category(dtype, block_size)
     roots = [
         _config_root() / arch / category,
@@ -108,8 +127,8 @@ def _find_moe_c_config(
         _config_root() / dtype,
         _config_root(),
     ]
-    for root in roots:
-        for name in names:
+    for name in names:
+        for root in roots:
             config = _load_config_file(root / name)
             if config is not None:
                 return config
@@ -135,7 +154,7 @@ def get_moe_config(
     quant_type: str,
     **_,
 ) -> Tuple[bool, MoeConfig]:
-    del N2, top_k, dtype
+    del N2, dtype
 
     n = N1 // 2
     dtype_name_by_quant = {
@@ -153,7 +172,8 @@ def get_moe_config(
         raise NotImplementedError(f"Unsupported local MOE quant_type: {quant_type}")
 
     configs = _find_moe_c_config(
-        E=E, N=n, K=K, dtype=dtype_name, is_bottom=False, block_size=block_size
+        E=E, N=n, K=K, dtype=dtype_name, is_bottom=False,
+        block_size=block_size, top_k=top_k,
     )
     if configs is None:
         return False, MoeConfig(quant_type=quant_type)
@@ -176,6 +196,7 @@ def get_moe_config_bottom(
     N: int,
     K: int,
     quant_type: str,
+    top_k: int = 8,
 ) -> Dict[str, Any]:
     dtype_name_by_quant = {
         MoeQuantType.W16A16: "w16a16",
@@ -192,7 +213,8 @@ def get_moe_config_bottom(
         raise NotImplementedError(f"Unsupported local MOE quant_type: {quant_type}")
     block_size = 32 if quant_type == MoeQuantType.WFP4A8 else None
     configs = _find_moe_c_config(
-        E=E, N=N, K=K, dtype=dtype_name, is_bottom=True, block_size=block_size
+        E=E, N=N, K=K, dtype=dtype_name, is_bottom=True,
+        block_size=block_size, top_k=top_k,
     )
     if configs is None:
         raise RuntimeError(f"No {dtype_name} bottom config found for E={E}, N={N}, K={K}")

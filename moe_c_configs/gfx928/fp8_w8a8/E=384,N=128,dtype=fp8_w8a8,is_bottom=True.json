@@ -1,170 +1,114 @@
 {
     "1": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 60038,
-        "SORTING_METHOD": "ck_sorting",
-        "N_LOOP2": 1
+        "MODE": 20001101
     },
     "2": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 60042,
-        "SORTING_METHOD": "ck_sorting",
-        "N_LOOP2": 1
+        "MODE": 20001102
     },
     "3": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 60042,
-        "SORTING_METHOD": "ck_sorting",
-        "N_LOOP2": 1
+        "MODE": 20001102
     },
     "4": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 60038,
-        "SORTING_METHOD": "ck_sorting",
-        "N_LOOP2": 1
+        "MODE": 20001101
     },
     "5": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 60038,
-        "SORTING_METHOD": "ck_sorting",
-        "N_LOOP2": 1
+        "MODE": 20001101
     },
     "6": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 60038,
-        "SORTING_METHOD": "ck_sorting",
-        "N_LOOP2": 1
+        "MODE": 20001101
     },
     "7": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 60038,
-        "SORTING_METHOD": "ck_sorting",
-        "N_LOOP2": 1
+        "MODE": 20001101
     },
     "8": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 60038,
-        "SORTING_METHOD": "ck_sorting",
-        "N_LOOP2": 1
+        "MODE": 20001101
     },
     "9": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 60038,
-        "SORTING_METHOD": "ck_sorting",
-        "N_LOOP2": 1
+        "MODE": 20001101
     },
     "10": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 60038,
-        "SORTING_METHOD": "ck_sorting",
-        "N_LOOP2": 1
+        "MODE": 20001101
     },
     "11": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 60038,
-        "SORTING_METHOD": "ck_sorting",
-        "N_LOOP2": 1
+        "MODE": 20001101
     },
     "12": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 60038,
-        "SORTING_METHOD": "ck_sorting",
-        "N_LOOP2": 1
+        "MODE": 20001101
     },
     "13": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 60038,
-        "SORTING_METHOD": "ck_sorting",
-        "N_LOOP2": 1
+        "MODE": 20001101
     },
     "14": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 60038,
-        "SORTING_METHOD": "ck_sorting",
-        "N_LOOP2": 1
+        "MODE": 20001101
     },
     "15": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 60038,
-        "SORTING_METHOD": "ck_sorting",
-        "N_LOOP2": 1
+        "MODE": 20001101
     },
     "16": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 60038,
-        "SORTING_METHOD": "ck_sorting",
-        "N_LOOP2": 1
+        "MODE": 20001101
     },
     "32": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 60043,
-        "SORTING_METHOD": "ck_sorting",
-        "N_LOOP2": 1
+        "MODE": 20001103
     },
     "64": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 60043,
-        "SORTING_METHOD": "ck_sorting",
-        "N_LOOP2": 1
+        "MODE": 20001103
     },
     "128": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 60046,
-        "SORTING_METHOD": "ck_sorting",
-        "N_LOOP2": 1
+        "MODE": 20001104
     },
     "256": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 60046,
-        "SORTING_METHOD": "ck_sorting",
-        "N_LOOP2": 1
+        "MODE": 20001104
     },
     "512": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 60043,
-        "SORTING_METHOD": "ck_sorting",
-        "N_LOOP2": 1
+        "MODE": 20001103
     },
     "1024": {
         "BLOCK_SIZE_M": 32,
-        "MODE": 100324,
-        "N_LOOP2": 4,
-        "SORTING_METHOD": "ck_sorting"
+        "MODE": 20202104
     },
     "2048": {
         "BLOCK_SIZE_M": 32,
-        "MODE": 100324,
-        "N_LOOP2": 4,
-        "SORTING_METHOD": "ck_sorting"
+        "MODE": 20202104
     },
     "4096": {
         "BLOCK_SIZE_M": 48,
-        "MODE": 100484,
-        "N_LOOP2": 4,
-        "SORTING_METHOD": "ck_sorting"
+        "MODE": 20203104
     },
     "6144": {
         "BLOCK_SIZE_M": 48,
-        "MODE": 100484,
-        "N_LOOP2": 4,
-        "SORTING_METHOD": "ck_sorting"
+        "MODE": 20203104
     },
     "8192": {
         "BLOCK_SIZE_M": 64,
-        "MODE": 100644,
-        "N_LOOP2": 4,
-        "SORTING_METHOD": "ck_sorting"
+        "MODE": 20204104
     },
     "16384": {
         "BLOCK_SIZE_M": 64,
-        "MODE": 100644,
-        "N_LOOP2": 4,
-        "SORTING_METHOD": "ck_sorting"
+        "MODE": 20204104
     },
     "32768": {
         "BLOCK_SIZE_M": 64,
-        "MODE": 100644,
-        "N_LOOP2": 4,
-        "SORTING_METHOD": "ck_sorting"
+        "MODE": 20204104
     }
 }

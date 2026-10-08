@@ -1,16 +1,58 @@
 {
-  "56": {"BLOCK_SIZE_M": 32, "MODE": 100322, "SORTING_METHOD": "ck_sorting"},
-  "112": {"BLOCK_SIZE_M": 32, "MODE": 100322, "SORTING_METHOD": "ck_sorting"},
-  "1400": {"BLOCK_SIZE_M": 32, "MODE": 100322, "SORTING_METHOD": "ck_sorting"},
-  "2240": {"BLOCK_SIZE_M": 48, "MODE": 100482, "SORTING_METHOD": "ck_sorting"},
-  "2800": {"BLOCK_SIZE_M": 64, "MODE": 100642, "SORTING_METHOD": "ck_sorting"},
-  "4480": {"BLOCK_SIZE_M": 48, "MODE": 100482, "SORTING_METHOD": "ck_sorting"},
-  "5712": {"BLOCK_SIZE_M": 64, "MODE": 100642, "SORTING_METHOD": "ck_sorting"},
-  "6552": {"BLOCK_SIZE_M": 64, "MODE": 100642, "SORTING_METHOD": "ck_sorting"},
-  "8960": {"BLOCK_SIZE_M": 64, "MODE": 100642, "SORTING_METHOD": "ck_sorting"},
-  "11424": {"BLOCK_SIZE_M": 64, "MODE": 100642, "SORTING_METHOD": "ck_sorting"},
-  "13104": {"BLOCK_SIZE_M": 64, "MODE": 100642, "SORTING_METHOD": "ck_sorting"},
-  "14336": {"BLOCK_SIZE_M": 64, "MODE": 100642, "SORTING_METHOD": "ck_sorting"},
-  "28672": {"BLOCK_SIZE_M": 64, "MODE": 100642, "SORTING_METHOD": "ck_sorting"},
-  "57344": {"BLOCK_SIZE_M": 64, "MODE": 100642, "SORTING_METHOD": "ck_sorting"}
+  "56": {
+    "MODE": 10002101,
+    "BLOCK_SIZE_M": 32
+  },
+  "112": {
+    "MODE": 10002101,
+    "BLOCK_SIZE_M": 32
+  },
+  "1400": {
+    "MODE": 10203102,
+    "BLOCK_SIZE_M": 48
+  },
+  "2240": {
+    "MODE": 10204102,
+    "BLOCK_SIZE_M": 64
+  },
+  "2800": {
+    "MODE": 10204102,
+    "BLOCK_SIZE_M": 64
+  },
+  "4480": {
+    "MODE": 10204102,
+    "BLOCK_SIZE_M": 64
+  },
+  "5712": {
+    "MODE": 10204102,
+    "BLOCK_SIZE_M": 64
+  },
+  "6552": {
+    "MODE": 10204102,
+    "BLOCK_SIZE_M": 64
+  },
+  "8960": {
+    "MODE": 10204102,
+    "BLOCK_SIZE_M": 64
+  },
+  "11424": {
+    "MODE": 10204102,
+    "BLOCK_SIZE_M": 64
+  },
+  "13104": {
+    "MODE": 10204102,
+    "BLOCK_SIZE_M": 64
+  },
+  "14336": {
+    "MODE": 10204102,
+    "BLOCK_SIZE_M": 64
+  },
+  "28672": {
+    "MODE": 10204102,
+    "BLOCK_SIZE_M": 64
+  },
+  "57344": {
+    "MODE": 10204102,
+    "BLOCK_SIZE_M": 64
+  }
 }

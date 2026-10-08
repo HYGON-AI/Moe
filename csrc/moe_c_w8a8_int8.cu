@@ -25,6 +25,10 @@ static torch::Tensor moe_c_moe_gemm_marlin_w8a8_impl(torch::Tensor input,
   bool tensorwise_scale
   ) {
 
+    // The instantiated W8A8 INT8 kernels consume CK-sorting packed IDs.
+    // Do not let a future moe_align mode fall through to the same callable.
+    validate_moe_channel_layout(mode, /*expected_sorting=*/0);
+
     const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
     const int size_m = input.size(0); 
     const int EXPERTS = b_qweight.size(0);
@@ -45,228 +49,33 @@ static torch::Tensor moe_c_moe_gemm_marlin_w8a8_impl(torch::Tensor input,
     bool first_stage = true;
     torch::Tensor output_alias = output.alias();
 
-    const float* topk_weights_ptr; // 第一阶段这里为null
+    const float* topk_weights_ptr = nullptr;
     if (topk_weights.has_value()){
       topk_weights_ptr = (const float*)topk_weights.value().data_ptr();
       first_stage = false;
     }
 
     int num_pad = 0;
-    if (output.scalar_type() == at::ScalarType::BFloat16){
-    if (input.scalar_type() == at::ScalarType::Char){
-      if(first_stage){
-     
-        int64_t EM = sorted_token_ids.size(0); // 一维线性化的token id
-        GemmParams<char,bhalf_t> params_in(
-          (const char*)input.data_ptr<int8_t>(), 
-          (const char*)b_qweight.data_ptr<int8_t>(), 
-          (bhalf_t*)output_alias.data_ptr(),
-          (float*)a_scale.data_ptr(), 
-          (float*)b_scale.data_ptr(),  
-          topk_weights_ptr,
-          sorted_token_ids.data_ptr<int32_t>(),
-          expert_ids.data_ptr<int32_t>(), 
-          num_pad, //num_tokens_post_pad[0].item<int>(), //这里获取值 会造成device->host的拷贝和一部分空泡
-          num_tokens_post_pad.data_ptr<int32_t>(),
-          size_m,
-          size_n,
-          size_k,
-          stride_asm,
-          stride_ask,
-          stride_bse,
-          stride_bsn,
-          stride_bsk,
-          EM,
-          top_k,
-          real_topk,
-          is_marlin,
-          tensorwise_scale
-        );
-
-        if(config_m <= 512){
-          auto it = kernel_maps_gemm1_decode<bhalf_t>.find(mode);
-          if (it != kernel_maps_gemm1_decode<bhalf_t>.end()) {
-              it->second(params_in);
-          } else {
-              printf("bfloat version gemm1 No matching kernel configuration found, using default settings \n");
-          }
-        }else{ //decode 
-          
-          auto it = kernel_maps_gemm1_prefill<bhalf_t>.find(mode);
-          if ( it != kernel_maps_gemm1_prefill<bhalf_t>.end()) {
-              it->second(params_in);
-              
-          } else {
-              printf("bfloat version gemm1 No matching kernel configuration found, using default settings \n");
-          }
-        }
-        
-        
-      }else{ //gemm2
-        int64_t EM = sorted_token_ids.size(0); // 一维线性化的token id
-          
-        // 使用int8类型处理
-        GemmParams<char,bhalf_t> params_in(
-          (const char*)input.data_ptr<int8_t>(), 
-          (const char*)b_qweight.data_ptr<int8_t>(), 
-          (bhalf_t*)output_alias.data_ptr(),
-          (float*)a_scale.data_ptr(), 
-          (float*)b_scale.data_ptr(),  
-          topk_weights_ptr,
-          sorted_token_ids.data_ptr<int32_t>(),
-          expert_ids.data_ptr<int32_t>(), 
-          num_pad, //num_tokens_post_pad[0].item<int>(),
-          num_tokens_post_pad.data_ptr<int32_t>(),
-          size_m,
-          size_n,
-          size_k,
-          stride_asm,
-          stride_ask,
-          stride_bse,
-          stride_bsn,
-          stride_bsk,
-          EM,
-          top_k,
-          real_topk,
-          is_marlin,
-          tensorwise_scale
-        );
-
-        if(config_m <= 512 ){
-          auto it = kernel_maps_gemm2_decode<bhalf_t>.find(mode);
-          if (it != kernel_maps_gemm2_decode<bhalf_t>.end()) {
-              it->second(params_in);
-          } else {
-              printf("bfloat version gemm2 No matching kernel configuration found, using default settings \n");
-          }
-        }else
-        {
-          
-          auto it = kernel_maps_gemm2_prefill<bhalf_t>.find(mode);
-          if (    it != kernel_maps_gemm2_prefill<bhalf_t>.end()) {
-              it->second(params_in);
-          } else {
-
-              printf("bfloat version gemm2 No matching kernel configuration found, using default settings \n");
-
-          }
-
-        }
-              // hipDeviceSynchronize();
-
-      }
+    TORCH_CHECK(input.scalar_type() == at::ScalarType::Char,
+                "moe_w8a8_gemm only supports int8");
+    TORCH_CHECK(output.scalar_type() == at::ScalarType::BFloat16 ||
+                    output.scalar_type() == at::ScalarType::Half,
+                "moe_w8a8_gemm only supports bf16/fp16 output");
+    if (output.scalar_type() == at::ScalarType::BFloat16) {
+      moe_marlin_w8a8_dispatch_gemm_stages<bhalf_t, int8_t>(
+          first_stage, input, b_qweight, output_alias, a_scale, b_scale,
+          topk_weights_ptr, sorted_token_ids, expert_ids, num_pad,
+          num_tokens_post_pad, size_m, size_n, size_k, stride_asm, stride_ask,
+          stride_bse, stride_bsn, stride_bsk, top_k, real_topk, is_marlin,
+          mode, config_m, input.size(1), tensorwise_scale);
     } else {
+      moe_marlin_w8a8_dispatch_gemm_stages<half, int8_t>(
+          first_stage, input, b_qweight, output_alias, a_scale, b_scale,
+          topk_weights_ptr, sorted_token_ids, expert_ids, num_pad,
+          num_tokens_post_pad, size_m, size_n, size_k, stride_asm, stride_ask,
+          stride_bse, stride_bsn, stride_bsk, top_k, real_topk, is_marlin,
+          mode, config_m, input.size(1), tensorwise_scale);
     }
-    
-  }
-  else if (output.scalar_type() == at::ScalarType::Half)
-  {
-    if (input.scalar_type() == at::ScalarType::Char){
-      if(first_stage){
-     
-        int64_t EM = sorted_token_ids.size(0); // 一维线性化的token id
-        GemmParams<char,half> params_in(
-          (const char*)input.data_ptr<int8_t>(), 
-          (const char*)b_qweight.data_ptr<int8_t>(), 
-          (half*)output_alias.data_ptr(),
-          (float*)a_scale.data_ptr(), 
-          (float*)b_scale.data_ptr(),  
-          topk_weights_ptr,
-          sorted_token_ids.data_ptr<int32_t>(),
-          expert_ids.data_ptr<int32_t>(), 
-          num_pad, //num_tokens_post_pad[0].item<int>(), //这里获取值 会造成device->host的拷贝和一部分空泡
-          num_tokens_post_pad.data_ptr<int32_t>(),
-          size_m,
-          size_n,
-          size_k,
-          stride_asm,
-          stride_ask,
-          stride_bse,
-          stride_bsn,
-          stride_bsk,
-          EM,
-          top_k,
-          real_topk,
-          is_marlin,
-          tensorwise_scale
-        );
-
-        if(config_m <= 512){
-          auto it = kernel_maps_gemm1_decode<half>.find(mode);
-          if (it != kernel_maps_gemm1_decode<half>.end()) {
-              it->second(params_in);
-          } else {
-              printf("half version gemm1 No matching kernel configuration found, using default settings \n");
-          }
-        }else{ //decode 
-          auto it = kernel_maps_gemm1_prefill<half>.find(mode);
-          if ( it != kernel_maps_gemm1_prefill<half>.end()) {
-              it->second(params_in);
-              
-          } else {
-              printf("half version gemm1 No matching kernel configuration found \n");
-
-          }
-        }
-        
-        
-      }else{ //gemm2
-        int64_t EM = sorted_token_ids.size(0); // 一维线性化的token id
-          
-        // 使用int8类型处理
-        GemmParams<char,half> params_in(
-          (const char*)input.data_ptr<int8_t>(), 
-          (const char*)b_qweight.data_ptr<int8_t>(), 
-          (half*)output_alias.data_ptr(),
-          (float*)a_scale.data_ptr(), 
-          (float*)b_scale.data_ptr(),  
-          topk_weights_ptr,
-          sorted_token_ids.data_ptr<int32_t>(),
-          expert_ids.data_ptr<int32_t>(), 
-          num_pad, //num_tokens_post_pad[0].item<int>(),
-          num_tokens_post_pad.data_ptr<int32_t>(),
-          size_m,
-          size_n,
-          size_k,
-          stride_asm,
-          stride_ask,
-          stride_bse,
-          stride_bsn,
-          stride_bsk,
-          EM,
-          top_k,
-          real_topk,
-          is_marlin,
-          tensorwise_scale
-        );
-
-        if(config_m <= 512 ){
-          auto it = kernel_maps_gemm2_decode<half>.find(mode);
-          if (it != kernel_maps_gemm2_decode<half>.end()) {
-              it->second(params_in);
-          } else {
-              printf("half version gemm2 No matching kernel configuration found, using default settings \n");
-          }
-        }else
-        {
-          // mode =86;
-          auto it = kernel_maps_gemm2_prefill<half>.find(mode);
-          if (  it != kernel_maps_gemm2_prefill<half>.end()) {
-              it->second(params_in);
-          } else {
-
-              printf("half version gemm2  No matching kernel configuration found \n");
-
-          }
-
-        }
-              // hipDeviceSynchronize();
-
-      }
-    } else {
-      TORCH_CHECK(false, "moe_w8a8_gemm only supports int8");
-    }
-  }
 
     return output;
 }

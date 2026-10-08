@@ -21,7 +21,7 @@ static inline void dispatch_wfp4a16_kernel_map(
     const char* timecost_path) {
   auto it = kernel_map.find(mode);
   if (it == kernel_map.end()) {
-    printf("wfp4a16 No matching kernel configuration found. mode %ld\n", mode);
+    TORCH_CHECK(false, "unsupported wfp4a16 kernel mode: ", mode);
     return;
   }
 

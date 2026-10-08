@@ -154,13 +154,14 @@ def run_w4a8_perchannel_golden(
 
     This mirrors the W4A8 kernel numerics: per-token int8 activation
     quantization, per-channel int4 weight scales, silu_and_mul, then routed
-    weighted sum.
+    weighted sum. Both GEMMs batch routed tokens by expert, while preserving
+    the output dtype conversion between activation and quantization stages.
     """
     hidden_states = hidden_states.contiguous()
     topk_weights = topk_weights.contiguous()
     topk_ids = topk_ids.contiguous()
-    w1 = w1.to(torch.float32).contiguous()
-    w2 = w2.to(torch.float32).contiguous()
+    w1 = w1.contiguous()
+    w2 = w2.contiguous()
     w1_scale = w1_scale.to(torch.float32).contiguous()
     w2_scale = w2_scale.to(torch.float32).contiguous()
 
@@ -188,12 +189,17 @@ def run_w4a8_perchannel_golden(
     qinput1 = qinput1.to(torch.float32)
     a1_scale = a1_scale.to(torch.float32)
 
-    for token_idx in range(m):
-        activation = qinput1[token_idx] * a1_scale[token_idx]
-        for route_idx in range(topk):
-            expert = int(topk_ids[token_idx, route_idx].item())
-            fc1_weight = w1[expert] * w1_scale[expert]
-            stage1[token_idx, route_idx] = activation.matmul(fc1_weight.t()).to(out_dtype)
+    flat_experts = topk_ids.reshape(-1)
+    expert_routes = [torch.where(flat_experts == expert)[0] for expert in range(w1.shape[0])]
+    stage1_flat = stage1.view(m * topk, n1)
+    input1 = qinput1 * a1_scale
+    for expert, routes in enumerate(expert_routes):
+        if routes.numel() == 0:
+            continue
+        tokens = routes // topk
+        fc1_weight = w1[expert].to(torch.float32) * w1_scale[expert]
+        route_out = input1[tokens].matmul(fc1_weight.t()).to(out_dtype)
+        stage1_flat.index_copy_(0, routes, route_out)
 
     stage1_2d = stage1.view(m * topk, n1)
     activated = (
@@ -216,15 +222,16 @@ def run_w4a8_perchannel_golden(
     qinput2 = qinput2.to(torch.float32)
     a2_scale = a2_scale.to(torch.float32)
 
-    for token_idx in range(m):
-        for route_idx in range(topk):
-            route = token_idx * topk + route_idx
-            expert = int(topk_ids[token_idx, route_idx].item())
-            activation = qinput2[route] * a2_scale[route]
-            fc2_weight = w2[expert] * w2_scale[expert]
-            route_out = activation.matmul(fc2_weight.t())
-            route_out = route_out * topk_weights[token_idx, route_idx].to(torch.float32)
-            stage2[token_idx, route_idx] = route_out.to(out_dtype)
+    input2 = qinput2 * a2_scale
+    stage2_flat = stage2.view(m * topk, hidden_out)
+    route_weights = topk_weights.reshape(-1, 1).to(torch.float32)
+    for expert, routes in enumerate(expert_routes):
+        if routes.numel() == 0:
+            continue
+        fc2_weight = w2[expert].to(torch.float32) * w2_scale[expert]
+        route_out = input2[routes].matmul(fc2_weight.t())
+        route_out = route_out * route_weights[routes]
+        stage2_flat.index_copy_(0, routes, route_out.to(out_dtype))
 
     out = stage2.sum(dim=1).to(out_dtype)
     if routed_scaling_factor != 1.0:

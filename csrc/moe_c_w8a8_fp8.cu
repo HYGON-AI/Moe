@@ -27,6 +27,11 @@ static torch::Tensor moe_c_moe_gemm_marlin_w8a8_fp8_impl(torch::Tensor input,
   ) {
 
 
+    TORCH_CHECK(input.scalar_type() == at::ScalarType::Float8_e4m3fn,
+                "moe_w8a8_fp8_gemm requires Float8_e4m3fn input");
+    TORCH_CHECK(output.scalar_type() == at::ScalarType::BFloat16 ||
+                    output.scalar_type() == at::ScalarType::Half,
+                "moe_w8a8_fp8_gemm only supports bf16/fp16 output");
     const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
     const int size_m = input.size(0); 
     const int EXPERTS = b_qweight.size(0);
@@ -48,7 +53,7 @@ static torch::Tensor moe_c_moe_gemm_marlin_w8a8_fp8_impl(torch::Tensor input,
     bool first_stage = true;
     torch::Tensor output_alias = output.alias();
 
-    const float* topk_weights_ptr; // 第一阶段这里为null
+    const float* topk_weights_ptr = nullptr; // GEMM1 has no routing weights.
     if (topk_weights.has_value()){
       topk_weights_ptr = (const float*)topk_weights.value().data_ptr();
       first_stage = false;
@@ -58,38 +63,6 @@ static torch::Tensor moe_c_moe_gemm_marlin_w8a8_fp8_impl(torch::Tensor input,
 
     if (output.scalar_type() == at::ScalarType::BFloat16){
     if (input.scalar_type() == at::ScalarType::Float8_e4m3fn){
-      if(EXPERTS == 288){
-
-        
-          moe_marlin_w8a8_dispatch_gemm_stages_n160<bhalf_t, at::Float8_e4m3fn>(
-          first_stage,
-          input,
-          b_qweight,
-          output_alias,
-          a_scale,
-          b_scale,
-          topk_weights_ptr,
-          sorted_token_ids,
-          expert_ids,
-          num_pad,
-          num_tokens_post_pad,
-          size_m,
-          size_n,
-          size_k,
-          stride_asm,
-          stride_ask,
-          stride_bse,
-          stride_bsn,
-          stride_bsk,
-          top_k,
-          real_topk,
-          is_marlin,
-          mode,
-          config_m,
-          real_size_k,
-          tensorwise_scale);
-      }
-      else{
         moe_marlin_w8a8_dispatch_gemm_stages<bhalf_t, at::Float8_e4m3fn>(
           first_stage,
           input,
@@ -117,13 +90,6 @@ static torch::Tensor moe_c_moe_gemm_marlin_w8a8_fp8_impl(torch::Tensor input,
           config_m,
           real_size_k,
           tensorwise_scale);
-      }
-      
-
-          
-        
-        
-       
     } else {
     }
     
@@ -131,39 +97,6 @@ static torch::Tensor moe_c_moe_gemm_marlin_w8a8_fp8_impl(torch::Tensor input,
   else if (output.scalar_type() == at::ScalarType::Half)
   {
     if (input.scalar_type() == at::ScalarType::Float8_e4m3fn){
-      if(EXPERTS == 288){
-
-        
-          moe_marlin_w8a8_dispatch_gemm_stages_n160<half, at::Float8_e4m3fn>(
-          first_stage,
-          input,
-          b_qweight,
-          output_alias,
-          a_scale,
-          b_scale,
-          topk_weights_ptr,
-          sorted_token_ids,
-          expert_ids,
-          num_pad,
-          num_tokens_post_pad,
-          size_m,
-          size_n,
-          size_k,
-          stride_asm,
-          stride_ask,
-          stride_bse,
-          stride_bsn,
-          stride_bsk,
-          top_k,
-          real_topk,
-          is_marlin,
-          mode,
-          config_m,
-          real_size_k,
-          tensorwise_scale);
-      }
-      else{
-         
         moe_marlin_w8a8_dispatch_gemm_stages<half, at::Float8_e4m3fn>(
           first_stage,
           input,
@@ -191,13 +124,6 @@ static torch::Tensor moe_c_moe_gemm_marlin_w8a8_fp8_impl(torch::Tensor input,
           config_m,
           real_size_k,
           tensorwise_scale);
-      }
-          
-
-        
-              // hipDeviceSynchronize();
-
-      
     } else {
     }
     

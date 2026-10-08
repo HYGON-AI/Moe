@@ -8,6 +8,21 @@
 #include "moe_wna16_utils.h"
 #include "moe_w4a8_opt.h"
 
+// HIPC channelwise mode format: S F K MM VVV.  W4A8 uses the same public
+// encoding as W8A8; the family/profile pair is translated to the existing
+// launcher ID below so the kernel templates are not duplicated.
+static inline bool is_w4a8_channel_mode(int64_t mode) {
+  return mode >= 10000000LL && mode < 30000000LL;
+}
+
+static inline int w4a8_channel_mode_family(int64_t mode) {
+  return static_cast<int>((mode / 100000LL) % 10);
+}
+
+static inline int w4a8_channel_mode_sorting(int64_t mode) {
+  return static_cast<int>((mode / 1000000LL) % 10);
+}
+
 template <typename scalar_t>
 static inline bool dispatch_w4a8_kernel_map(
     const std::unordered_map<int, KernelFunc_w4a8<scalar_t>>& kernel_map,
@@ -90,6 +105,9 @@ static void moe_c_moe_gemm_marlin_w4a8_impl(
               "w4a8 requires int8 activation input");
 
   const bool first_stage = !topk_weights.has_value();
+  TORCH_CHECK(is_w4a8_channel_mode(mode), "unsupported W4A8 mode encoding: ", mode);
+  TORCH_CHECK(mode / 10000000 == (first_stage ? 1 : 2),
+              "W4A8 mode stage does not match GEMM stage: ", mode);
   const bool gemm1_n256_layout = b_scale.stride(0) == 256;
   const float* topk_weights_ptr =
       topk_weights.has_value() ? topk_weights.value().data_ptr<float>() : nullptr;
@@ -107,18 +125,24 @@ static void moe_c_moe_gemm_marlin_w4a8_impl(
       top_k,
       delta);
 
+  TORCH_CHECK(is_w4a8_channel_mode(mode),
+              "legacy W4A8 mode is no longer supported: ", mode);
+  TORCH_CHECK(w4a8_channel_mode_sorting(mode) == 1,
+              "W4A8 channelwise mode must use moe_align metadata: ", mode);
   bool launched = false;
+  const int64_t dispatch_mode = mode;
   if (first_stage) {
-    if (config_m <= 512) {
+    const bool descriptive_decode = w4a8_channel_mode_family(mode) == 0;
+    if (descriptive_decode) {
       launched = dispatch_w4a8_kernel_map(
-          kernel_maps_gemm1_decode_w4a8<scalar_t>, mode, params);
+          kernel_maps_gemm1_decode_w4a8<scalar_t>, dispatch_mode, params);
       TORCH_CHECK(launched, "unsupported w4a8 GEMM1 decode kernel mode: ", mode);
       return;
     }
 
     if (gemm1_n256_layout) {
       launched = dispatch_w4a8_kernel_map(
-          kernel_maps_gemm1_prefill_w4a8_gemm1n256<scalar_t>, mode, params);
+          kernel_maps_gemm1_prefill_w4a8_gemm1n256<scalar_t>, dispatch_mode, params);
       TORCH_CHECK(launched,
                   "unsupported w4a8 GEMM1N256 prefill kernel mode: ",
                   mode);
@@ -126,20 +150,21 @@ static void moe_c_moe_gemm_marlin_w4a8_impl(
     }
 
     launched = dispatch_w4a8_kernel_map(
-        kernel_maps_gemm1_prefill_w4a8<scalar_t>, mode, params);
+        kernel_maps_gemm1_prefill_w4a8<scalar_t>, dispatch_mode, params);
     TORCH_CHECK(launched, "unsupported w4a8 GEMM1 prefill kernel mode: ", mode);
     return;
   }
 
-  if (config_m <= 512) {
+  const bool descriptive_decode = w4a8_channel_mode_family(mode) == 0;
+  if (descriptive_decode) {
     launched = dispatch_w4a8_kernel_map(
-        kernel_maps_gemm2_decode_w4a8<scalar_t>, mode, params);
+        kernel_maps_gemm2_decode_w4a8<scalar_t>, dispatch_mode, params);
     TORCH_CHECK(launched, "unsupported w4a8 GEMM2 decode kernel mode: ", mode);
     return;
   }
 
   launched = dispatch_w4a8_kernel_map(
-      kernel_maps_gemm2_prefill_w4a8<scalar_t>, mode, params);
+      kernel_maps_gemm2_prefill_w4a8<scalar_t>, dispatch_mode, params);
   TORCH_CHECK(launched, "unsupported w4a8 GEMM2 prefill kernel mode: ", mode);
 }
 
