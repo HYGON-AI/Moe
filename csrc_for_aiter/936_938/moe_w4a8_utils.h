@@ -2123,7 +2123,7 @@ __forceinline__ __device__ void gemm_nt_marlin_decode_w4a8(
     } weight_reg_tmp[WARP_N / 32][WARP_K / READ_K][STAGE];
 
 #pragma unroll
-    for (int i = 0; i < STAGE - 1; ++i)
+    for (int i = 0; i < STAGE - 1 && i < size_k / BLOCK_K; ++i)
     {
 #pragma unroll
         for (int m_tile = 0; m_tile < WARP_M / MFMA_M; m_tile++)
@@ -2450,6 +2450,48 @@ __forceinline__ __device__ void gemm_nt_marlin_decode_w4a8(
     }
     else
     {
+        // Drain the valid initial tiles when K is shorter than the pipeline.
+#pragma unroll
+        for (int i = 0; i < STAGE - 1 && i < size_k / BLOCK_K; ++i)
+        {
+            vmcnt_wait(0);
+#pragma unroll
+            for (int n_tile = 0; n_tile < WARP_N / 32; ++n_tile)
+            {
+#pragma unroll
+                for (int it = 0; it < 2; ++it)
+                {
+#pragma unroll
+                    for (int k_tile = 0; k_tile < WARP_K / MFMA_K; ++k_tile)
+                    {
+                        const uint32_t packed = weight_reg_tmp[n_tile][k_tile / (READ_K / MFMA_K)][i].i[
+                            it * 2 + k_tile % (READ_K / MFMA_K)];
+                        B_reg[n_tile * 2 + it][i].int2_array[k_tile][0] = packed & 0xf0f0f0f0;
+                        B_reg[n_tile * 2 + it][i].int2_array[k_tile][1] = (packed << 4) & 0xf0f0f0f0;
+                    }
+                }
+            }
+#pragma unroll
+            for (int m_tile = 0; m_tile < WARP_M / MFMA_M; ++m_tile)
+            {
+#pragma unroll
+                for (int n_tile = 0; n_tile < WARP_N / 32; ++n_tile)
+                {
+#pragma unroll
+                    for (int it = 0; it < 2; ++it)
+                    {
+#pragma unroll
+                        for (int k_tile = 0; k_tile < WARP_K / MFMA_K; ++k_tile)
+                        {
+                            auto &acc = C_reg[0][m_tile * (WARP_N / MFMA_N) + n_tile * 2 + it];
+                            acc = mmac<Element>(
+                                *(vec<Element, 8> *)(&A_reg[m_tile][i].int8t_array[k_tile]),
+                                *(vec<Element, 8> *)(&B_reg[n_tile * 2 + it][i].int8t_array[k_tile]), acc);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     extern __shared__ int out_smem[];

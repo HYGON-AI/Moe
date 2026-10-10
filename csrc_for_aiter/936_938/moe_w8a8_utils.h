@@ -94,8 +94,11 @@ __forceinline__ __device__ void gemm_nt_marlin_prefill(
         g_row_B[n_tile] = (warp_n_id * WARP_N + row_id + n_tile * MFMA_N) * 64 + col_id * 16; // warp内部k连续[warpn, 64] warp外部在N方向连续
     }
 
+    // Short K must neither prefetch nor accumulate nonexistent tiles.
+    constexpr int PREFETCH_TILES = (SIZE_K / BLOCK_K < STAGE - 1)
+                                       ? SIZE_K / BLOCK_K : STAGE - 1;
 #pragma unroll
-    for (int i = 0; i < STAGE - 1; ++i)
+    for (int i = 0; i < PREFETCH_TILES; ++i)
     {
 #pragma unroll
         for (int m_tile = 0; m_tile < WARP_M / MFMA_M; m_tile++)
@@ -291,9 +294,9 @@ __forceinline__ __device__ void gemm_nt_marlin_prefill(
     else
     {
 #pragma unroll
-        for (int i = 1; i < STAGE; ++i)
+        for (int i = 1; i <= PREFETCH_TILES; ++i)
         {
-            vmcnt_wait((WARP_M / MFMA_M * WARP_K / READ_K + WARP_N / MFMA_N * WARP_K / READ_K) * (STAGE - 1 - i));
+            vmcnt_wait((WARP_M / MFMA_M * WARP_K / READ_K + WARP_N / MFMA_N * WARP_K / READ_K) * (PREFETCH_TILES - i));
 
 #pragma unroll
             for (int m_tile = 0; m_tile < WARP_M / MFMA_M; m_tile++)
@@ -1132,8 +1135,11 @@ __forceinline__ __device__ void gemm_nt_marlin_decode_new(
         g_row_B[n_tile] = (warp_n_id * WARP_N + row_id + n_tile * MFMA_N) * 64 + col_id * 16; // warp内部k连续[warpn, 64] warp外部在N方向连续
     }
 
+    // Short K must neither prefetch nor accumulate nonexistent tiles.
+    constexpr int PREFETCH_TILES = (SIZE_K / BLOCK_K < STAGE - 1)
+                                       ? SIZE_K / BLOCK_K : STAGE - 1;
 #pragma unroll
-    for (int i = 0; i < STAGE - 1; ++i)
+    for (int i = 0; i < PREFETCH_TILES; ++i)
     {
 #pragma unroll
         for (int m_tile = 0; m_tile < WARP_M / MFMA_M; m_tile++)
@@ -1335,9 +1341,9 @@ __forceinline__ __device__ void gemm_nt_marlin_decode_new(
     else
     {
 #pragma unroll
-        for (int i = 1; i < STAGE; ++i)
+        for (int i = 1; i <= PREFETCH_TILES; ++i)
         {
-            vmcnt_wait((WARP_M / MFMA_M * WARP_K / READ_K + WARP_N / MFMA_N * WARP_K / READ_K) * (STAGE - 1 - i));
+            vmcnt_wait((WARP_M / MFMA_M * WARP_K / READ_K + WARP_N / MFMA_N * WARP_K / READ_K) * (PREFETCH_TILES - i));
 
 #pragma unroll
             for (int m_tile = 0; m_tile < WARP_M / MFMA_M; m_tile++)
@@ -1485,8 +1491,11 @@ __forceinline__ __device__ void gemm_nt_marlin_decode(
                           row_id * 16 + col_id * 16 * 16;
     }
 
+    // Short K must neither prefetch nor accumulate nonexistent tiles.
+    constexpr int PREFETCH_TILES = (SIZE_K / BLOCK_K < STAGE - 1)
+                                       ? SIZE_K / BLOCK_K : STAGE - 1;
 #pragma unroll
-    for (int i = 0; i < STAGE - 1; ++i)
+    for (int i = 0; i < PREFETCH_TILES; ++i)
     {
 #pragma unroll
         for (int m_tile = 0; m_tile < WARP_M / MFMA_M; m_tile++)
@@ -1682,9 +1691,9 @@ __forceinline__ __device__ void gemm_nt_marlin_decode(
     else
     {
 #pragma unroll
-        for (int i = 1; i < STAGE; ++i)
+        for (int i = 1; i <= PREFETCH_TILES; ++i)
         {
-            vmcnt_wait((WARP_M / MFMA_M * WARP_K / READ_K + WARP_N / MFMA_N * WARP_K / READ_K) * (STAGE - 1 - i));
+            vmcnt_wait((WARP_M / MFMA_M * WARP_K / READ_K + WARP_N / MFMA_N * WARP_K / READ_K) * (PREFETCH_TILES - i));
 
 #pragma unroll
             for (int m_tile = 0; m_tile < WARP_M / MFMA_M; m_tile++)
@@ -2349,8 +2358,11 @@ __forceinline__ __device__ void gemm_nt_marlin_prefill_fp8(
         g_row_B[n_tile] = (warp_n_id * WARP_N + row_id + n_tile * MFMA_N) * 64 + col_id * 16; // warp内部k连续[warpn, 64] warp外部在N方向连续
     }
 
+    // Short K must neither prefetch nor accumulate nonexistent tiles.
+    constexpr int PREFETCH_TILES = (SIZE_K / BLOCK_K < STAGE - 1)
+                                       ? SIZE_K / BLOCK_K : STAGE - 1;
 #pragma unroll
-    for (int i = 0; i < STAGE - 1; ++i)
+    for (int i = 0; i < PREFETCH_TILES; ++i)
     {
 #pragma unroll
         for (int m_tile = 0; m_tile < WARP_M / MFMA_M; m_tile++)
@@ -2546,9 +2558,9 @@ __forceinline__ __device__ void gemm_nt_marlin_prefill_fp8(
     else
     {
 #pragma unroll
-        for (int i = 1; i < STAGE; ++i)
+        for (int i = 1; i <= PREFETCH_TILES; ++i)
         {
-            vmcnt_wait((WARP_M / MFMA_M * WARP_K / READ_K + WARP_N / MFMA_N * WARP_K / READ_K) * (STAGE - 1 - i));
+            vmcnt_wait((WARP_M / MFMA_M * WARP_K / READ_K + WARP_N / MFMA_N * WARP_K / READ_K) * (PREFETCH_TILES - i));
 
 #pragma unroll
             for (int m_tile = 0; m_tile < WARP_M / MFMA_M; m_tile++)
@@ -3347,8 +3359,11 @@ __forceinline__ __device__ void gemm_nt_marlin_decode_fp8(
         g_row_B[n_tile] = (warp_n_id * (WARP_N / MFMA_N) + n_tile) * 16 * 64 + row_id * 16 + col_id * 16 * 16; // align decode gemm1 with gemm2-shuffled weights
     }
 
+    // Short K must neither prefetch nor accumulate nonexistent tiles.
+    constexpr int PREFETCH_TILES = (SIZE_K / BLOCK_K < STAGE - 1)
+                                       ? SIZE_K / BLOCK_K : STAGE - 1;
 #pragma unroll
-    for (int i = 0; i < STAGE - 1; ++i)
+    for (int i = 0; i < PREFETCH_TILES; ++i)
     {
 #pragma unroll
         for (int m_tile = 0; m_tile < WARP_M / MFMA_M; m_tile++)
@@ -3544,9 +3559,9 @@ __forceinline__ __device__ void gemm_nt_marlin_decode_fp8(
     else
     {
 #pragma unroll
-        for (int i = 1; i < STAGE; ++i)
+        for (int i = 1; i <= PREFETCH_TILES; ++i)
         {
-            vmcnt_wait((WARP_M / MFMA_M * WARP_K / READ_K + WARP_N / MFMA_N * WARP_K / READ_K) * (STAGE - 1 - i));
+            vmcnt_wait((WARP_M / MFMA_M * WARP_K / READ_K + WARP_N / MFMA_N * WARP_K / READ_K) * (PREFETCH_TILES - i));
 
 #pragma unroll
             for (int m_tile = 0; m_tile < WARP_M / MFMA_M; m_tile++)

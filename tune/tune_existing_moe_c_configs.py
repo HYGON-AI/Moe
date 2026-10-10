@@ -31,6 +31,8 @@ AITer_ROOT = ROOT.parents[1]
 CONFIG_ROOT = ROOT / "moe_c_configs"
 TUNE_HIPC = ROOT / "tune" / "tune_moe_hipc.py"
 TUNE_W4A8 = ROOT / "tune" / "tune_moe_w4a8_perchannel.py"
+sys.path.insert(0, str(ROOT))
+from moe_utils.fused_moe_c import CSV_NAMES, rows_from_pair, write_config_csv
 
 
 @dataclass(frozen=True)
@@ -100,6 +102,20 @@ def load_m_values(top_path: Path, bottom_path: Path) -> Tuple[int, ...]:
 
 
 def discover_shapes(arch: str, quant: str, config_root: Path = CONFIG_ROOT) -> List[ConfigShape]:
+    if (config_root / CSV_NAMES[quant]).is_file():
+        groups = {}
+        with (config_root / CSV_NAMES[quant]).open(newline="") as stream:
+            for row in csv.DictReader(stream):
+                if row["arch"] != arch or row["quant_type"] != quant + "_channel" or row["indtype"] != "torch.bfloat16":
+                    continue
+                key = (int(row["expert"]), int(row["inter_dim"]), int(row["model_dim"]),
+                       int(row["topk"] or 8), int(row["cu_num"]) if row["cu_num"] else None)
+                groups.setdefault(key, set()).add(int(row["token"]))
+        shapes = []
+        for (e, n, k, topk, cu), tokens in sorted(groups.items(), key=lambda item: str(item[0])):
+            name = f"E={e},N={n},K={k},topk={topk},dtype={quant}.json"
+            shapes.append(ConfigShape(quant, arch, e, n, k, topk, cu, name, bottom_name(name), tuple(sorted(tokens))))
+        return shapes
     base = config_root / arch / quant
     shapes: List[ConfigShape] = []
     for path in sorted(base.glob("*.json")):
@@ -214,6 +230,13 @@ def write_json(path: Path, data) -> None:
         f.write("\n")
 
 
+def write_shape_csv(shape, out_dir, top, bottom):
+    rows = rows_from_pair(top, bottom, shape.arch, shape.quant, shape.e, shape.n,
+                          shape.k, shape.topk, shape.cu or default_cu_for_arch(shape.arch),
+                          ("torch.bfloat16",))
+    write_config_csv(str(out_dir / "configs" / CSV_NAMES[shape.quant]), rows)
+
+
 def tune_w8a8(shape: ConfigShape, args: argparse.Namespace, env: Dict[str, str], manifest: List[Dict]) -> None:
     shape_run = args.out_dir / "runs" / shape.quant / shape.label
     cu = shape.cu if shape.cu is not None else default_cu_for_arch(shape.arch)
@@ -267,6 +290,7 @@ def tune_w8a8(shape: ConfigShape, args: argparse.Namespace, env: Dict[str, str],
     config_dir = args.out_dir / "configs" / shape.arch / shape.quant
     write_json(config_dir / shape.runtime_filename, best_top)
     write_json(config_dir / bottom_name(shape.runtime_filename), best_bottom)
+    write_shape_csv(shape, args.out_dir, best_top, best_bottom)
     total_expected = len(shape.m_values) * 2
     total_selected = len(best_top) + len(best_bottom)
     status = "passed" if total_selected == total_expected and not failed_m else "partial"
@@ -323,6 +347,7 @@ def tune_w4a8(shape: ConfigShape, args: argparse.Namespace, env: Dict[str, str],
         bottom = json.loads(bottom_src.read_text())
         write_json(config_dir / shape.runtime_filename, top)
         write_json(config_dir / bottom_name(shape.runtime_filename), bottom)
+        write_shape_csv(shape, args.out_dir, top, bottom)
         total_expected = len(shape.m_values) * 2
         total_selected = len(top) + len(bottom)
         status = "passed" if total_selected == total_expected else "partial"
@@ -356,6 +381,7 @@ def tune_inprocess(shape: ConfigShape, args: argparse.Namespace,
     dest = args.out_dir / "configs" / shape.arch / shape.quant
     write_json(dest / shape.runtime_filename, top)
     write_json(dest / bottom_name(shape.runtime_filename), bottom)
+    write_shape_csv(shape, args.out_dir, top, bottom)
     missing = sorted(set(shape.m_values) - {int(m) for m in top})
     manifest.append({"shape": asdict(shape), "status": "passed" if not missing and rc == 0 else "partial",
                      "returncode": rc, "candidate_rows": len(rows), "missing_m": missing,

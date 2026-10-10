@@ -30,6 +30,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG_ROOT = ROOT / "moe_c_configs"
+sys.path.insert(0, str(ROOT))
+from moe_utils.fused_moe_c import CSV_NAMES, find_csv_config, rows_from_pair, write_config_csv
 
 
 @dataclass(frozen=True)
@@ -381,7 +383,7 @@ def _describe_mode(quant: str, cand: Candidate) -> ModeDescriptor:
                          (16, 103): (16, 1024, 16, 16, 256, 4)})
             tiles = variants[(cand.bm, cand.profile)]
             params.update(nloop=1, k_step=tiles[1],
-                          min_reduce_k=tiles[1] * max(1, tiles[-1] - 1),
+                          min_reduce_k=tiles[1],
                           supported_reduce_k=fp8_up_k if is_fp8 else up_k)
         else:
             variants = {(16, 101): (128, 64, 16, 32, 64, 2),
@@ -466,14 +468,28 @@ def _shape_from_config_name(path: Path, arch: str, dtype: str) -> Shape:
 def audit_configs(profile: QuantProfile, arch: str, out_dir: Path,
                   shape_filter: Optional[Tuple[int, int, int]] = None) -> List[BenchResult]:
     results: List[BenchResult] = []
-    for path in _arch_files(arch, profile):
-        try:
-            data = json.loads(path.read_text())
-        except Exception as exc:
-            results.append(BenchResult(str(path), 0, None, 0, 0, 0, 0, "", 0, 0, None, False, f"invalid JSON: {exc}"))
-            continue
-        bottom = _is_bottom(path)
-        file_shape = _shape_from_config_name(path, arch, profile.name)
+    records = []
+    csv_path = CONFIG_ROOT / CSV_NAMES[profile.name]
+    if csv_path.is_file():
+        with csv_path.open(newline="") as stream:
+            for row in csv.DictReader(stream):
+                if row["arch"] != arch or row["quant_type"] != profile.name + "_channel":
+                    continue
+                for stage, mode_i in enumerate(row["sol_id"].split("+"), 1):
+                    file_shape = Shape(int(row["expert"]), int(row["inter_dim"]), int(row["model_dim"]),
+                                       int(row["topk"] or 0), int(row["token"]),
+                                       "fp16" if row["indtype"] == "torch.float16" else "bf16", arch,
+                                       int(row["cu_num"]) if row["cu_num"] else None)
+                    records.append((csv_path, {row["token"]: {"MODE": int(mode_i)}}, stage == 2, file_shape))
+    else:
+        for path in _arch_files(arch, profile):
+            try:
+                data = json.loads(path.read_text())
+            except Exception as exc:
+                results.append(BenchResult(str(path), 0, None, 0, 0, 0, 0, "", 0, 0, None, False, f"invalid JSON: {exc}"))
+                continue
+            records.append((path, data, _is_bottom(path), _shape_from_config_name(path, arch, profile.name)))
+    for path, data, bottom, file_shape in records:
         if shape_filter is not None:
             filter_e, filter_n, filter_k = shape_filter
             if filter_e and file_shape.e != filter_e:
@@ -585,6 +601,12 @@ def _config_file_names(e: int, n: int, k: int, dtype: str, is_bottom: bool,
 def _load_shape_config(profile: QuantProfile, arch: str, e: int, n: int, k: int,
                        is_bottom: bool, topk: Optional[int] = None,
                        cu: Optional[int] = None) -> Dict[int, Any]:
+    if (CONFIG_ROOT / CSV_NAMES[profile.name]).is_file():
+        result = find_csv_config(str(CONFIG_ROOT), arch, profile.name, e, n, k,
+                                 topk, cu, is_bottom)
+        if result is None:
+            raise FileNotFoundError(f"No CSV config for {profile.name}/{arch}, N={n}, K={k}")
+        return result
     candidates = []
     for category in profile.categories:
         base = CONFIG_ROOT / arch / category
@@ -869,8 +891,16 @@ def _bench_w8a8_stage(
                 a2_scale if stage == "gemm2" else input_scale,
             )
         reference = reference_cache[reference_key]
-        max_delta = (output.float() - reference).abs().max().item()
-        if not torch.allclose(output.float(), reference, atol=1e-2, rtol=1e-2):
+        # Avoid full-size FP32 comparison temporaries for large routed outputs.
+        output_flat, reference_flat = output.reshape(-1), reference.reshape(-1)
+        max_delta, matches = 0.0, True
+        for start in range(0, output_flat.numel(), 1 << 24):
+            actual = output_flat[start:start + (1 << 24)].float()
+            expected = reference_flat[start:start + (1 << 24)]
+            delta = (actual - expected).abs().max().item()
+            max_delta = max(max_delta, delta)
+            matches = torch.allclose(actual, expected, atol=1e-2, rtol=1e-2) and matches
+        if not matches:
             return DirectBenchRow(shape.m, stage, mode_i, bm, sorting_name, None, False,
                                   f"correctness failed: max_delta={max_delta}", max_delta)
         latency_us = _event_time_us(invoke, warmup, iters)
@@ -1046,6 +1076,12 @@ def bench_direct(args: argparse.Namespace) -> int:
         for stage in ("gemm1", "gemm2"):
             name = _config_file_names(args.e, args.n, args.k, args.quant, stage == "gemm2", args.topk, args.cu)[0]
             (args.out_dir / name).write_text(json.dumps(configs[stage], indent=2) + "\n")
+        indtype = {"bf16": "torch.bfloat16", "fp16": "torch.float16"}[args.dtype or "bf16"]
+        csv_rows = rows_from_pair(configs["gemm1"], configs["gemm2"], args.arch, args.quant,
+                                  args.e, args.n, args.k, args.topk, args.cu, (indtype,),
+                                  {m: row["best"]["latency_us"] for m, row in summary["m_results"].items()
+                                   if row["best"] is not None})
+        write_config_csv(str(args.out_dir / CSV_NAMES[args.quant]), csv_rows)
         return 2 if missing_best else 0
     return 0 if rows and all(row.ok for row in rows) else 2
 
