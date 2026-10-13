@@ -175,13 +175,19 @@ namespace moe_c
     return 25.0f * r;
   }
 
-  template <int ACTIVATION>
+  template <int ACTIVATION, typename native_scalar_t>
   __device__ __forceinline__ float glu_activation_elem(
       float gate_f, float up_f, float beta1, float beta2)
   {
     if constexpr (ACTIVATION == 0)
     {
-      return silu_fast(gate_f) * up_f;
+      float activated = silu_fast(gate_f);
+      if constexpr (std::is_same_v<native_scalar_t, __hip_bfloat16>)
+      {
+        // Match framework SiLU output rounding before the separate multiply.
+        activated = static_cast<float>(b32_to_b16<__hip_bfloat16>(activated));
+      }
+      return activated * up_f;
     }
     else if constexpr (ACTIVATION == 2)
     {
@@ -424,7 +430,7 @@ namespace moe_c
       const float gate_f = static_cast<float>(gate_ptr[i]);
       const float up_f = static_cast<float>(up_ptr[i]);
       const float result_f =
-          glu_activation_elem<ACTIVATION>(gate_f, up_f, beta1, beta2);
+          glu_activation_elem<ACTIVATION, native_scalar_t>(gate_f, up_f, beta1, beta2);
       if constexpr (std::is_same_v<native_scalar_t, float>)
       {
         out_ptr[i] = result_f;
@@ -540,13 +546,22 @@ namespace moe_c
         const int i = d * kElemsPerDword;
         const float gate_f0 = static_cast<float>(gate_vals[i]);
         const float up_f0 = static_cast<float>(up_vals[i]);
-        const float result_f0 =
-            glu_activation_elem<ACTIVATION>(gate_f0, up_f0, beta1, beta2);
         const float gate_f1 = static_cast<float>(gate_vals[i + 1]);
         const float up_f1 = static_cast<float>(up_vals[i + 1]);
-        const float result_f1 =
-            glu_activation_elem<ACTIVATION>(gate_f1, up_f1, beta1, beta2);
-        out_packed[d] = silu_pack_bf16_pair(result_f0, result_f1);
+#if defined(__gfx938__)
+        if constexpr (ACTIVATION == 0)
+        {
+          const uint32_t activated = silu_pack_bf16_pair(silu_fast(gate_f0), silu_fast(gate_f1));
+          const uint32_t up = up_buf[d];
+          asm volatile("v_pk_mul_bf16 %0, %1, %2" : "=v"(out_packed[d]) : "v"(activated), "v"(up));
+        }
+        else
+#endif
+        {
+          const float result_f0 = glu_activation_elem<ACTIVATION, native_scalar_t>(gate_f0, up_f0, beta1, beta2);
+          const float result_f1 = glu_activation_elem<ACTIVATION, native_scalar_t>(gate_f1, up_f1, beta1, beta2);
+          out_packed[d] = silu_pack_bf16_pair(result_f0, result_f1);
+        }
       }
     }
     else
@@ -557,7 +572,7 @@ namespace moe_c
         const float gate_f = static_cast<float>(gate_vals[i]);
         const float up_f = static_cast<float>(up_vals[i]);
         const float result_f =
-            glu_activation_elem<ACTIVATION>(gate_f, up_f, beta1, beta2);
+            glu_activation_elem<ACTIVATION, native_scalar_t>(gate_f, up_f, beta1, beta2);
         if constexpr (std::is_same_v<native_scalar_t, float>)
         {
           out_tail[i] = result_f;
@@ -1033,13 +1048,22 @@ namespace moe_c
             const int i = d * kElemsPerDword;
             const float g0 = static_cast<float>(gate_vals[i]);
             const float u0 = static_cast<float>(up_vals[i]);
-            const float r0 =
-                glu_activation_elem<ACTIVATION>(g0, u0, beta1, beta2);
             const float g1 = static_cast<float>(gate_vals[i + 1]);
             const float u1 = static_cast<float>(up_vals[i + 1]);
-            const float r1 =
-                glu_activation_elem<ACTIVATION>(g1, u1, beta1, beta2);
-            out_packed[d] = silu_pack_bf16_pair(r0, r1);
+#if defined(__gfx938__)
+            if constexpr (ACTIVATION == 0)
+            {
+              const uint32_t activated = silu_pack_bf16_pair(silu_fast(g0), silu_fast(g1));
+              const uint32_t up = up_buf[r][d];
+              asm volatile("v_pk_mul_bf16 %0, %1, %2" : "=v"(out_packed[d]) : "v"(activated), "v"(up));
+            }
+            else
+#endif
+            {
+              const float r0 = glu_activation_elem<ACTIVATION, native_scalar_t>(g0, u0, beta1, beta2);
+              const float r1 = glu_activation_elem<ACTIVATION, native_scalar_t>(g1, u1, beta1, beta2);
+              out_packed[d] = silu_pack_bf16_pair(r0, r1);
+            }
           }
           silu_store_out<kDwords>(out_dw_r[r], out_packed);
         }
@@ -1051,7 +1075,7 @@ namespace moe_c
             const float g = static_cast<float>(gate_vals[i]);
             const float u = static_cast<float>(up_vals[i]);
             const float rf =
-                glu_activation_elem<ACTIVATION>(g, u, beta1, beta2);
+                glu_activation_elem<ACTIVATION, native_scalar_t>(g, u, beta1, beta2);
             if constexpr (std::is_same_v<native_scalar_t, float>)
             {
               out_tail[i] = rf;
