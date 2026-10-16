@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstring>
 #include <cstdint>
+#include <optional>
 #include <type_traits>
 
 #include "compat.h"
@@ -179,8 +180,13 @@ namespace moe_c
   __device__ __forceinline__ float glu_activation_elem(
       float gate_f, float up_f, float beta1, float beta2)
   {
-    if constexpr (ACTIVATION == 0)
+    if constexpr (ACTIVATION == 0 || ACTIVATION == 5)
     {
+      if constexpr (ACTIVATION == 5)
+      {
+        gate_f = gate_f > beta1 ? beta1 : gate_f;
+        up_f = up_f > beta1 ? beta1 : (up_f < -beta1 ? -beta1 : up_f);
+      }
       float activated = silu_fast(gate_f);
       if constexpr (std::is_same_v<native_scalar_t, __hip_bfloat16>)
       {
@@ -188,12 +194,6 @@ namespace moe_c
         activated = static_cast<float>(b32_to_b16<__hip_bfloat16>(activated));
       }
       return activated * up_f;
-    }
-    else if constexpr (ACTIVATION == 5)
-    {
-      gate_f = gate_f > beta1 ? beta1 : gate_f;
-      up_f = up_f > beta1 ? beta1 : (up_f < -beta1 ? -beta1 : up_f);
-      return silu_fast(gate_f) * up_f;
     }
     else if constexpr (ACTIVATION == 2)
     {
@@ -2051,20 +2051,22 @@ namespace moe_c
   }
 
   inline void silu_and_mul(torch::Tensor &out, torch::Tensor &input,
-                           int rows_per_block = 1, int vec_size = 2)
+                           int rows_per_block = 1, int vec_size = 2,
+                           std::optional<double> limit = std::nullopt)
   {
-    glu_impl<0>(
-        out, input, rows_per_block, vec_size, 0.0f, 0.0f, "silu_and_mul");
-  }
-
-  inline void silu_clamp_and_mul(torch::Tensor &out, torch::Tensor &input,
-                                float limit, int rows_per_block = 1,
-                                int vec_size = 2)
-  {
-    TORCH_CHECK(std::isfinite(limit) && limit > 0.0f,
-                "silu_clamp_and_mul: limit must be finite and positive");
-    glu_impl<5>(out, input, rows_per_block, vec_size, limit, 0.0f,
-                "silu_clamp_and_mul");
+    if (limit.has_value())
+    {
+      const float clamp_limit = static_cast<float>(*limit);
+      TORCH_CHECK(std::isfinite(clamp_limit) && clamp_limit > 0.0f,
+                  "silu_and_mul: limit must be finite and positive");
+      glu_impl<5>(out, input, rows_per_block, vec_size, clamp_limit, 0.0f,
+                  "silu_and_mul");
+    }
+    else
+    {
+      glu_impl<0>(
+          out, input, rows_per_block, vec_size, 0.0f, 0.0f, "silu_and_mul");
+    }
   }
 
   inline void gelu_and_mul(torch::Tensor &out, torch::Tensor &input,
