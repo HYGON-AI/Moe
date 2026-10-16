@@ -183,6 +183,12 @@ namespace moe_c
     {
       return silu_fast(gate_f) * up_f;
     }
+    else if constexpr (ACTIVATION == 5)
+    {
+      gate_f = gate_f > beta1 ? beta1 : gate_f;
+      up_f = up_f > beta1 ? beta1 : (up_f < -beta1 ? -beta1 : up_f);
+      return silu_fast(gate_f) * up_f;
+    }
     else if constexpr (ACTIVATION == 2)
     {
       return situ_gate_part_beta4(gate_f) * situ_up_part_beta25(up_f);
@@ -1515,7 +1521,7 @@ namespace moe_c
       SiluLaunchConfig cfg;
       cfg.block_n = 128;
       cfg.vec_size = (vec_size == 1) ? 1 : 2;
-      if constexpr (ACTIVATION == 0 || ACTIVATION == 3 || ACTIVATION == 4)
+      if constexpr (ACTIVATION == 0 || ACTIVATION == 3 || ACTIVATION == 4 || ACTIVATION == 5)
       {
         cfg.rows_per_block =
             pick_silu_rows_per_block(M, rows_per_block, cfg.block_n, N);
@@ -1595,7 +1601,7 @@ namespace moe_c
       }
     }
 
-    if constexpr (ACTIVATION == 0 || ACTIVATION == 3 || ACTIVATION == 4)
+    if constexpr (ACTIVATION == 0 || ACTIVATION == 3 || ACTIVATION == 4 || ACTIVATION == 5)
     {
       cfg.rows_per_block =
           pick_silu_rows_per_block(M, rows_per_block, cfg.block_n, N);
@@ -2025,6 +2031,16 @@ namespace moe_c
   {
     glu_impl<0>(
         out, input, rows_per_block, vec_size, 0.0f, 0.0f, "silu_and_mul");
+  }
+
+  inline void silu_clamp_and_mul(torch::Tensor &out, torch::Tensor &input,
+                                float limit, int rows_per_block = 1,
+                                int vec_size = 2)
+  {
+    TORCH_CHECK(std::isfinite(limit) && limit > 0.0f,
+                "silu_clamp_and_mul: limit must be finite and positive");
+    glu_impl<5>(out, input, rows_per_block, vec_size, limit, 0.0f,
+                "silu_clamp_and_mul");
   }
 
   inline void gelu_and_mul(torch::Tensor &out, torch::Tensor &input,

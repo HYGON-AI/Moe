@@ -14,6 +14,16 @@ void moe_c_activation_silu_and_mul(torch::Tensor& out,
                       static_cast<int>(vec_size));
 }
 
+void moe_c_activation_silu_clamp_and_mul(torch::Tensor& out,
+                                        torch::Tensor& input,
+                                        double limit,
+                                        int64_t rows_per_block = 1,
+                                        int64_t vec_size = 2) {
+  moe_c::silu_clamp_and_mul(out, input, static_cast<float>(limit),
+                           static_cast<int>(rows_per_block),
+                           static_cast<int>(vec_size));
+}
+
 void moe_c_activation_gelu_and_mul(torch::Tensor& out,
                                    torch::Tensor& input,
                                    int64_t rows_per_block = 1,
