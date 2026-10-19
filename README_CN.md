@@ -30,7 +30,8 @@ MOE sum、Silu-and-mul 等activation算子。
 ```text
 .
 |-- csrc/              # Torch library 注册入口和各精度物理 .cu 接口文件
-|-- csrc_for_aiter/    # MOE kernel 主体实现、配置、intrinsic 和公共头文件
+|-- csrc_for_aiter/    # 按架构拆分的 MOE kernel 主体实现、配置、intrinsic 和公共头文件
+|   `-- 936_938/       # 当前 gfx936/gfx938 兼容实现
 |-- moe_utils/         # Python 侧 op wrapper、MOE 路由、golden、shuffle 和工具函数
 |-- moe_c_configs/     # 按 GPU 架构和量化类型组织的 moe_c 配置文件
 |-- op_test/           # 从 AITER MOE CI 路径迁移并去 AITER 化后的本地正确性脚本

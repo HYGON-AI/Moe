@@ -5,6 +5,7 @@ __pycache__
 
 *.log
 *.csv
+!moe_c_configs/tuned_moe_c_*_channel.csv
 *.pyc
 *.pyo
 *.pyd

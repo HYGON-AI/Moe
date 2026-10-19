@@ -1,82 +1,82 @@
 {
   "1": {
-    "BLOCK_SIZE_M": 16,
-    "MODE": 374116
+    "MODE": 11001104,
+    "BLOCK_SIZE_M": 16
   },
   "2": {
-    "BLOCK_SIZE_M": 16,
-    "MODE": 374116
+    "MODE": 11001104,
+    "BLOCK_SIZE_M": 16
   },
   "3": {
-    "BLOCK_SIZE_M": 16,
-    "MODE": 374216
+    "MODE": 11201101,
+    "BLOCK_SIZE_M": 16
   },
   "4": {
-    "BLOCK_SIZE_M": 16,
-    "MODE": 374116
+    "MODE": 11201101,
+    "BLOCK_SIZE_M": 16
   },
   "5": {
-    "BLOCK_SIZE_M": 16,
-    "MODE": 374116
+    "MODE": 11201102,
+    "BLOCK_SIZE_M": 16
   },
   "6": {
-    "BLOCK_SIZE_M": 16,
-    "MODE": 374116
+    "MODE": 11001104,
+    "BLOCK_SIZE_M": 16
   },
   "7": {
-    "BLOCK_SIZE_M": 16,
-    "MODE": 374116
+    "MODE": 11201102,
+    "BLOCK_SIZE_M": 16
   },
   "8": {
-    "BLOCK_SIZE_M": 16,
-    "MODE": 374116
+    "MODE": 11001104,
+    "BLOCK_SIZE_M": 16
   },
   "16": {
-    "BLOCK_SIZE_M": 16,
-    "MODE": 374116
+    "MODE": 11001104,
+    "BLOCK_SIZE_M": 16
   },
   "32": {
-    "BLOCK_SIZE_M": 32,
-    "MODE": 374132
+    "MODE": 11001104,
+    "BLOCK_SIZE_M": 16
   },
   "64": {
-    "BLOCK_SIZE_M": 32,
-    "MODE": 374132
+    "MODE": 11201101,
+    "BLOCK_SIZE_M": 16
   },
   "128": {
-    "BLOCK_SIZE_M": 32,
-    "MODE": 374132
+    "MODE": 11201101,
+    "BLOCK_SIZE_M": 16
   },
   "256": {
-    "BLOCK_SIZE_M": 48,
-    "MODE": 374148
+    "MODE": 11201101,
+    "BLOCK_SIZE_M": 16
   },
   "512": {
-    "BLOCK_SIZE_M": 48,
-    "MODE": 374148
+    "MODE": 11202101,
+    "BLOCK_SIZE_M": 32
   },
   "1024": {
-    "BLOCK_SIZE_M": 64,
-    "MODE": 374164
+    "MODE": 11203103,
+    "BLOCK_SIZE_M": 48
   },
   "2048": {
-    "BLOCK_SIZE_M": 48,
-    "MODE": 31348
+    "MODE": 11203104,
+    "BLOCK_SIZE_M": 48
   },
   "4096": {
-    "BLOCK_SIZE_M": 64,
-    "MODE": 374364
+    "MODE": 11204104,
+    "BLOCK_SIZE_M": 64
   },
   "6144": {
-    "BLOCK_SIZE_M": 64,
-    "MODE": 374464
+    "MODE": 11204104,
+    "BLOCK_SIZE_M": 64
   },
   "8192": {
-    "BLOCK_SIZE_M": 64,
-    "MODE": 374464
+    "MODE": 11204104,
+    "BLOCK_SIZE_M": 64
   },
   "16384": {
-    "BLOCK_SIZE_M": 64,
-    "MODE": 374464
+    "MODE": 11204104,
+    "BLOCK_SIZE_M": 64
   }
 }

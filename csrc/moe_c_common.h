@@ -60,7 +60,7 @@ using at::device_of;
     return __VA_ARGS__();                   \
   } \
    else {                                                  \
-    std::cout<<"unsupported BIT"<<std::endl;                \
+    TORCH_CHECK(false, "unsupported BIT: ", bit);           \
   }                                                         \
 }()
 
@@ -79,7 +79,7 @@ using at::device_of;
     constexpr static int BLOCK_SIZE_M_ = 64;                 \
     return __VA_ARGS__(); \
   }else {                                                  \
-    std::cout<<"unsupported BLOCK_SIZE_M"<<std::endl;       \
+    TORCH_CHECK(false, "unsupported BLOCK_SIZE_M: ", BLOCK_SIZE_M); \
   }                                                         \
 }()
 
@@ -89,7 +89,7 @@ using at::device_of;
     constexpr static int BLOCK_SIZE_N_ = 64;               \
     return __VA_ARGS__();                                   \
   }else {                                                  \
-    std::cout<<"unsupported BLOCK_SIZE_N"<<std::endl;       \
+    TORCH_CHECK(false, "unsupported BLOCK_SIZE_N: ", BLOCK_SIZE_N); \
   }                                                         \
 }()
 
@@ -99,7 +99,7 @@ using at::device_of;
     constexpr static int BLOCK_SIZE_K_ = 128;               \
     return __VA_ARGS__();                                   \
   }else {                                                  \
-    std::cout<<"unsupported BLOCK_SIZE_K"<<std::endl;       \
+    TORCH_CHECK(false, "unsupported BLOCK_SIZE_K: ", BLOCK_SIZE_K); \
   }                                                         \
 }()
 
@@ -123,7 +123,7 @@ using at::device_of;
     constexpr static int TOPK = 1;          \
     return __VA_ARGS__();                   \
   }else {                                  \
-    std::cout<<"unsupported TOPK"<<std::endl;\
+    TORCH_CHECK(false, "unsupported TOPK: ", topk);\
   }                                         \
 }()
 
@@ -133,7 +133,7 @@ using at::device_of;
     constexpr static int GROUP_SIZE_N = 128;                   \
     return __VA_ARGS__();                                   \
   }else {                                                  \
-    std::cout<<"unsupported GROUP_SIZE_N"<<std::endl;         \
+    TORCH_CHECK(false, "unsupported GROUP_SIZE_N: ", group_size_n); \
   }                                                         \
 }()
 
@@ -146,7 +146,7 @@ using at::device_of;
     constexpr static int GROUP_SIZE_K = 64;            \
     return __VA_ARGS__();                                   \
   }else {                                                  \
-    std::cout<<"unsupported GROUP_SIZE_K"<<std::endl;         \
+    TORCH_CHECK(false, "unsupported GROUP_SIZE_K: ", group_size_k); \
   }                                                         \
 }()
 
@@ -156,7 +156,7 @@ using at::device_of;
     constexpr static int BLOCK_SIZE_M_LOOPS = 1;            \
     return __VA_ARGS__();                                   \
   } else {                                                  \
-    std::cout<<"unsupported BLOCK_SIZE_M_LOOPS"<<std::endl;         \
+    TORCH_CHECK(false, "unsupported BLOCK_SIZE_M_LOOPS: ", block_size_m_loops); \
   }                                                         \
 }()
 
@@ -172,7 +172,7 @@ using at::device_of;
      constexpr static int BLOCK_SIZE_N_LOOPS = 2;            \
     return __VA_ARGS__();                                   \
   }else {                                                  \
-    std::cout<<"unsupported BLOCK_SIZE_N_LOOPS"<<std::endl;         \
+    TORCH_CHECK(false, "unsupported BLOCK_SIZE_N_LOOPS: ", block_size_n_loops); \
   }                                                         \
 }()
 
@@ -203,7 +203,7 @@ using at::device_of;
     constexpr static int BLOCK_SIZE_K_LOOPS = 56;            \
     return __VA_ARGS__();                                   \
   }else {                                                  \
-    std::cout<<"unsupported BLOCK_SIZE_K_LOOPS"<<std::endl;         \
+    TORCH_CHECK(false, "unsupported BLOCK_SIZE_K_LOOPS: ", block_size_k_loops); \
   }                                                         \
 }()
 
@@ -213,7 +213,7 @@ using at::device_of;
     constexpr static int GROUP_SIZE = 64;                   \
     return __VA_ARGS__();                                   \
   }else {                                                  \
-    std::cout<<"unsupported GROUP_SIZE"<<std::endl;         \
+    TORCH_CHECK(false, "unsupported GROUP_SIZE: ", group_size); \
   }                                                         \
 }()
 
@@ -222,11 +222,86 @@ using at::device_of;
 
 
 
-static inline int64_t normalize_fp8_prefill_mode(int64_t mode) {
-  if (mode >= 90000 && mode < 100000) {
-    return mode - 10000;
-  }
-  return mode;
+// Descriptive HIPC channelwise mode format: S F K MM VVV.
+// S=stage, F=sorting, K=kernel family, MM=BLOCK_SIZE_M / 16,
+// VVV=profile ID. The profile descriptor owns N_LOOP and any other static
+// attributes. The n160/kgrain64 family is intentionally excluded from this
+// descriptive mode namespace.
+static inline bool is_moe_channel_mode(int64_t mode) {
+  return mode >= 10000000LL && mode < 30000000LL;
+}
+
+// Kept as a named alias for callers that still describe the FP8 path.
+static inline bool is_fp8_channel_mode(int64_t mode) {
+  return is_moe_channel_mode(mode);
+}
+
+static inline int moe_channel_mode_stage(int64_t mode) {
+  return static_cast<int>(mode / 10000000LL);
+}
+
+static inline int moe_channel_mode_sorting(int64_t mode) {
+  return static_cast<int>((mode / 1000000LL) % 10);
+}
+
+static inline int moe_channel_mode_family(int64_t mode) {
+  return static_cast<int>((mode / 100000LL) % 10);
+}
+
+static inline int moe_channel_mode_bm(int64_t mode) {
+  return static_cast<int>((mode / 1000LL) % 100) * 16;
+}
+
+static inline int moe_channel_mode_profile(int64_t mode) {
+    return static_cast<int>(mode % 1000LL);
+}
+
+static inline void validate_moe_channel_layout(int64_t mode,
+                                                int expected_sorting) {
+    TORCH_CHECK(is_moe_channel_mode(mode),
+                "invalid HIPC W8A8 channelwise mode: ", mode);
+    const int sorting = moe_channel_mode_sorting(mode);
+    TORCH_CHECK(sorting == expected_sorting,
+                "W8A8 channelwise mode ", mode,
+                " requests sorting layout ", sorting,
+                ", but this dispatch path supports layout ", expected_sorting,
+                ". No kernel alias is allowed between CK sorting and moe_align.");
+}
+
+static inline void validate_moe_channel_mode(int64_t mode) {
+    TORCH_CHECK(is_moe_channel_mode(mode),
+                "invalid HIPC W8A8 channelwise mode: ", mode);
+    const int sorting = moe_channel_mode_sorting(mode);
+    TORCH_CHECK(sorting == 0 || sorting == 1,
+                "invalid HIPC W8A8 channelwise sorting field in mode: ", mode);
+}
+
+static inline bool moe_w8a8_mode_uses_moe_align(int64_t mode) {
+  return ((mode / 1000000) % 10) == 1;
+}
+
+static inline bool moe_w8a8_mode_is_decode(int64_t mode, int config_m) {
+  TORCH_CHECK(mode >= 10000000 && mode < 30000000,
+              "unsupported W8A8 mode encoding: ", mode);
+  return ((mode / 100000) % 10) == 0;
+}
+
+static inline void moe_w8a8_throw_missing_kernel(
+    const char* stage,
+    const char* phase,
+    int64_t mode,
+    int config_m,
+    int size_n,
+    int size_k,
+    int real_size_k) {
+  TORCH_CHECK(false,
+      "No matching moe_c w8a8 kernel: stage=", stage,
+      ", phase=", phase,
+      ", mode=", mode,
+      ", config_m=", config_m,
+      ", size_n=", size_n,
+      ", size_k=", size_k,
+      ", real_size_k=", real_size_k);
 }
 
 template <typename OutT, typename ElemT>
@@ -260,6 +335,16 @@ static void moe_marlin_w8a8_dispatch_gemm_stages(
   static_assert(
       std::is_same_v<ElemT, at::Float8_e4m3fn> || std::is_same_v<ElemT, int8_t>,
       "ElemT must be at::Float8_e4m3fn or int8_t");
+  const bool is_decode = moe_w8a8_mode_is_decode(mode, config_m);
+  const int routing = (mode / 1000000) % 10;
+  TORCH_CHECK(mode / 10000000 == (first_stage ? 1 : 2),
+              "W8A8 mode stage does not match GEMM stage: ", mode);
+  if constexpr (std::is_same_v<ElemT, int8_t>) {
+    TORCH_CHECK(routing == 0, "W8A8 INT8 requires CK sorting mode: ", mode);
+  } else {
+    TORCH_CHECK(routing == 0 || (routing == 1 && !is_decode),
+                "unsupported W8A8 FP8 routing/kernel family: ", mode);
+  }
   if (first_stage) {
     const int64_t EM = sorted_token_ids.size(0);
     GemmParams<char, OutT> params_in(
@@ -288,52 +373,39 @@ static void moe_marlin_w8a8_dispatch_gemm_stages(
         tensorwise_scale,
         real_size_k);
 
-    const bool use_prefill_mode = std::is_same_v<ElemT, at::Float8_e4m3fn> && mode >= 70000;
-    if (config_m <= 512 && !use_prefill_mode) {
+    if (is_decode) {
       if constexpr (std::is_same_v<ElemT, at::Float8_e4m3fn>) {
-        auto it = kernel_maps_gemm1_decode_fp8<OutT>.find(mode);
-        if (it != kernel_maps_gemm1_decode_fp8<OutT>.end()) {
+        auto it = kernel_maps_gemm1_decode_fp8_ck_sorting<OutT>.find(mode);
+        if (it != kernel_maps_gemm1_decode_fp8_ck_sorting<OutT>.end()) {
           it->second(params_in);
         } else {
-          printf("bfloat version gemm1 No matching kernel configuration found, using default settings \n");
+          moe_w8a8_throw_missing_kernel("gemm1", "fp8_decode", mode, config_m, size_n, size_k, real_size_k);
         }
       } else {
-        auto it = kernel_maps_gemm1_decode<OutT>.find(mode);
-        if (it != kernel_maps_gemm1_decode<OutT>.end()) {
+        auto it = kernel_maps_gemm1_decode_ck_sorting<OutT>.find(mode);
+        if (it != kernel_maps_gemm1_decode_ck_sorting<OutT>.end()) {
           it->second(params_in);
         } else {
-          if constexpr (std::is_same_v<OutT, half>) {
-            printf("half version gemm1 No matching kernel configuration found, using default settings \n");
-          } else {
-            printf("bfloat version gemm1 No matching kernel configuration found, using default settings \n");
-          }
+          moe_w8a8_throw_missing_kernel("gemm1", "int8_decode", mode, config_m, size_n, size_k, real_size_k);
         }
       }
     } else {
       if constexpr (std::is_same_v<ElemT, at::Float8_e4m3fn>) {
-        auto& prefill_kernels = kernel_maps_gemm1_prefill_fp8<OutT>;
+        auto& prefill_kernels = moe_w8a8_mode_uses_moe_align(mode)
+            ? kernel_maps_gemm1_prefill_fp8_moe_align<OutT>
+            : kernel_maps_gemm1_prefill_fp8_ck_sorting<OutT>;
         auto it = prefill_kernels.find(mode);
-        if (it == prefill_kernels.end()) {
-          const int64_t prefill_mode = normalize_fp8_prefill_mode(mode);
-          if (prefill_mode != mode) {
-            it = prefill_kernels.find(prefill_mode);
-          }
-        }
-        if (it != kernel_maps_gemm1_prefill_fp8<OutT>.end()) {
+        if (it != prefill_kernels.end()) {
           it->second(params_in);
         } else {
-          printf("bfloat version gemm1 No matching kernel configuration found, using default settings \n");
+          moe_w8a8_throw_missing_kernel("gemm1", "fp8_prefill", mode, config_m, size_n, size_k, real_size_k);
         }
       } else {
-        auto it = kernel_maps_gemm1_prefill<OutT>.find(mode);
-        if (it != kernel_maps_gemm1_prefill<OutT>.end()) {
+        auto it = kernel_maps_gemm1_prefill_ck_sorting<OutT>.find(mode);
+        if (it != kernel_maps_gemm1_prefill_ck_sorting<OutT>.end()) {
           it->second(params_in);
         } else {
-          if constexpr (std::is_same_v<OutT, half>) {
-            printf("half version gemm1 No matching kernel configuration found \n");
-          } else {
-            printf("bfloat version gemm1 No matching kernel configuration found, using default settings \n");
-          }
+          moe_w8a8_throw_missing_kernel("gemm1", "int8_prefill", mode, config_m, size_n, size_k, real_size_k);
         }
       }
     }
@@ -365,197 +437,47 @@ static void moe_marlin_w8a8_dispatch_gemm_stages(
         tensorwise_scale,
         real_size_k);
 
-    const bool use_prefill_mode = std::is_same_v<ElemT, at::Float8_e4m3fn> && mode >= 70000;
-    if (config_m <= 512 && !use_prefill_mode) {
+    if (is_decode) {
       if constexpr (std::is_same_v<ElemT, at::Float8_e4m3fn>) {
-        auto it = kernel_maps_gemm2_decode_fp8<OutT>.find(mode);
-        if (it != kernel_maps_gemm2_decode_fp8<OutT>.end()) {
+        auto it = kernel_maps_gemm2_decode_fp8_ck_sorting<OutT>.find(mode);
+        if (it != kernel_maps_gemm2_decode_fp8_ck_sorting<OutT>.end()) {
           it->second(params_in);
         } else {
-          printf("bfloat version gemm2 No matching kernel configuration found, using default settings \n");
+          moe_w8a8_throw_missing_kernel("gemm2", "fp8_decode", mode, config_m, size_n, size_k, real_size_k);
         }
       } else {
-        auto it = kernel_maps_gemm2_decode<OutT>.find(mode);
-        if (it != kernel_maps_gemm2_decode<OutT>.end()) {
+        auto it = kernel_maps_gemm2_decode_ck_sorting<OutT>.find(mode);
+        if (it != kernel_maps_gemm2_decode_ck_sorting<OutT>.end()) {
           it->second(params_in);
         } else {
-          if constexpr (std::is_same_v<OutT, half>) {
-            printf("half version gemm2 No matching kernel configuration found, using default settings \n");
-          } else {
-            printf("bfloat version gemm2 No matching kernel configuration found, using default settings \n");
-          }
+          moe_w8a8_throw_missing_kernel("gemm2", "int8_decode", mode, config_m, size_n, size_k, real_size_k);
         }
       }
     } else {
       if constexpr (std::is_same_v<ElemT, at::Float8_e4m3fn>) {
-        auto& prefill_kernels = kernel_maps_gemm2_prefill_fp8<OutT>;
+        auto& prefill_kernels = moe_w8a8_mode_uses_moe_align(mode)
+            ? kernel_maps_gemm2_prefill_fp8_moe_align<OutT>
+            : kernel_maps_gemm2_prefill_fp8_ck_sorting<OutT>;
         auto it = prefill_kernels.find(mode);
-        if (it == prefill_kernels.end()) {
-          const int64_t prefill_mode = normalize_fp8_prefill_mode(mode);
-          if (prefill_mode != mode) {
-            it = prefill_kernels.find(prefill_mode);
-          }
-        }
-        if (it != kernel_maps_gemm2_prefill_fp8<OutT>.end()) {
+        if (it != prefill_kernels.end()) {
           it->second(params_in);
         } else {
-          printf("bfloat version gemm2 No matching kernel configuration found, using default settings \n");
+          moe_w8a8_throw_missing_kernel("gemm2", "fp8_prefill", mode, config_m, size_n, size_k, real_size_k);
         }
       } else {
-        auto it = kernel_maps_gemm2_prefill<OutT>.find(mode);
-        if (it != kernel_maps_gemm2_prefill<OutT>.end()) {
+        auto it = kernel_maps_gemm2_prefill_ck_sorting<OutT>.find(mode);
+        if (it != kernel_maps_gemm2_prefill_ck_sorting<OutT>.end()) {
           it->second(params_in);
         } else {
-          if constexpr (std::is_same_v<OutT, half>) {
-            printf("half version gemm2  No matching kernel configuration found \n");
-          } else {
-            printf("bfloat version gemm2 No matching kernel configuration found, using default settings \n");
-          }
+          moe_w8a8_throw_missing_kernel("gemm2", "int8_prefill", mode, config_m, size_n, size_k, real_size_k);
         }
       }
     }
   }
 }
-
-
-
-template <typename OutT, typename ElemT>
-static void moe_marlin_w8a8_dispatch_gemm_stages_n160(
-    bool first_stage,
-    const torch::Tensor& input,
-    const torch::Tensor& b_qweight,
-    torch::Tensor& output_alias,
-    const torch::Tensor& a_scale,
-    const torch::Tensor& b_scale,
-    const float* topk_weights_ptr,
-    const torch::Tensor& sorted_token_ids,
-    const torch::Tensor& expert_ids,
-    int num_pad,
-    const torch::Tensor& num_tokens_post_pad,
-    int size_m,
-    int size_n,
-    int size_k,
-    int stride_asm,
-    int stride_ask,
-    int stride_bse,
-    int stride_bsn,
-    int stride_bsk,
-    int64_t top_k,
-    uint32_t real_topk,
-    bool is_marlin,
-    int64_t mode,
-    int config_m,
-    int real_size_k,
-    bool tensorwise_scale = false) {
-  static_assert(
-      std::is_same_v<ElemT, at::Float8_e4m3fn> || std::is_same_v<ElemT, int8_t>,
-      "ElemT must be at::Float8_e4m3fn or int8_t");
-  if (first_stage) {
-    const int64_t EM = sorted_token_ids.size(0);
-    GemmParams<char, OutT> params_in(
-        (const char*)input.data_ptr<ElemT>(),
-        (const char*)b_qweight.data_ptr<ElemT>(),
-        (OutT*)output_alias.data_ptr(),
-        (float*)a_scale.data_ptr(),
-        (float*)b_scale.data_ptr(),
-        topk_weights_ptr,
-        sorted_token_ids.data_ptr<int32_t>(),
-        expert_ids.data_ptr<int32_t>(),
-        num_pad,
-        num_tokens_post_pad.data_ptr<int32_t>(),
-        size_m,
-        size_n,
-        size_k,
-        stride_asm,
-        stride_ask,
-        stride_bse,
-        stride_bsn,
-        stride_bsk,
-        EM,
-        top_k,
-        real_topk,
-        is_marlin,
-        tensorwise_scale,
-        real_size_k);
-
-    const bool use_prefill_mode = std::is_same_v<ElemT, at::Float8_e4m3fn> && mode >= 70000;
-    if (config_m <= 512 && !use_prefill_mode) {
-      if constexpr (std::is_same_v<ElemT, at::Float8_e4m3fn>) {
-        auto it = kernel_maps_gemm1_decode_n160_fp8<OutT>.find(mode);
-        if (it != kernel_maps_gemm1_decode_n160_fp8<OutT>.end()) {
-          it->second(params_in);
-        } else {
-          std::cout<<"moe_marlin_w8a8_dispatch_gemm_stages<half, at::Float8_e4m3fn> mode \n"<<mode<<std::endl;
-
-        }
-      }
-    } else {
-      if constexpr (std::is_same_v<ElemT, at::Float8_e4m3fn>) {
-        auto it_prefill = kernel_maps_gemm1_prefill_fp8<OutT>.find(mode);
-        if (it_prefill != kernel_maps_gemm1_prefill_fp8<OutT>.end()) {
-          it_prefill->second(params_in);
-        } else {
-          auto it = kernel_maps_gemm1_prefill_n160_fp8<OutT>.find(mode);
-          if (it != kernel_maps_gemm1_prefill_n160_fp8<OutT>.end()) {
-            it->second(params_in);
-          } else {
-            printf("bfloat version gemm1 No matching kernel configuration found, using default settings \n");
-          }
-        }
-      }
-    }
-  } else {
-    const int64_t EM = sorted_token_ids.size(0);
-    GemmParams<char, OutT> params_in(
-        (const char*)input.data_ptr<ElemT>(),
-        (const char*)b_qweight.data_ptr<ElemT>(),
-        (OutT*)output_alias.data_ptr(),
-        (float*)a_scale.data_ptr(),
-        (float*)b_scale.data_ptr(),
-        topk_weights_ptr,
-        sorted_token_ids.data_ptr<int32_t>(),
-        expert_ids.data_ptr<int32_t>(),
-        num_pad,
-        num_tokens_post_pad.data_ptr<int32_t>(),
-        size_m,
-        size_n,
-        size_k,
-        stride_asm,
-        stride_ask,
-        stride_bse,
-        stride_bsn,
-        stride_bsk,
-        EM,
-        top_k,
-        real_topk,
-        is_marlin,
-        tensorwise_scale,
-        real_size_k);
-
-    const bool use_prefill_mode = std::is_same_v<ElemT, at::Float8_e4m3fn> && mode >= 70000;
-    if (config_m <= 512 && !use_prefill_mode) {
-      if constexpr (std::is_same_v<ElemT, at::Float8_e4m3fn>) {
-        auto it = kernel_maps_gemm2_decode_n160_fp8<OutT>.find(mode);
-        if (it != kernel_maps_gemm2_decode_n160_fp8<OutT>.end()) {
-          it->second(params_in);
-        } else {
-          printf("bfloat version gemm2 No matching kernel configuration found, using default settings \n");
-        }
-      }
-    } else {
-      if constexpr (std::is_same_v<ElemT, at::Float8_e4m3fn>) {
-        auto it_prefill = kernel_maps_gemm2_prefill_fp8<OutT>.find(mode);
-        if (it_prefill != kernel_maps_gemm2_prefill_fp8<OutT>.end()) {
-          it_prefill->second(params_in);
-        } else {
-          auto it = kernel_maps_gemm2_prefill_n160_fp8<OutT>.find(mode);
-          if (it != kernel_maps_gemm2_prefill_n160_fp8<OutT>.end()) {
-            it->second(params_in);
-          } else {
-            printf("bfloat version gemm2 No matching kernel configuration found, using default settings \n");
-          }
-        }
-      }
-    }
-  }
-}
+// 模板抽象
+// BLOCK_MNK: [16, 128, 128]
+// WARP_MNK: [16, 32, 64]
+// MMA_MNK: [16, 16, 32]
+// BLOCK_MNK / WARP_MNK = [1, 4, 2]  代表warp在MN方向的排布 block_k/warp_k代表stage
+// WARP_MNK / MMA_MNK = [1, 2, 2]    代表warp在MNK方向重复计算的次数 会分配额外的寄存器
