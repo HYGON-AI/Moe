@@ -199,11 +199,13 @@ __device__ __forceinline__ int cvta_to_shared(const void *ptr)
 __device__ __forceinline__ void cp_async4(float *smem_ptr, uintx4 global_addr, const int gvOffset_s, const int &gvOffset_v)
 {
     int smem_offset = cvta_to_shared(smem_ptr); // reinterpret_cast<size_t>(smem_ptr);
+    __builtin_amdgcn_sched_barrier(0);
     asm volatile(
         "s_mov_b32 m0, %1 \n\t"
         "buffer_load_dword %0, %2, %3 ,offen  offset:0, lds \n" ::"v"(gvOffset_v),
         "s"(smem_offset), "s"(global_addr), "s"(gvOffset_s)
         :);
+    __builtin_amdgcn_sched_barrier(0);
     // asm volatile(
     //     "s_waitcnt vmcnt(0) \n\t"
     // :);
@@ -272,10 +274,12 @@ __forceinline__ __device__ void buffer_load_reg_dwordx2(const T *ptr, vec<int, 2
     global_ptr[2] = 0x80000000;
     global_ptr[3] = 0x00020000;
 
+    __builtin_amdgcn_sched_barrier(0);
     asm volatile(
         "s_nop 2 \n\t"
         "buffer_load_dwordx2 %0,%1,%2,0, offen offset:0\n"
         : "=v"(rsrc), "+v"(offset), "+s"(global_ptr));
+    __builtin_amdgcn_sched_barrier(0);
 
     return;
     __builtin_amdgcn_sched_barrier(0);
@@ -290,10 +294,12 @@ __forceinline__ __device__ void buffer_load_reg_dwordx2_w4a8(const T *ptr, vec<i
     global_ptr[2] = 0x80000000;
     global_ptr[3] = 0x00020000;
 
+    __builtin_amdgcn_sched_barrier(0);
     asm volatile("buffer_load_dwordx2 %0, %1, %2, %3 offen offset:0 \n"
                  : "=v"(rsrc)
                  : "v"(v_offset), "s"(global_ptr), "s"(s_offset)
                  : "memory");
+    __builtin_amdgcn_sched_barrier(0);
     return;
     __builtin_amdgcn_sched_barrier(0);
 }
@@ -308,10 +314,12 @@ __forceinline__ __device__ void buffer_load_reg_dwordx4(const T *ptr, vec<int, 4
     global_ptr[2] = 0x80000000;
     global_ptr[3] = 0x00020000;
 
+    __builtin_amdgcn_sched_barrier(0);
     asm volatile(
         "s_nop 2 \n\t"
         "buffer_load_dwordx4 %0,%1,%2,0, offen offset:0\n"
         : "=v"(rsrc), "+v"(offset), "+s"(global_ptr));
+    __builtin_amdgcn_sched_barrier(0);
 
     return;
     __builtin_amdgcn_sched_barrier(0);
@@ -332,10 +340,12 @@ __forceinline__ __device__ void buffer_load_reg_dwordx4_w4a8(const T *ptr, vec<i
     //     "s_nop 2 \n\t"
     //     "buffer_load_dwordx4 %0,%1,%2,0, offen offset:0\n"
     //     : "=v"(rsrc), "+v"(total_offset), "+s"(global_ptr));
+    __builtin_amdgcn_sched_barrier(0);
     asm volatile("buffer_load_dwordx4 %0, %1, %2 ,%3 offen  offset:0  \n"
                  : "=v"(rsrc)
                  : "v"(v_offset), "s"(global_ptr), "s"(s_offset)
                  : "memory");
+    __builtin_amdgcn_sched_barrier(0);
     return;
     __builtin_amdgcn_sched_barrier(0);
 }
@@ -350,10 +360,12 @@ __forceinline__ __device__ void buffer_load_reg_dwordx4_uint32(const T *ptr, vec
     global_ptr[2] = 0x80000000;
     global_ptr[3] = 0x00020000;
 
+    __builtin_amdgcn_sched_barrier(0);
     asm volatile(
         "s_nop 2 \n\t"
         "buffer_load_dwordx4 %0,%1,%2,0, offen offset:0\n"
         : "=v"(rsrc), "+v"(offset), "+s"(global_ptr));
+    __builtin_amdgcn_sched_barrier(0);
 
     return;
 }
@@ -368,10 +380,12 @@ __forceinline__ __device__ void buffer_load_reg_dwordx4_half8(const T *ptr, vec8
     global_ptr[2] = 0x80000000;
     global_ptr[3] = 0x00020000;
 
+    __builtin_amdgcn_sched_barrier(0);
     asm volatile(
         "s_nop 2 \n\t"
         "buffer_load_dwordx4 %0,%1,%2,0, offen offset:0\n"
         : "=v"(rsrc), "+v"(offset), "+s"(global_ptr));
+    __builtin_amdgcn_sched_barrier(0);
 
     return;
 }
@@ -386,10 +400,12 @@ __forceinline__ __device__ void buffer_load_reg_dwordx4_gls_slc(const T *ptr, ve
     global_ptr[2] = 0x80000000;
     global_ptr[3] = 0x00020000;
 
+    __builtin_amdgcn_sched_barrier(0);
     asm volatile(
         "s_nop 2 \n\t"
         "buffer_load_dwordx4 %0,%1,%2,0, offen offset:0 glc slc\n"
         : "=v"(rsrc), "+v"(offset), "+s"(global_ptr));
+    __builtin_amdgcn_sched_barrier(0);
 
     return;
 }
@@ -401,11 +417,13 @@ __forceinline__ __device__ void inline_buffer_load_dword_bypass_glc_slc(DataType
     int v_offset_bytes = v_offset << shfl_count;
     int s_offset_bytes = s_offset << shfl_count;
 
+    __builtin_amdgcn_sched_barrier(0);
     asm volatile(
         "buffer_load_dword %0, %1, %2, %3 ,offen  glc slc \n"
         : "=v"(v_data)
         : "v"(v_offset_bytes), "s"(global_addr), "s"(s_offset_bytes)
         : "memory");
+    __builtin_amdgcn_sched_barrier(0);
 }
 
 // template<class DataType, const int shfl_count=2>
@@ -639,6 +657,7 @@ static __device__ inline T b32_to_b16(float f)
 #elif defined(__gfx938__)
         __builtin_amdgcn_sched_barrier(0);
         __hip_bfloat16 res;
+        __builtin_amdgcn_sched_barrier(0);
         asm volatile(
             "v_cvt_bf16_f32  %0, %1 \n\t"
             : "=v"(res)
