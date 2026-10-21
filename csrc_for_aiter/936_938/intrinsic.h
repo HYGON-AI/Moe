@@ -15,10 +15,12 @@ __forceinline__ __device__ void inline_buffer_load_dword_lds(DataType *const sha
     int offset_s = gvOffset_s << shfl_count;
     int offset_v = gvOffset_v << shfl_count;
 
+    __builtin_amdgcn_sched_barrier(0);
     asm volatile("s_mov_b32 m0, %1 \n\t"
                  "buffer_load_dword %0, %2, %3 ,offen  offset:0, lds \n" ::"v"(offset_v),
                  "s"(ldsAddrPerWave), "s"(global_addr), "s"(offset_s)
                  :);
+    __builtin_amdgcn_sched_barrier(0);
 }
 
 template <class DataType, const int shfl_count>
@@ -35,6 +37,7 @@ __forceinline__ __device__ void inline_buffer_load_ushort(DataType &v_data, int 
     //     : "=v"(v_data)
     //     : "v"(v_offset_bytes), "s"(global_addr), "s"(s_offset_bytes)
     //     : "memory");
+    __builtin_amdgcn_sched_barrier(0);
     asm volatile(
         "buffer_load_ushort %0, %1, %2, %3 offen\n"
         // "s_waitcnt vmcnt(0)\n"
@@ -42,6 +45,7 @@ __forceinline__ __device__ void inline_buffer_load_ushort(DataType &v_data, int 
         : "=v"(v_data)
         : "v"(v_offset_bytes), "s"(global_addr), "s"(s_offset_bytes)
         : "memory");
+    __builtin_amdgcn_sched_barrier(0);
 }
 
 template <class DataType>
@@ -58,6 +62,7 @@ __forceinline__ __device__ void inline_buffer_load_ubyte(DataType &v_data, int v
     //     : "=v"(v_data)
     //     : "v"(v_offset_bytes), "s"(global_addr), "s"(s_offset_bytes)
     //     : "memory");
+    __builtin_amdgcn_sched_barrier(0);
     asm volatile(
         "buffer_load_ubyte %0, %1, %2, %3 offen\n"
         // "s_waitcnt vmcnt(0)\n"
@@ -65,6 +70,7 @@ __forceinline__ __device__ void inline_buffer_load_ubyte(DataType &v_data, int v
         : "=v"(v_data)
         : "v"(v_offset_bytes), "s"(global_addr), "s"(s_offset_bytes)
         : "memory");
+    __builtin_amdgcn_sched_barrier(0);
 }
 
 template <class DataType, const int shfl_count = 2>
@@ -74,6 +80,7 @@ __forceinline__ __device__ void inline_buffer_load_dword(DataType &v_data, int v
     int v_offset_bytes = v_offset << shfl_count;
     int s_offset_bytes = s_offset << shfl_count;
 
+    __builtin_amdgcn_sched_barrier(0);
     asm volatile(
 
         "buffer_load_dword %0, %1, %2, %3 offen\n"
@@ -83,6 +90,7 @@ __forceinline__ __device__ void inline_buffer_load_dword(DataType &v_data, int v
         : "=v"(v_data)
         : "v"(v_offset_bytes), "s"(global_addr), "s"(s_offset_bytes)
         : "memory");
+    __builtin_amdgcn_sched_barrier(0);
 }
 
 template <class DataType, const int shfl_count = 2>
@@ -93,10 +101,12 @@ __forceinline__ __device__ void inline_buffer_load_dwordx2_lds(DataType *const s
     int offset_s = gvOffset_s << shfl_count;
     int offset_v = gvOffset_v << shfl_count;
 
+    __builtin_amdgcn_sched_barrier(0);
     asm volatile("s_mov_b32 m0, %1 \n\t"
                  "buffer_load_dwordx2 %0, %2, %3 ,offen  offset:0, lds \n" ::"v"(offset_v),
                  "s"(ldsAddrPerWave), "s"(global_addr), "s"(offset_s)
                  :);
+    __builtin_amdgcn_sched_barrier(0);
 }
 
 template <class DataType, const int shfl_count = 2>
@@ -107,10 +117,12 @@ __forceinline__ __device__ void inline_buffer_load_dwordx4_lds(DataType *const s
     int offset_s = gvOffset_s << shfl_count;
     int offset_v = gvOffset_v << shfl_count;
 
+    __builtin_amdgcn_sched_barrier(0);
     asm volatile("s_mov_b32 m0, %1 \n\t"
                  "buffer_load_dwordx4 %0, %2, %3 ,offen  offset:0, lds \n" ::"v"(offset_v),
                  "s"(ldsAddrPerWave), "s"(global_addr), "s"(offset_s)
                  :);
+    __builtin_amdgcn_sched_barrier(0);
 }
 
 template <class DataType, const int shfl_count = 2>
@@ -120,10 +132,12 @@ __forceinline__ __device__ void inline_buffer_load_dwordx4(DataType &v_data, con
     int offset_s = gvOffset_s << shfl_count;
     int offset_v = gvOffset_v << shfl_count;
 
+    __builtin_amdgcn_sched_barrier(0);
     asm volatile("buffer_load_dwordx4 %0, %1, %2 ,%3 offen  offset:0 \n"
                  : "=v"(v_data)
                  : "v"(offset_v), "s"(global_addr), "s"(offset_s)
                  : "memory");
+    __builtin_amdgcn_sched_barrier(0);
 }
 
 template <class DataType, const int shfl_count = 2>
@@ -132,10 +146,12 @@ __forceinline__ __device__ void inline_s_load_dwordx4(DataType &s_data, const ui
 
     int offset_s = gvOffset_s << shfl_count;
 
+    __builtin_amdgcn_sched_barrier(0);
     asm volatile("s_load_dwordx4 %0, %1 \n"
                  : "=s"(s_data)
                  : "s"(global_addr)
                  : "memory");
+    __builtin_amdgcn_sched_barrier(0);
 }
 
 template <class DataType, const int shfl_count = 2>
@@ -146,10 +162,12 @@ __forceinline__ __device__ void inline_buffer_load_dword_lds_bypass_glc_slc(Data
     int offset_s = gvOffset_s << shfl_count;
     int offset_v = gvOffset_v << shfl_count;
 
+    __builtin_amdgcn_sched_barrier(0);
     asm volatile("s_mov_b32 m0, %1 \n\t"
                  "buffer_load_dword %0, %2, %3 ,offen  offset:0 glc slc lds\n" ::"v"(offset_v),
                  "s"(ldsAddrPerWave), "s"(global_addr), "s"(offset_s)
                  :);
+    __builtin_amdgcn_sched_barrier(0);
 }
 
 template <class DataType, const int shfl_count = 2>
@@ -160,10 +178,12 @@ __forceinline__ __device__ void inline_buffer_load_dword_lds_bypass_l1_glc(DataT
     int offset_s = gvOffset_s << shfl_count;
     int offset_v = gvOffset_v << shfl_count;
 
+    __builtin_amdgcn_sched_barrier(0);
     asm volatile("s_mov_b32 m0, %1 \n\t"
                  "buffer_load_dword %0, %2, %3 ,offen  offset:0 glc lds\n" ::"v"(offset_v),
                  "s"(ldsAddrPerWave), "s"(global_addr), "s"(offset_s)
                  :);
+    __builtin_amdgcn_sched_barrier(0);
 }
 
 template <class DataType, const int shfl_count = 2>
@@ -174,10 +194,12 @@ __forceinline__ __device__ void inline_buffer_load_dword_lds_bypass_l2_slc(DataT
     int offset_s = gvOffset_s << shfl_count;
     int offset_v = gvOffset_v << shfl_count;
 
+    __builtin_amdgcn_sched_barrier(0);
     asm volatile("s_mov_b32 m0, %1 \n\t"
                  "buffer_load_dword %0, %2, %3 ,offen  offset:0 slc lds\n" ::"v"(offset_v),
                  "s"(ldsAddrPerWave), "s"(global_addr), "s"(offset_s)
                  :);
+    __builtin_amdgcn_sched_barrier(0);
 }
 
 template <typename src_type = half_t, typename dst_type = float, const int dword_count = 1, const int auxilariy = 0>
@@ -228,9 +250,11 @@ __forceinline__ __device__ void inline_buffer_store_dword(const DataType v_data,
     int s_offset_bybes = s_offset << shfl_count;
     const int s_constant_bytes = s_constant << shfl_count;
 
+    __builtin_amdgcn_sched_barrier(0);
     asm volatile(
         "buffer_store_dword %0, %1, %2, %3, offen  offset:%4 \n" ::"v"(v_data), "v"(v_offset_bytes), "s"(global_addr), "s"(s_offset_bybes), "B"(s_constant_bytes)
         :);
+    __builtin_amdgcn_sched_barrier(0);
 }
 
 template <class DataType, const int shfl_count>
@@ -241,72 +265,86 @@ __forceinline__ __device__ void inline_buffer_store_dword_glc_slc(DataType v_dat
     int s_offset_bybes = s_offset << shfl_count;
     const int s_constant_bytes = s_constant << shfl_count;
 
+    __builtin_amdgcn_sched_barrier(0);
     asm volatile(
         "buffer_store_dword %0, %1, %2, %3, offen  offset:%4  glc slc\n" ::"v"(v_data), "v"(v_offset_bytes), "s"(global_addr), "s"(s_offset_bybes), "B"(s_constant_bytes)
         :);
+    __builtin_amdgcn_sched_barrier(0);
 }
 
 template <typename VEC>
 __forceinline__ __device__ void inline_ds_read_b32_no_wait(VEC *const shared_addr, const int &lds_offset, VEC &reg_val)
 {
     int ldsAddr = reinterpret_cast<size_t>(shared_addr) + lds_offset * 4;
+    __builtin_amdgcn_sched_barrier(0);
     asm volatile(
         "ds_read_b32 %0, %1\n"
         : "=v"(reg_val)
         : "v"(ldsAddr)
         :);
+    __builtin_amdgcn_sched_barrier(0);
 }
 
 template <typename VEC>
 __forceinline__ __device__ void inline_ds_read_b32_no_wait_bytes(const int &lds_offset, VEC &reg_val)
 {
+    __builtin_amdgcn_sched_barrier(0);
     asm volatile(
         "ds_read_b32 %0, %1\n"
         : "=v"(reg_val)
         : "v"(lds_offset)
         :);
+    __builtin_amdgcn_sched_barrier(0);
 }
 
 template <typename VEC, typename dwordx2>
 __forceinline__ __device__ void inline_ds_read2_b32_no_wait(VEC *shared_addr, const int &lds_offset, dwordx2 &reg_val, const int offset1)
 {
     int ldsAddr = reinterpret_cast<size_t>(shared_addr) + lds_offset * 4;
+    __builtin_amdgcn_sched_barrier(0);
     asm volatile(
         "ds_read2_b32 %0 ,%1 offset0:0 offset1:%2\n"
         : "=v"(reg_val)
         : "v"(ldsAddr), "B"(offset1)
         :);
+    __builtin_amdgcn_sched_barrier(0);
 }
 
 template <typename dwordx2>
 __forceinline__ __device__ void inline_ds_read2_b32_no_wait_bytes(const int &lds_offset, dwordx2 &reg_val, const int offset1)
 {
+    __builtin_amdgcn_sched_barrier(0);
     asm volatile(
         "ds_read2_b32 %0, %1 offset0:0 offset1:%2\n"
         : "=v"(reg_val)
         : "v"(lds_offset), "B"(offset1)
         :);
+    __builtin_amdgcn_sched_barrier(0);
 }
 
 template <typename dwordx2>
 __forceinline__ __device__ void inlineasm_fa_ds_read2_b32(float *shared_addr, const int &lds_offset, dwordx2 &reg_val, const int offset0, const int offset1)
 {
     int lds_addr = reinterpret_cast<size_t>(shared_addr) + lds_offset * 4;
+    __builtin_amdgcn_sched_barrier(0);
     asm volatile(
         "ds_read2_b32 %0, %1 offset0:%2 offset1:%3\n"
         : "=v"(reg_val)
         : "v"(lds_addr), "B"(offset0), "B"(offset1)
         :);
+    __builtin_amdgcn_sched_barrier(0);
 }
 
 __forceinline__ __device__ void inline_ds_write2_b32_no_wait_bytes(float *shared_addr, int lds_offset, const __float2 &reg_val, const int offset0, const int offset1)
 {
     int lds_addr = reinterpret_cast<size_t>(shared_addr) + lds_offset * 4;
+    __builtin_amdgcn_sched_barrier(0);
     asm volatile(
         "ds_write2_b32 %0, %1, %2 offset0:%3 offset1:%4\n"
         : "=v"(lds_addr)
         : "v"(reg_val[0]), "v"(reg_val[1]), "B"(offset0), "B"(offset1)
         :);
+    __builtin_amdgcn_sched_barrier(0);
 }
 
 template <typename VEC>
@@ -318,26 +356,32 @@ __forceinline__ __device__ void inline_ds_read_b32_wait(VEC *const shared_addr, 
 template <typename VEC>
 __forceinline__ __device__ void inline_vgpr_init_zero(VEC &dst, const int idx)
 {
+    __builtin_amdgcn_sched_barrier(0);
     asm("v_mov_b32 %0, 0x0"
         : "=v"(dst[idx])
         :);
+    __builtin_amdgcn_sched_barrier(0);
 }
 
 template <typename VEC>
 __forceinline__ __device__ void inline_vgpr4_init_zero(VEC &dst)
 {
 #if defined(__gfx936__) || defined(__gfx928__) || defined(__gfx938__) || defined(__gfx946__) || defined(__gfx92a__)
+    __builtin_amdgcn_sched_barrier(0);
     asm("v_mov_b64 %0, 0x0\n\t"
         "v_mov_b64 %1, 0x0\n\t"
         : "=v"(dst.u64[0]), "=v"(dst.u64[1])
         :);
+    __builtin_amdgcn_sched_barrier(0);
 #else
+    __builtin_amdgcn_sched_barrier(0);
     asm("v_mov_b32 %0, 0x0\n\t"
         "v_mov_b32 %1, 0x0\n\t"
         "v_mov_b32 %2, 0x0\n\t"
         "v_mov_b32 %3, 0x0\n\t"
         : "=v"(dst.f32[0]), "=v"(dst.f32[1]), "=v"(dst.f32[2]), "=v"(dst.f32[3])
         :);
+    __builtin_amdgcn_sched_barrier(0);
 #endif
 }
 
@@ -345,6 +389,7 @@ template <typename VEC>
 __forceinline__ __device__ void inline_vgpr4_init_zero_4x4x4(VEC s_reg[4][4])
 {
 #if defined(__gfx936__) || defined(__gfx928__) || defined(__gfx938__) || defined(__gfx946__) || defined(__gfx92a__)
+    __builtin_amdgcn_sched_barrier(0);
     asm("v_mov_b64 %0, 0x0\n\t"
         "v_mov_b64 %1, 0x0\n\t"
         "v_mov_b64 %2, 0x0\n\t"
@@ -379,6 +424,7 @@ __forceinline__ __device__ void inline_vgpr4_init_zero_4x4x4(VEC s_reg[4][4])
         "v_mov_b64 %31, 0x0\n"
         : "=v"(s_reg[0][0].u64[0]), "=v"(s_reg[0][0].u64[1]), "=v"(s_reg[0][1].u64[0]), "=v"(s_reg[0][1].u64[1]), "=v"(s_reg[0][2].u64[0]), "=v"(s_reg[0][2].u64[1]), "=v"(s_reg[0][3].u64[0]), "=v"(s_reg[0][3].u64[1]), "=v"(s_reg[1][0].u64[0]), "=v"(s_reg[1][0].u64[1]), "=v"(s_reg[1][1].u64[0]), "=v"(s_reg[1][1].u64[1]), "=v"(s_reg[1][2].u64[0]), "=v"(s_reg[1][2].u64[1]), "=v"(s_reg[1][3].u64[0]), "=v"(s_reg[1][3].u64[1]), "=v"(s_reg[2][0].u64[0]), "=v"(s_reg[2][0].u64[1]), "=v"(s_reg[2][1].u64[0]), "=v"(s_reg[2][1].u64[1]), "=v"(s_reg[2][2].u64[0]), "=v"(s_reg[2][2].u64[1]), "=v"(s_reg[2][3].u64[0]), "=v"(s_reg[2][3].u64[1]), "=v"(s_reg[3][0].u64[0]), "=v"(s_reg[3][0].u64[1]), "=v"(s_reg[3][1].u64[0]), "=v"(s_reg[3][1].u64[1]), "=v"(s_reg[3][2].u64[0]), "=v"(s_reg[3][2].u64[1]), "=v"(s_reg[3][3].u64[0]), "=v"(s_reg[3][3].u64[1])
         :);
+    __builtin_amdgcn_sched_barrier(0);
 #else
     uint64_t pk_zero = 0x0;
 #pragma unroll
@@ -398,6 +444,7 @@ template <typename VEC>
 __forceinline__ __device__ void inline_vgpr4_init_zero_4x2x4(VEC s_reg[4][4])
 {
 #if defined(__gfx936__) || defined(__gfx928__) || defined(__gfx938__) || defined(__gfx946__) || defined(__gfx92a__)
+    __builtin_amdgcn_sched_barrier(0);
     asm("v_mov_b64 %0, 0x0\n\t"
         "v_mov_b64 %1, 0x0\n\t"
         "v_mov_b64 %2, 0x0\n\t"
@@ -416,6 +463,7 @@ __forceinline__ __device__ void inline_vgpr4_init_zero_4x2x4(VEC s_reg[4][4])
         "v_mov_b64 %15, 0x0\n\t"
         : "=v"(s_reg[0][0].u64[0]), "=v"(s_reg[0][0].u64[1]), "=v"(s_reg[0][2].u64[0]), "=v"(s_reg[0][2].u64[1]), "=v"(s_reg[1][0].u64[0]), "=v"(s_reg[1][0].u64[1]), "=v"(s_reg[1][2].u64[0]), "=v"(s_reg[1][2].u64[1]), "=v"(s_reg[2][0].u64[0]), "=v"(s_reg[2][0].u64[1]), "=v"(s_reg[2][2].u64[0]), "=v"(s_reg[2][2].u64[1]), "=v"(s_reg[3][0].u64[0]), "=v"(s_reg[3][0].u64[1]), "=v"(s_reg[3][2].u64[0]), "=v"(s_reg[3][2].u64[1])
         :);
+    __builtin_amdgcn_sched_barrier(0);
 #else
     uint64_t pk_zero = 0x0;
 #pragma unroll
@@ -435,6 +483,7 @@ template <typename VEC>
 __forceinline__ __device__ void inline_vgpr4_init_zero_1x4x4(VEC s_reg[1][4])
 {
 #if defined(__gfx936__) || defined(__gfx928__) || defined(__gfx938__) || defined(__gfx946__) || defined(__gfx92a__)
+    __builtin_amdgcn_sched_barrier(0);
     asm("v_mov_b64 %0, 0x0\n\t"
         "v_mov_b64 %1, 0x0\n\t"
         "v_mov_b64 %2, 0x0\n\t"
@@ -445,6 +494,7 @@ __forceinline__ __device__ void inline_vgpr4_init_zero_1x4x4(VEC s_reg[1][4])
         "v_mov_b64 %7, 0x0\n\t"
         : "=v"(s_reg[0][0].u64[0]), "=v"(s_reg[0][0].u64[1]), "=v"(s_reg[0][1].u64[0]), "=v"(s_reg[0][1].u64[1]), "=v"(s_reg[0][2].u64[0]), "=v"(s_reg[0][2].u64[1]), "=v"(s_reg[0][3].u64[0]), "=v"(s_reg[0][3].u64[1])
         :);
+    __builtin_amdgcn_sched_barrier(0);
 #endif
 }
 
@@ -452,12 +502,14 @@ template <typename VEC>
 __forceinline__ __device__ void inline_vgpr4_init_zero_1x2x4(VEC s_reg[1][4])
 {
 #if defined(__gfx936__) || defined(__gfx928__) || defined(__gfx938__) || defined(__gfx946__) || defined(__gfx92a__)
+    __builtin_amdgcn_sched_barrier(0);
     asm("v_mov_b64 %0, 0x0\n\t"
         "v_mov_b64 %1, 0x0\n\t"
         "v_mov_b64 %2, 0x0\n\t"
         "v_mov_b64 %3, 0x0\n\t"
         : "=v"(s_reg[0][0].u64[0]), "=v"(s_reg[0][0].u64[1]), "=v"(s_reg[0][2].u64[0]), "=v"(s_reg[0][2].u64[1])
         :);
+    __builtin_amdgcn_sched_barrier(0);
 #endif
 }
 
@@ -465,38 +517,46 @@ __forceinline__ __device__ void inline_vgpr4_init_zero_1x2x4(VEC s_reg[1][4])
 inline __device__ __float2 inlineasm_fa_v_pk_fma_f32(__float2 &a, const __float2 &b, const __float2 &c)
 {
     __float2 d;
+    __builtin_amdgcn_sched_barrier(0);
     asm volatile("v_pk_fma_f32 %0, %1, %2, %3  ; inlineasm_fa_v_pk_fma_f32"
                  : "=v"(d)
                  : "v"(a), "v"(b), "v"(c)
                  :);
+    __builtin_amdgcn_sched_barrier(0);
     return d;
 }
 
 inline __device__ void inlineasm_fa_v_mov_b64(__float2 &c, const __float2 &a)
 {
+    __builtin_amdgcn_sched_barrier(0);
     asm volatile("v_mov_b64 %0, %1 ; inlineasm_fa_v_mov_b64"
                  : "=v"(c)
                  : "v"(a)
                  :);
+    __builtin_amdgcn_sched_barrier(0);
 }
 
 extern __device__ __attribute__((const)) __float2 __llvm_v_pk_fma_f32(__float2, __float2, __float2) __asm("llvm.fma.v2f32");
 
 inline __device__ void inlineasm_fa_v_pk_mul_f32(__float2 &dst, const __float2 &src, const __float2 &scale)
 {
+    __builtin_amdgcn_sched_barrier(0);
     asm volatile("v_pk_mul_f32 %0, %1, %2 ; inlineasm_fa_v_pk_mul_f32"
                  : "=v"(dst)
                  : "v"(src), "v"(scale)
                  :);
+    __builtin_amdgcn_sched_barrier(0);
 }
 
 // c = a + b
 inline __device__ void inlineasm_fa_v_pk_add_f32(__float2 &c, const __float2 &a, const __float2 &b)
 {
+    __builtin_amdgcn_sched_barrier(0);
     asm volatile("v_pk_add_f32 %0, %1, %2 ; inlineasm_fa_v_pk_add_f32"
                  : "=v"(c)
                  : "v"(a), "v"(b)
                  :);
+    __builtin_amdgcn_sched_barrier(0);
 }
 
 /*
@@ -513,12 +573,14 @@ inline __device__ float inlineasm_fa_v_exp2_f32(const float x)
 {
     // return exp2f(x);
     float y;
+    __builtin_amdgcn_sched_barrier(0);
     asm volatile(
         // "s_waitcnt lgkmcnt(0)\n\t"
         "v_exp_f32 %0, %1"
         : "=v"(y)
         : "v"(x)
         :);
+    __builtin_amdgcn_sched_barrier(0);
     return y;
 }
 
@@ -601,28 +663,34 @@ __device__ __forceinline__ vec<uint, 4> tcp_cache_swizzle_func_b8(const T *ptr)
     }
 
 #define MATRIX_LOAD_64x32_B8_LDS_REARRANGE(LDSADDR, SRSRC, MATRIX_OFFSET, R, T)                 \
+    __builtin_amdgcn_sched_barrier(0); \
     asm volatile("s_nop 0\n\t"                                                                  \
                  "matrix_load_64x16_b8 %0, %1, moffset:%2 " #R #T " lds\n\t"                    \
                  "matrix_load_64x16_b8 %0, %3, moffset:%4 " #R #T " lds\n" ::"s"(SRSRC),        \
                  "s"(LDSADDR), "n"(MATRIX_OFFSET), "s"(LDSADDR + 1024), "n"(MATRIX_OFFSET + 16) \
-                 :);
+                 :); \
+    __builtin_amdgcn_sched_barrier(0);
 
 #define DS_READ_MATRIX_64x16_B8(OFFSET, REG)                                                \
     int lds_offset_s = __builtin_amdgcn_readfirstlane(OFFSET);                              \
+    __builtin_amdgcn_sched_barrier(0); \
     asm volatile(                                                                           \
         "s_add_u32 m0, %1, 0x80000000\n\t"                                                  \
         "s_nop 0\n\t"                                                                       \
         "ds_read_matrix_trans_format %0, m0 offset:0 element:0x1 row:0x3 col:0x1 alt:0x0\n" \
         : "=v"(REG)                                                                         \
         : "s"(lds_offset_s)                                                                 \
-        :);
+        :); \
+    __builtin_amdgcn_sched_barrier(0);
 
 #define MATRIX_LOAD_64x16_B8_LDS_TRANSPOSE(LDSADDR, SRSRC, MATRIX_OFFSET, R, T)            \
     LDSADDR = LDSADDR + 0x80000000;                                                        \
+    __builtin_amdgcn_sched_barrier(0); \
     asm volatile("s_nop 0\n\t"                                                             \
                  "matrix_load_64x16_b8 %0, %1, moffset:%2 " #R #T " lds\n\t" ::"s"(SRSRC), \
                  "s"(LDSADDR), "n"(MATRIX_OFFSET)                                          \
-                 :);
+                 :); \
+    __builtin_amdgcn_sched_barrier(0);
 
 template <int r, int t, class DataType>
 __forceinline__ __device__ void inline_matrix_load_64x16_b8_lds_transpose(DataType *shared_addr, vec4_uint srsrc, int lds_offset, const int matrix_offset)
