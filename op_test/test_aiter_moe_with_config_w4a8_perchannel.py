@@ -514,7 +514,10 @@ def _run_moe_perf(
         block_shape,
         global_num_experts,
         expert_map,
+        use_weight_shuffle=False,
+        output_dtype=hidden_states.dtype,
     )
+
 def generate_unique_int_tensor(m, topk, low=0, high=256):
     """生成[m, topk]的整数张量，每行元素不重复"""
     if topk > (high - low):
@@ -692,8 +695,23 @@ def test_moe_w4a8(m, k, n, e, topk, dtype, show_compare=False):
 
     ret = {
         "m": m,
+        "e": e,
+        "n": n,
+        "k": k,
+        "topk": topk,
+        "aiter_backend": moe_cfg.solution_type if status else None,
+        "aiter_moe_us": None,
+        # Keep the legacy column names for existing standalone CSV consumers.
         "moe_backend": moe_cfg.solution_type if status else None,
         "moe_us": None,
+        "aiter_config_mode": (
+            int(moe_cfg.config["MODE"]) if status and moe_cfg.config else None
+        ),
+        "aiter_block_size_m": (
+            int(moe_cfg.config["BLOCK_SIZE_M"])
+            if status and moe_cfg.config and "BLOCK_SIZE_M" in moe_cfg.config
+            else None
+        ),
     }
     moe_us = 1.0
     if not status:
@@ -742,13 +760,15 @@ def test_moe_w4a8(m, k, n, e, topk, dtype, show_compare=False):
         f"error_ratio={check_ret:.6f}, tolerance=0.03"
     )
     ret["moe_accuracy"] = "passed" if check_ret == 0 else (1-check_ret)
+    ret["aiter_moe_us"] = moe_us
     ret["moe_us"] = moe_us
     return ret
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--tokens", type=int, nargs="+", default=None)
+    parser.add_argument("--tokens", "--m", nargs="+", type=int,
+        default=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 6144, 8192, 16384],)
     parser.add_argument("--e", type=int, default=256, help="Number of experts.")
     parser.add_argument("--n", type=int, default=256, help="Expert hidden/output dimension.")
     parser.add_argument("--k", type=int, default=7168, help="Model/input dimension.")

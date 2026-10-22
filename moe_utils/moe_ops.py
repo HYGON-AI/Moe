@@ -81,7 +81,14 @@ def silu_and_mul(
     input: torch.Tensor,
     rows_per_block: int = 1,
     vec_size: int = 2,
+    limit: Optional[float] = None,
 ) -> None:
+    if limit is not None:
+        gate, up = input.chunk(2, dim=-1)
+        gate = gate.clamp(min=-float(limit), max=float(limit))
+        up = up.clamp(min=-float(limit), max=float(limit))
+        out.copy_((torch.nn.functional.silu(gate) * up).to(out.dtype))
+        return
     _call_moe_wna16_op("silu_and_mul", out, input, rows_per_block, vec_size)
 
 
@@ -286,11 +293,144 @@ def moe_sorting_fwd(
     sorted_expert_ids: torch.Tensor,
     tokens_positions_per_expert: torch.Tensor,
     num_valid_ids: torch.Tensor,
+    moe_buf: Optional[torch.Tensor],
+    num_experts: int,
+    block_size: int,
+    expert_mask: Optional[torch.Tensor] = None,
+) -> None:
+    """Run the local CK sorting operator when it is available.
+
+    The Python implementation remains the fallback for builds without the
+    vendored CK sources or when explicitly disabled for diagnosis.
+    """
+    if os.environ.get("MOE_C_DISABLE_NATIVE_CK", "0").strip().lower() not in {
+        "1", "true", "yes", "on"
+    }:
+        try:
+            load_moe_c_library()
+            native = getattr(torch.ops.moe_wna16, "moe_sorting_fwd", None)
+        except (AttributeError, OSError, RuntimeError):
+            native = None
+        if native is not None:
+            native(
+                topk_ids,
+                topk_weights,
+                sorted_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                tokens_positions_per_expert,
+                num_valid_ids,
+                moe_buf,
+                int(num_experts),
+                int(block_size),
+                expert_mask,
+            )
+            return
+    _moe_sorting_fwd_fallback(
+        topk_ids,
+        topk_weights,
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        tokens_positions_per_expert,
+        num_valid_ids,
+        moe_buf,
+        num_experts,
+        block_size,
+        expert_mask,
+    )
+
+
+def _moe_sorting_fwd_fallback(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    sorted_weights: torch.Tensor,
+    sorted_expert_ids: torch.Tensor,
+    tokens_positions_per_expert: torch.Tensor,
+    num_valid_ids: torch.Tensor,
     moe_buf: torch.Tensor,
     num_experts: int,
     block_size: int,
     expert_mask: Optional[torch.Tensor] = None,
 ) -> None:
+    # The standalone build does not include AITER's module_cpp_api sorting
+    # extension.  Keep the common, unmasked path tensorized so it remains
+    # asynchronous and CUDA-Graph-capturable instead of falling back to the
+    # Python expert loop used for masked/reference cases.
+    if expert_mask is None:
+        topk_ids_i32 = topk_ids.to(torch.int32)
+        topk_weights_f32 = topk_weights.to(torch.float32)
+        m, topk = topk_ids_i32.shape
+        route_count = m * topk
+        if route_count == 0:
+            sorted_ids.fill_((topk << 24) | m)
+            sorted_weights.zero_()
+            sorted_expert_ids.fill_(-1)
+            tokens_positions_per_expert.zero_()
+            num_valid_ids.zero_()
+            moe_buf.zero_()
+            return
+
+        # Stable expert-major ordering preserves the flattened token/route
+        # order produced by AITER's sorting kernel within each expert.
+        flat_experts = topk_ids_i32.reshape(-1)
+        order = torch.argsort(flat_experts, stable=True)
+        sorted_experts = flat_experts[order]
+        counts = torch.zeros(
+            int(num_experts), device=topk_ids.device, dtype=torch.int64
+        )
+        counts.scatter_add_(
+            0,
+            flat_experts.to(torch.int64),
+            torch.ones_like(flat_experts, dtype=torch.int64),
+        )
+        starts = torch.cumsum(counts, dim=0) - counts
+        padded_counts = torch.where(
+            counts > 0,
+            ((counts + block_size - 1) // block_size) * block_size,
+            torch.full_like(counts, block_size),
+        )
+        padded_starts = torch.cumsum(padded_counts, dim=0) - padded_counts
+        num_valid = torch.sum(padded_counts)
+
+        route_positions = torch.arange(route_count, device=topk_ids.device)
+        within_expert = route_positions - starts[sorted_experts]
+        destinations = padded_starts[sorted_experts] + within_expert
+        token_ids = torch.arange(m, device=topk_ids.device).repeat_interleave(topk)
+        route_ids = torch.arange(topk, device=topk_ids.device).repeat(m)
+        encoded_ids = (route_ids << 24) | token_ids
+
+        sorted_ids.fill_((topk << 24) | m)
+        sorted_weights.zero_()
+        sorted_ids.scatter_(0, destinations, encoded_ids[order].to(sorted_ids.dtype))
+        sorted_weights.scatter_(0, destinations, topk_weights_f32.reshape(-1)[order].to(sorted_weights.dtype))
+
+        # Each expert contributes at least one block.  bucketize maps each
+        # padded block to its expert without data-dependent Python control flow.
+        block_counts = padded_counts // block_size
+        block_indices = torch.arange(
+            sorted_expert_ids.numel(), device=topk_ids.device
+        )
+        block_ends = torch.cumsum(block_counts, dim=0)
+        expert_for_block = torch.bucketize(block_indices, block_ends, right=True)
+        valid_blocks = torch.sum(block_counts)
+        expert_for_block = torch.where(
+            block_indices < valid_blocks,
+            expert_for_block,
+            torch.full_like(expert_for_block, -1),
+        )
+        sorted_expert_ids.copy_(expert_for_block.to(sorted_expert_ids.dtype))
+        tokens_positions_per_expert[: int(num_experts)].copy_(
+            counts.to(tokens_positions_per_expert.dtype)
+        )
+        tokens_positions_per_expert[int(num_experts) :].copy_(
+            padded_starts.to(tokens_positions_per_expert.dtype)
+        )
+        num_valid_ids.copy_(num_valid.reshape_as(num_valid_ids).to(num_valid_ids.dtype))
+        moe_buf.zero_()
+        return
+
     from .ck_sorting_sim import simulate_ck_moe_sorting
 
     sorting = simulate_ck_moe_sorting(

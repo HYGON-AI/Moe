@@ -1106,11 +1106,13 @@ __forceinline__ __device__ void gemm_nt_w4a16_stage_lambda_scale_ldx(
         const int32_t next_stage = (it_stage + 1) % STAGE;
         const int32_t cur_stage = it_stage % STAGE;
         g2r(next_stage);
-        vmcnt_wait_w4a16(((WARP_N / MFMA_N) * (WARP_K / READ_K_B) + G2S_LDA_COUNT) + (WARP_N / MFMA_N) * (WARP_K / READ_K_B) * 2);
+        // wait cur_stage(A); count = next_stage(A + B) + cur_stage(scale + B)
+        vmcnt_wait_w4a16(((WARP_N / MFMA_N) * (WARP_K / READ_K_B) + G2S_LDA_COUNT) + (WARP_N / MFMA_N) * (WARP_K / READ_K_B) + WARP_N / MFMA_N);
         matrixA_r2s(cur_stage);
         __builtin_amdgcn_sched_barrier(0);
         __syncthreads();
         matrix_s2r(cur_stage);
+        // wait cur_stage(B + scale); count = next_stage(A + B)
         vmcnt_wait_w4a16((WARP_N / MFMA_N) * (WARP_K / READ_K_B) + G2S_LDA_COUNT);
         dequant_and_matmul(cur_stage, it_stage);
         advance_AB_offset();

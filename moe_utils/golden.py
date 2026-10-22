@@ -83,14 +83,14 @@ def compare_tensors(
 
     def get_indices_1d(mask: torch.Tensor) -> list:
         indices = torch.nonzero(mask).squeeze(dim=1)
-        return indices.tolist() if indices.numel() > 0 else []
+        return indices[:30].tolist() if indices.numel() > 0 else []
 
     match_indices_1d = get_indices_1d(match_mask_flat)
     mismatch_indices_1d = get_indices_1d(~match_mask_flat)
 
     total = tensor1_flat.numel()
-    matched = len(match_indices_1d)
-    mismatched = len(mismatch_indices_1d)
+    matched = int(match_mask_flat.sum().item())
+    mismatched = total - matched
     match_rate = matched / total if total > 0 else 0.0
     max_abs_diff = abs_diff.max().item() if total > 0 else 0.0
     avg_abs_diff = abs_diff.mean().item() if total > 0 else 0.0
@@ -1411,7 +1411,8 @@ def _fp8_channelwise_stage1_kernel(
 
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
-    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    IS_INT8: tl.constexpr = hidden_ptr.dtype.element_ty == tl.int8
+    acc = tl.zeros((BLOCK_N,), dtype=tl.int32 if IS_INT8 else tl.float32)
 
     for k0 in range(0, K, BLOCK_K):
         k_idxs = k0 + offs_k
@@ -1425,7 +1426,10 @@ def _fp8_channelwise_stage1_kernel(
             mask=(offs_n[:, None] < N1) & (k_idxs[None, :] < K),
             other=0.0,
         ).to(tl.float32)
-        acc += tl.sum(b * a[None, :], axis=1)
+        if IS_INT8:
+            acc += tl.sum(b.to(tl.int32) * a[None, :].to(tl.int32), axis=1)
+        else:
+            acc += tl.sum(b * a[None, :], axis=1)
 
     a_scale = tl.load(a_scale_ptr + token_id).to(tl.float32)
     w_scale = tl.load(
@@ -1513,7 +1517,8 @@ def _fp8_channelwise_stage2_routes_kernel(
     expert_id = tl.load(topk_ids_ptr + route_id).to(tl.int64)
     route_weight = tl.load(topk_weights_ptr + route_id).to(tl.float32)
     bridge_scale = tl.load(bridge_scale_ptr + route_id).to(tl.float32)
-    route_acc = tl.zeros((BLOCK_K,), dtype=tl.float32)
+    IS_INT8: tl.constexpr = bridge_ptr.dtype.element_ty == tl.int8
+    route_acc = tl.zeros((BLOCK_K,), dtype=tl.int32 if IS_INT8 else tl.float32)
 
     for n0 in range(0, N, BLOCK_N):
         n_idxs = n0 + offs_n
@@ -1527,7 +1532,10 @@ def _fp8_channelwise_stage2_routes_kernel(
             mask=(offs_k[:, None] < K) & (n_idxs[None, :] < N),
             other=0.0,
         ).to(tl.float32)
-        route_acc += tl.sum(b * act[None, :], axis=1)
+        if IS_INT8:
+            route_acc += tl.sum(b.to(tl.int32) * act[None, :].to(tl.int32), axis=1)
+        else:
+            route_acc += tl.sum(b * act[None, :], axis=1)
 
     w_scale = tl.load(
         w2_scale_ptr + expert_id * stride_w2se + offs_k * stride_w2sk,
@@ -1561,8 +1569,15 @@ def _run_fp8_channelwise_golden_impl(
     w2 = w2.contiguous()
     topk_weights = topk_weights.contiguous()
     topk_ids = topk_ids.contiguous()
+    int8_quant = None
+    if w1.dtype == torch.int8:
+        from .fused_moe_c import per_token_quant_int8
+        int8_quant = per_token_quant_int8
     if a1_scale is None:
-        hidden_states, a1_scale = pertoken_quant(hidden_states, quant_dtype=w1.dtype)
+        if int8_quant is not None:
+            hidden_states, a1_scale = int8_quant(hidden_states)
+        else:
+            hidden_states, a1_scale = pertoken_quant(hidden_states, quant_dtype=w1.dtype)
     else:
         hidden_states = hidden_states.to(w1.dtype)
     hidden_states = hidden_states.contiguous()
@@ -1613,7 +1628,10 @@ def _run_fp8_channelwise_golden_impl(
         gemm1_alpha=None,
         gemm1_limit=None,
     )
-    bridge, bridge_scale = per_token_quant_hip(activated, quant_dtype=torch.float8_e4m3fn)
+    if int8_quant is not None:
+        bridge, bridge_scale = int8_quant(activated)
+    else:
+        bridge, bridge_scale = per_token_quant_hip(activated, quant_dtype=torch.float8_e4m3fn)
 
     route_out = torch.empty((m, topk, k), device=hidden_states.device, dtype=out_dtype)
     _fp8_channelwise_stage2_routes_kernel[(m * topk, triton.cdiv(k, block_k))](
@@ -1643,6 +1661,21 @@ def _run_fp8_channelwise_golden_impl(
 
     triton_moe_sum(route_out, out, routed_scaling_factor=1.0)
     return out
+
+
+
+
+def run_int8_channelwise_golden(
+    hidden_states, w1, w2, topk_weights, topk_ids, out_dtype,
+    w1_scale, w2_scale, a1_scale=None, global_num_experts=-1,
+):
+    """Reference INT8 channelwise MoE using integer GEMM accumulation."""
+    if w1.dtype != torch.int8 or w2.dtype != torch.int8:
+        raise ValueError("INT8 channelwise golden requires INT8 weights")
+    return _run_fp8_channelwise_golden_impl(
+        hidden_states, w1, w2, topk_weights, topk_ids, out_dtype,
+        w1_scale, w2_scale, a1_scale, global_num_experts,
+    )
 
 
 def run_fp8_channelwise_golden(
