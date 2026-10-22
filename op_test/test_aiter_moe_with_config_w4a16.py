@@ -23,7 +23,6 @@ from moe_utils.moe import (
     MoeQuantType,
     AiterMoeConfig,
 )
-from moe_utils.moe import w4a16_marlin_weight_1, w4a16_marlin_weight_2
 
 torch.set_default_device("cuda")
 
@@ -56,6 +55,8 @@ def _quantize_w4a16_weights(w_fp, group_size, has_zp, pack_for_backend):
 
     qweight = qweight[:, 1::2] * 16 + qweight[:, ::2]
     if has_zp:
+        if pack_for_backend != MoeSolutionType.MOE_C:
+            raise ValueError(f"unsupported W4A16 backend: {pack_for_backend}")
         qzeros = qzeros[1::2, :] * 16 + qzeros[::2, :]
 
     return weight, qweight, scales, qzeros if has_zp else None
@@ -93,14 +94,16 @@ def prepare_w4a16_inputs(m, k, n, e, topk, group_size, has_zp, dtype,
             (e, k // pack_factor, n // group_size), device="cuda",
             dtype=torch.uint8)
     else:
-        # w1_qzeros = None
-        # w2_qzeros = None
+        # The native MOE_C entry point requires a qzero tensor even for
+        # symmetric W4A16.  Encode the midpoint (8) in both nibbles.
         w1_qzeros = torch.empty(
-                (e, 2 * n // pack_factor, k // group_size), device="cuda",
-                dtype=torch.uint8)
+            (e, 2 * n // pack_factor, k // group_size), device="cuda",
+            dtype=torch.uint8)
         w2_qzeros = torch.empty(
             (e, k // pack_factor, n // group_size), device="cuda",
             dtype=torch.uint8)
+        w1_qzeros.fill_(0x88)
+        w2_qzeros.fill_(0x88)
 
     w1_ref = w1_fp.clone()
     w2_ref = w2_fp.clone()
@@ -121,27 +124,10 @@ def prepare_w4a16_inputs(m, k, n, e, topk, group_size, has_zp, dtype,
         if has_zp and w_zp is not None:
             w_zp[expert_id] = qzeros
 
-    # For moe_c backend, apply marlin weight shuffle
-    if backend == "moe_c":
-        # w1_qweight_final = w4a16_marlin_weight_1(w1_qweight)
-        # w2_qweight_final = w4a16_marlin_weight_2(w2_qweight)
-        # w1_qweight_final = w1_qweight_final.view(-1).view(
-        #     torch.uint8).view(*w1_qweight.shape)
-        # w2_qweight_final = w2_qweight_final.view(-1).view(
-        #     torch.uint8).view(*w2_qweight.shape)
-        if config.need_shuffle_scale:
-            w1_scales, w2_scales = aiter_moe_shfl_scale(w1_scales,w2_scales,config)
-        # pmt_factor = 4
-        # pmt_factor2 = 4
-        # w1_scales_tm = w1_scales.reshape(e,2*n,(k // group_size // pmt_factor),pmt_factor).transpose(2,3).contiguous()
-        # w1_scales = w1_scales_tm.reshape(e,2*n,k // group_size)
-        # w2_scales_tm = w2_scales.reshape(e,k,(n // group_size // pmt_factor2),pmt_factor2).transpose(2,3).contiguous()
-        # w2_scales = w2_scales_tm.reshape(e,k,n // group_size)
-        w1_qweight_final = w1_qweight
-        w2_qweight_final = w2_qweight
-    else:
-        w1_qweight_final = w1_qweight
-        w2_qweight_final = w2_qweight
+    # Both the BW reference test and the active MOE_C MODE=4/2 kernel use
+    # canonical packed qweights.  Only the scale layout is backend-configured.
+    w1_qweight_final = w1_qweight
+    w2_qweight_final = w2_qweight
 
     topk_weights, topk_ids = fused_topk(input_tensor, score, topk, True)
 
@@ -166,8 +152,7 @@ def prepare_w4a16_inputs(m, k, n, e, topk, group_size, has_zp, dtype,
 # ---------------------------------------------------------------------------
 
 def test_get_config(m, k, n, e, topk, group_size, dtype):
-    """Test that get_aiter_moe_config returns a valid w4a16 config or
-    gracefully reports no-solution."""
+    """Test that the explicit MOE_C W4A16 config is available."""
     N1 = 2 * n  # gate + up
     N2 = k      # down / hidden_size
     K = k       # model dimension (uncompressed)
@@ -176,14 +161,16 @@ def test_get_config(m, k, n, e, topk, group_size, dtype):
         M=m, E=e, N1=N1, N2=N2, K=K,
         top_k=topk, block_size=group_size, dtype=dtype,
         quant_type=MoeQuantType.W4A16,
+        spec_sol_type=MoeSolutionType.MOE_C,
     )
 
     if status:
-        assert moe_cfg.solution_type is not None, \
-            "status=True but solution_type is None"
+        assert moe_cfg.solution_type == MoeSolutionType.MOE_C, (
+            f"requested backend {MoeSolutionType.MOE_C}, "
+            f"got {moe_cfg.solution_type}"
+        )
         assert moe_cfg.config is not None, \
             "status=True but config is None"
-        assert moe_cfg.solution_type == MoeSolutionType.MOE_C, f"Unexpected solution_type: {moe_cfg.solution_type}"
         assert moe_cfg.quant_type == MoeQuantType.W4A16
         logger.info(
             f"[get_config_w4a16] {m=}, {N1=}, {N2=}, {K=}, {e=}, {topk=}, "
@@ -252,6 +239,7 @@ def test_aiter_moe_w4a16(m, k, n, e, topk, group_size, has_zp, dtype, inplace, r
         M=m, E=e, N1=N1, N2=N2, K=K,
         top_k=topk, block_size=group_size, dtype=dtype,
         quant_type=MoeQuantType.W4A16,
+        spec_sol_type=MoeSolutionType.MOE_C,
     )
 
     if not status:
@@ -262,13 +250,25 @@ def test_aiter_moe_w4a16(m, k, n, e, topk, group_size, has_zp, dtype, inplace, r
         return None
 
     backend = moe_cfg.solution_type
-    logger.info(
-        f"[aiter_moe_w4a16] {m=}, {N1=}, {N2=}, {K=}, {e=}, {topk=}, "
-        f"backend={backend}"
+    assert backend == MoeSolutionType.MOE_C, (
+        f"requested backend {MoeSolutionType.MOE_C}, got {backend}"
     )
 
     data = prepare_w4a16_inputs(
         m, k, n, e, topk, group_size, has_zp, dtype, backend, moe_cfg)
+
+    logger.info(
+        f"[aiter_moe_w4a16] {m=}, {N1=}, {N2=}, {K=}, {e=}, {topk=}, "
+        f"backend={backend}, config={moe_cfg.config}, "
+        f"need_shuffle={moe_cfg.need_shuffle}, "
+        f"need_shuffle_scale={moe_cfg.need_shuffle_scale}, "
+        f"block_shape={[0, group_size]}"
+    )
+
+    if moe_cfg.need_shuffle_scale:
+        data["w1_scales"], data["w2_scales"] = aiter_moe_shfl_scale(
+            data["w1_scales"], data["w2_scales"], moe_cfg
+        )
 
     # Torch reference
     ref_out, _ = _run_torch_ref(

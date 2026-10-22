@@ -7,13 +7,16 @@ from __future__ import annotations
 import logging
 import os
 import time
+import copy
 from dataclasses import dataclass
 from enum import Enum
 from types import SimpleNamespace
 from typing import Any, Callable, Optional, Tuple, Union
 
 import torch
+import torch.profiler as tpf
 import torch.nn.functional as F
+import pandas as pd
 
 
 logger = logging.getLogger("moe")
@@ -29,11 +32,17 @@ dtypes = SimpleNamespace(
     bf16=torch.bfloat16,
     fp32=torch.float32,
     i32=torch.int32,
+    i64=torch.int64,
+    i16=torch.int16,
     i8=torch.int8,
+    u64=torch.uint64,
+    u32=torch.uint32,
     u8=torch.uint8,
 )
 if hasattr(torch, "float8_e4m3fn"):
     dtypes.fp8 = torch.float8_e4m3fn
+if hasattr(torch, "float8_e8m0fnu"):
+    dtypes.fp8_e8m0 = torch.float8_e8m0fnu
 
 
 def get_gfx() -> str:
@@ -47,6 +56,12 @@ def get_gfx() -> str:
 
 class ActivationType:
     Silu = "silu"
+    Gelu = "gelu"
+    GeluTanh = "gelu_tanh"
+    Relu2 = "relu2"
+    Situ = "situ"
+    SwiGluOai = "swigluoai"
+    SwiGluStep = "swiglustep"
 
 
 _SCALAR_TYPES_ID_MAP = {}
@@ -220,34 +235,338 @@ def torch_compile_guard(
     return decorator
 
 
-def perftest(num_iters=101, num_warmup=2, testGraph=False, num_rotate_args=0, needTrace=False):
+def perftest(
+    num_iters=101, num_warmup=2, testGraph=False, num_rotate_args=0, needTrace=False
+):
+    """Benchmark a callable using AITER-compatible device-time semantics.
+
+    The standalone package deliberately keeps its own helper implementation, but
+    the CUDA path mirrors ``aiter.test_common.perftest`` so measurements from
+    the two channelwise tests describe the same work.  In particular, profiler
+    device time excludes host-side dispatch gaps, and ``testGraph`` measures a
+    CUDA Graph replay rather than silently falling back to an event loop.
+    """
+
     def decorator(func):
         def wrapper(*args, **kwargs):
-            for _ in range(num_warmup):
-                func(*args, **kwargs)
-
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-                start = torch.cuda.Event(enable_timing=True)
-                end = torch.cuda.Event(enable_timing=True)
-                start.record()
-                data = None
-                for _ in range(num_iters):
-                    data = func(*args, **kwargs)
-                end.record()
-                end.synchronize()
-                avg_us = start.elapsed_time(end) * 1000.0 / max(num_iters, 1)
-            else:
+            if not torch.cuda.is_available():
+                rotate_args = [
+                    (copy.deepcopy(args), copy.deepcopy(kwargs))
+                    for _ in range(max(num_rotate_args - 1, 0))
+                ] + [(args, kwargs)]
+                run_iters(num_warmup, func, *args, **kwargs)
                 start = time.perf_counter()
-                data = None
+                data = run_iters_rotate(num_iters, func, rotate_args)
+                avg_us = (time.perf_counter() - start) * 1_000_000.0 / max(
+                    num_iters, 1
+                )
+                return data, avg_us
+
+            num = num_rotate_args
+            if num < 1:
+                gpu_id = torch.cuda.current_device()
+                iter_used_memory, input_size, _, _ = device_memory_profiling(
+                    func, *args, **kwargs
+                )
+                try:
+                    properties = torch.cuda.get_device_properties(gpu_id)
+                    free_memory = torch.cuda.mem_get_info(gpu_id)[0]
+                except (AssertionError, RuntimeError):
+                    properties = None
+                    free_memory = 0
+                cache_size = min(
+                    getattr(properties, "L2_cache_size", 4096 * 1024) * 64 * 128,
+                    (free_memory - iter_used_memory + input_size) * 0.9,
+                )
+                cache_size = max(cache_size, 0)
+                num = int((cache_size + input_size - 1) // input_size)
+            num = max(1, min(num, num_iters))
+
+            rotate_args = [
+                (copy.deepcopy(args), copy.deepcopy(kwargs)) for _ in range(num - 1)
+            ] + [(args, kwargs)]
+            run_iters(num_warmup, func, *args, **kwargs)
+            torch.cuda.synchronize()
+
+            if int(os.environ.get("AITER_LOG_MORE", 0)):
+                latencies = []
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
                 for _ in range(num_iters):
+                    start_event.record()
                     data = func(*args, **kwargs)
-                avg_us = (time.perf_counter() - start) * 1_000_000.0 / max(num_iters, 1)
-            return data, avg_us
+                    end_event.record()
+                    end_event.synchronize()
+                    latencies.append(start_event.elapsed_time(end_event))
+                avg = sum(latencies) * 1000.0 / max(len(latencies), 1)
+                logger.info(f"avg: {avg} us/iter from cuda.Event")
+
+            if testGraph:
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    data = run_iters_rotate(num_iters, func, rotate_args)
+                with tpf.profile(
+                    activities=[tpf.ProfilerActivity.CPU, tpf.ProfilerActivity.CUDA],
+                    profile_memory=True,
+                    with_stack=True,
+                    with_modules=True,
+                ) as prof:
+                    run_iters(1, graph.replay)
+                graph_events = [
+                    event
+                    for event in prof.events()
+                    if str(getattr(event, "device_type", "")).split(".")[-1]
+                    == "CUDA"
+                    and not str(getattr(event, "name", "")).startswith("Memcpy")
+                ]
+                if len(graph_events) >= 2:
+                    avg = get_trace_perf(prof, num_iters)
+                    logger.info(f"avg: {avg} us/iter with hipgraph (profiler)")
+                else:
+                    logger.warning(
+                        "CUDA Graph replay exposed no captured compute kernels; "
+                        "skipping the standalone graph metric and using the regular "
+                        "profiler measurement below"
+                    )
+
+            with tpf.profile(
+                activities=[tpf.ProfilerActivity.CPU, tpf.ProfilerActivity.CUDA],
+                profile_memory=False,
+                with_stack=False,
+                with_modules=True,
+                on_trace_ready=(
+                    tpf.tensorboard_trace_handler(
+                        f"./moe_c_logs/gpu_id_{torch.cuda.current_device()}"
+                    )
+                    if needTrace
+                    else None
+                ),
+            ) as prof:
+                data = run_iters_rotate(num_iters, func, rotate_args)
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+
+            avg = get_trace_perf(prof, num_iters)
+            return data, avg
 
         return wrapper
 
     return decorator
+
+
+def device_memory_profiling(func, *args, **kwargs):
+    gpu_id = torch.cuda.current_device()
+    input_size = (
+        sum(
+            el.nbytes
+            for el in args
+            if isinstance(el, torch.Tensor) and el.device.index == gpu_id
+        )
+        + 1
+    )
+    torch.cuda.reset_peak_memory_stats(gpu_id)
+    cuda_memory_before = (
+        torch.cuda.mem_get_info(gpu_id)[1] - torch.cuda.mem_get_info(gpu_id)[0]
+    )
+    torch_memory_before = torch.cuda.memory_reserved(gpu_id)
+    torch_peak_before = torch.cuda.memory_stats(gpu_id).get(
+        "allocated_bytes.all.peak", 0
+    )
+    non_torch_memory_before = cuda_memory_before - torch_memory_before
+
+    func(*args, **kwargs)
+
+    torch.cuda.reset_peak_memory_stats(gpu_id)
+    cuda_memory_after = (
+        torch.cuda.mem_get_info(gpu_id)[1] - torch.cuda.mem_get_info(gpu_id)[0]
+    )
+    torch_memory_after = torch.cuda.memory_reserved(gpu_id)
+    torch_peak_after = torch.cuda.memory_stats(gpu_id).get(
+        "allocated_bytes.all.peak", 0
+    )
+    non_torch_memory_after = cuda_memory_after - torch_memory_after
+
+    torch_peak_increase = torch_peak_after - torch_peak_before
+    non_torch_increase = non_torch_memory_after - non_torch_memory_before
+    iter_used_memory = torch_peak_increase + non_torch_increase + input_size
+    return iter_used_memory, input_size, torch_peak_increase, non_torch_increase
+
+
+def run_iters(num_iters, func, *args, **kwargs):
+    data = None
+    for _ in range(num_iters):
+        data = func(*args, **kwargs)
+    return data
+
+
+def run_iters_rotate(num_iters, func, rotate_args):
+    data = None
+    num_rotate_args = len(rotate_args)
+    for _ in range(num_iters):
+        args, kwargs = rotate_args[_ % num_rotate_args]
+        data = func(*args, **kwargs)
+    return data
+
+
+def run_perftest(
+    func,
+    *args,
+    num_iters=101,
+    num_warmup=2,
+    testGraph=False,
+    num_rotate_args=0,
+    needTrace=False,
+    **kwargs,
+):
+    @perftest(
+        num_iters=num_iters,
+        num_warmup=num_warmup,
+        testGraph=testGraph,
+        num_rotate_args=num_rotate_args,
+        needTrace=needTrace,
+    )
+    def worker(*worker_args, **worker_kwargs):
+        return func(*worker_args, **worker_kwargs)
+
+    return worker(*args, **kwargs)
+
+
+def post_process_data(df, num_iters, warm_iter=1):
+    """remove abnormal data"""
+
+    device_df = df[df["device_type"].astype(str).str.contains("DeviceType.CUDA")]
+    if device_df.empty:
+        return [], 0
+    kernels_num = int(len(device_df) / num_iters)
+
+    act_iters = num_iters
+    valid_n = len(device_df)
+    dropped_indices = []
+    if len(device_df) % num_iters == 0:
+        kernels_num = int(len(device_df) / num_iters)
+    else:
+        name_list = device_df["name"].tolist()
+        max_kernel_num = 20
+        n = len(name_list)
+        for step in range(1, min(max_kernel_num, n // 2 + 1)):
+            sub_list = [name_list[i] for i in range(step)]
+            m = len(sub_list)
+            valid_n = int(n / m) * m
+            pattern_match = all(
+                name_list[i] == sub_list[i % m]
+                for i in range(int(n / m) * m)
+            )
+            if pattern_match:
+                kernels_num = m
+                act_iters = valid_n / m
+                break
+        dropped_indices = device_df.iloc[valid_n:].index.tolist()
+        if kernels_num == 0:
+            print("data missed, the time may be inaccurate!")
+
+    test_df = device_df.iloc[:valid_n].reset_index()
+    grouped_kernel_df = test_df.groupby(test_df.index // kernels_num, sort=False).agg(
+        {"self_device_time_total": "sum", "index": list}
+    )
+    sum_df = grouped_kernel_df.iloc[warm_iter:].reset_index(drop=True)
+    out_range_indices = []
+    if num_iters > 30:
+        k = 1.5
+        q1 = sum_df["self_device_time_total"].quantile(0.25)
+        q3 = sum_df["self_device_time_total"].quantile(0.75)
+        iqr = q3 - q1
+        lower = q1 - k * iqr
+        upper = q3 + k * iqr
+        out_range_indices = sum_df.index[
+            (sum_df["self_device_time_total"] < lower)
+            | (sum_df["self_device_time_total"] > upper)
+        ].tolist()
+
+    indices = {
+        idx
+        for iteration in out_range_indices
+        for idx in sum_df.iloc[iteration]["index"]
+    }
+    indices.update(
+        idx for sublist in grouped_kernel_df["index"].head(warm_iter) for idx in sublist
+    )
+    indices.update(dropped_indices)
+    return list(indices), len(out_range_indices) + warm_iter + num_iters - act_iters
+
+
+def get_trace_perf(prof, num_iters):
+    assert num_iters > 1
+    warm_iter = 1
+    num_iters -= warm_iter
+    rows = []
+    cols = [
+        "name",
+        "self_cpu_time_total",
+        "self_device_time_total",
+        "device_type",
+        "device_index",
+    ]
+    for event in prof.events():
+        rows.append([getattr(event, column, None) for column in cols])
+    frame = pd.DataFrame(rows, columns=cols)
+    dropped_indices, dropped_num = post_process_data(
+        frame, num_iters + warm_iter, warm_iter
+    )
+    frame = frame.drop(dropped_indices)
+    frame["cnt"] = 1
+    results = []
+
+    for name, group in frame.groupby("name", sort=False):
+        kernel_num_per_iter = 0
+        if str(group["device_type"].iat[0]).split(".")[-1] != "CUDA":
+            kernel_num_per_iter = 1
+        result = group.iloc[kernel_num_per_iter:][
+            ["cnt", "self_cpu_time_total", "self_device_time_total"]
+        ].sum()
+        if not result.empty:
+            device_type = str(group["device_type"].iat[0]).split(".")[-1]
+            result["name"] = name
+            result["device_type"] = device_type
+            result["device_index"] = str(group["device_index"].iat[0])
+            if device_type == "CUDA":
+                result["device_time_sum"] = result["self_device_time_total"]
+                result["host_time_sum"] = 0
+            else:
+                result["host_time_sum"] = result["self_device_time_total"]
+                result["device_time_sum"] = 0
+        results.append(result)
+
+    frame = pd.DataFrame(results)
+    cols = [
+        "name",
+        "cnt",
+        "host_time_sum",
+        "device_time_sum",
+        "device_type",
+        "device_index",
+    ]
+    cols = [column for column in cols if column in frame.columns]
+    if frame.empty:
+        logger.info("no valid data after post process!")
+        return 0.0
+    frame = frame[(frame.host_time_sum > 0) | (frame.device_time_sum > 0)]
+    if frame.empty:
+        return 0.0
+    timer_list = ["host_time_sum", "device_time_sum"]
+    frame = frame[cols].sort_values(timer_list, ignore_index=True)
+    actual_iters = num_iters + warm_iter - dropped_num
+    avg_name = "[avg us/iter]"
+    for column in timer_list:
+        if column == "host_time_sum":
+            frame.at[avg_name, column] = frame[column].sum() / num_iters
+        else:
+            frame.at[avg_name, column] = frame[column].sum() / actual_iters
+    if int(os.environ.get("AITER_LOG_MORE", 0)):
+        pd.set_option("display.expand_frame_repr", False)
+        pd.set_option("display.max_colwidth", 90)
+        pd.set_option("display.float_format", "{:,.1f}".format)
+        logger.info(f"{frame}")
+    return frame.at[avg_name, "device_time_sum"]
 
 
 def checkAllclose(a, b, rtol=1e-2, atol=1e-2, tol_err_ratio=0.05, msg="", printNum=8, printLog=True, perfModel=False):
@@ -358,7 +677,43 @@ def compare_tensors(
     print("\n" + "=" * 60)
 
 
-def per_token_quant_int8(x: torch.Tensor, eps: float = 1e-10) -> Tuple[torch.Tensor, torch.Tensor]:
+def _native_per_token_quant_int8(
+    x: torch.Tensor,
+    num_rows: Optional[torch.Tensor] = None,
+    num_rows_factor: int = 1,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    if not x.is_cuda:
+        return None
+    if not x.is_contiguous():
+        return None
+    if os.environ.get("MOE_C_DISABLE_NATIVE_QUANT", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return None
+    try:
+        from .moe_ops import load_moe_c_library
+
+        load_moe_c_library()
+        op = getattr(torch.ops.moe_wna16, "dynamic_per_token_scaled_quant", None)
+    except (AttributeError, OSError, RuntimeError):
+        return None
+    if op is None:
+        return None
+    output = torch.empty_like(x, dtype=torch.int8)
+    scales = torch.empty((*x.shape[:-1], 1), dtype=torch.float32, device=x.device)
+    op(output, x, scales, num_rows, int(num_rows_factor))
+    return output.contiguous(), scales.contiguous()
+
+
+def per_token_quant_int8(
+    x: torch.Tensor, eps: float = 1e-10
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    native = _native_per_token_quant_int8(x) if eps == 1e-10 else None
+    if native is not None:
+        return native
     x_f = x.to(torch.float32)
     scale = x_f.abs().amax(dim=-1, keepdim=True).clamp_min(eps) / 127.0
     q = torch.round(x_f / scale).clamp(-127, 127).to(torch.int8)
@@ -418,10 +773,14 @@ def per_token_quant_hip(
     num_rows: Optional[torch.Tensor] = None,
     num_rows_factor: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    del num_rows, num_rows_factor
     if scale is not None:
         raise ValueError("static per-token quantization scale is not supported")
     if quant_dtype is torch.int8:
+        native = _native_per_token_quant_int8(
+            x, num_rows=num_rows, num_rows_factor=num_rows_factor
+        )
+        if native is not None:
+            return native
         return per_token_quant_int8(x)
 
     x_f = x.to(torch.float32)

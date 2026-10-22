@@ -157,7 +157,7 @@ def prepare_w8a8_channelwise_inputs(m, k, n, e, topk, dtype, quant_type=MoeQuant
     }
 
 
-def test_get_config(m, k, n, e, topk, dtype, quant_type=MoeQuantType.W8A8, use_shuffle=0):
+def test_get_config(m, k, n, e, topk, dtype, quant_type=MoeQuantType.W8A8, use_shuffle=0, backend=None):
     """Test get_moe_config for channel-wise w8a8 (block_size=0)."""
     status, moe_cfg = get_moe_config(
         M=m,
@@ -170,16 +170,26 @@ def test_get_config(m, k, n, e, topk, dtype, quant_type=MoeQuantType.W8A8, use_s
         dtype=dtype,
         quant_type=quant_type,
         use_shuffle=use_shuffle,
+        spec_sol_type=backend,
     )
 
     tag = f"get_config_{quant_type}_cw"
+    if backend is not None:
+        assert status and moe_cfg.solution_type == backend, (
+            f"Requested backend unavailable: {backend}, M={m}"
+        )
     if status:
         assert moe_cfg.quant_type == quant_type
-        assert moe_cfg.solution_type == MoeSolutionType.MOE_C
+        assert moe_cfg.solution_type in (
+            MoeSolutionType.ASM,
+            MoeSolutionType.MOE_C,
+            MoeSolutionType.TRITON,
+            MoeSolutionType.CK,
+        )
         assert moe_cfg.config is not None
         logger.info(
             f"[{tag}] {m=}, solution={moe_cfg.solution_type}, "
-            f"config keys={list(moe_cfg.config.keys())}"
+            f"config={moe_cfg.config}"
         )
     else:
         assert moe_cfg.solution_type is None
@@ -201,6 +211,7 @@ def test_aiter_moe_w8a8_channelwise(
     inplace=False,
     use_shuffle=0,
     show_compare=False,
+    backend=None,
 ):
     """End-to-end test of aiter_moe with channel-wise w8a8 (int8 or fp8)."""
     status, moe_cfg = get_moe_config(
@@ -214,9 +225,14 @@ def test_aiter_moe_w8a8_channelwise(
         dtype=in_dtype,
         quant_type=quant_type,
         use_shuffle=use_shuffle,
+        spec_sol_type=backend,
     )
 
     tag = f"aiter_moe_{quant_type}_cw"
+    if backend is not None:
+        assert status and moe_cfg.solution_type == backend, (
+            f"Requested backend unavailable: {backend}, M={m}"
+        )
     if not status:
         logger.info(f"[{tag}] SKIP {m=}: no backend available")
         return None
@@ -312,6 +328,7 @@ if __name__ == "__main__":
             failed_cases.append(str(exc))
             print(f"[ACCURACY FAILED] {exc}", flush=True)
             return None
+
     parser = argparse.ArgumentParser(
         description="Test aiter_moe with channel-wise w8a8 quantization",
     )
@@ -321,43 +338,39 @@ if __name__ == "__main__":
         default="fp8",
         help="Quantization type: int8 (MoeQuantType.W8A8) or fp8 (MoeQuantType.FP8_W8A8)",
     )
+    parser.add_argument("--backend", choices=("auto", "moe-c"), default="auto")
+    parser.add_argument("--e", type=int, default=192)
+    parser.add_argument("--n", type=int, default=384)
+    parser.add_argument("--k", type=int, default=4096)
+    parser.add_argument("--topk", type=int, default=8)
     parser.add_argument(
-        "--tokens",
-        type=int,
-        nargs="+",
-        default=None,
-        help="Token sizes to run. Default runs the full CI sweep.",
+        "--tokens", "--m", nargs="+", type=int,
+        default=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 6144, 8192, 16384],
     )
+    parser.add_argument("--dtype", choices=("fp8", "bf16", "fp16"), default="fp8")
+    parser.add_argument("--output", default="w8a8_channelwise.csv")
     parser.add_argument(
         "--compare",
         action="store_true",
         help="Print detailed compare_tensors output for each executed case.",
     )
-    parser.add_argument("--e", type=int, default=None, help="Number of experts.")
-    parser.add_argument("--n", type=int, default=None, help="Expert hidden/output dimension.")
-    parser.add_argument("--k", type=int, default=None, help="Model/input dimension.")
-    parser.add_argument("--topk", type=int, default=8, help="Top-k experts.")
     args = parser.parse_args()
 
+    backend = MoeSolutionType.MOE_C if args.backend == "moe-c" else None
     quant_type = MoeQuantType.FP8_W8A8 if args.quant == "fp8" else MoeQuantType.W8A8
     inplace = False     # in_dtype != out_dtype时，不能为True
 
-    # for moe_c backend, it does not support n=320 for now;
-    # for triton backend, it can run with n=320 in NMZ;
-    in_dtype = dtypes.fp8 if quant_type == MoeQuantType.FP8_W8A8 else dtypes.bf16
+    in_dtype = getattr(dtypes, args.dtype)
     out_dtype = dtypes.bf16
-    e = args.e if args.e is not None else (384 if quant_type == MoeQuantType.FP8_W8A8 else 256)
-    topk = args.topk
-    k = args.k if args.k is not None else 4096
-    n = args.n if args.n is not None else (512 if quant_type == MoeQuantType.FP8_W8A8 else 384)
+    e, n, k, topk = args.e, args.n, args.k, args.topk
     use_shuffle = 0
+    test_tokens = args.tokens
 
     logger.info("=" * 60)
     logger.info(f"Part 1: Testing get_moe_config for {quant_type} channel-wise")
     logger.info("=" * 60)
-    test_tokens = args.tokens or [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048 , 4096, 6144 , 8192 , 16384]
     for m in test_tokens:
-        test_get_config(m, k, n, e, topk, in_dtype, quant_type, use_shuffle)
+        test_get_config(m, k, n, e, topk, in_dtype, quant_type, use_shuffle, backend)
 
     logger.info("=" * 60)
     logger.info(f"Part 2: Testing moe end-to-end for {quant_type} channel-wise")
@@ -367,13 +380,13 @@ if __name__ == "__main__":
         ret = run_accuracy_case(
             test_aiter_moe_w8a8_channelwise,
             m, k, n, e, topk, in_dtype, out_dtype, quant_type, inplace,
-            use_shuffle, args.compare,
+            use_shuffle, args.compare, backend,
         )
         if ret is not None:
             df.append(ret)
     if df:
         df = pd.DataFrame(df)
-        df.to_csv("w8a8_channelwise.csv", index=False)
+        df.to_csv(args.output, index=False)
         logger.info(f"summary:\n{df}")
 
     if failed_cases:
