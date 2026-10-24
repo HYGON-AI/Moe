@@ -93,6 +93,22 @@ __forceinline__ __device__ void inline_buffer_load_dword(DataType &v_data, int v
     __builtin_amdgcn_sched_barrier(0);
 }
 
+// Complete index loads before exposing their outputs to compiler-generated copies.
+template <class DataType, const int shfl_count = 2>
+__forceinline__ __device__ void inline_buffer_load_dword_wait(DataType &v_data, int v_offset, vec<uint, 4> global_addr, int s_offset)
+{
+    int v_offset_bytes = v_offset << shfl_count;
+    int s_offset_bytes = s_offset << shfl_count;
+    __builtin_amdgcn_sched_barrier(0);
+    asm volatile(
+        "buffer_load_dword %0, %1, %2, %3 offen\n\t"
+        "s_waitcnt vmcnt(0)\n\t"
+        : "=v"(v_data)
+        : "v"(v_offset_bytes), "s"(global_addr), "s"(s_offset_bytes)
+        : "memory");
+    __builtin_amdgcn_sched_barrier(0);
+}
+
 template <class DataType, const int shfl_count = 2>
 __forceinline__ __device__ void inline_buffer_load_dwordx2_lds(DataType *const shared_addr, const vec4_uint global_addr, const int &lds_offset, const int &gvOffset_s, const int &gvOffset_v)
 {

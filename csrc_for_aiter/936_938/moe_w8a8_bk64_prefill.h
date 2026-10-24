@@ -115,7 +115,7 @@ __forceinline__ __device__ void gemm_nt_marlin_prefill_flat_route_fp8_bk64(
 #pragma unroll
             for (int m_tile = 0; m_tile < WARP_M / MFMA_M; m_tile++)
             {
-                inline_buffer_load_dword(
+                inline_buffer_load_dword_wait(
                     sorted_token_ids_element[m_tile],
                     std::min(bidx * BLOCK_M + m_tile * MFMA_M + col_id + A_index * 4,
                              int(sorted_token_lens - 1)),
@@ -129,7 +129,7 @@ __forceinline__ __device__ void gemm_nt_marlin_prefill_flat_route_fp8_bk64(
 #pragma unroll
             for (int m_tile = 0; m_tile < WARP_M / MFMA_M; m_tile++)
             {
-                inline_buffer_load_dword(
+                inline_buffer_load_dword_wait(
                     sorted_token_ids_element[m_tile],
                     std::min(bidx * BLOCK_M + m_tile * MFMA_M + col_id + A_index * 4,
                              int(sorted_token_lens - 1)),
@@ -145,7 +145,7 @@ __forceinline__ __device__ void gemm_nt_marlin_prefill_flat_route_fp8_bk64(
         {
             for (int index = warp_id; index < MFMA_M / 4; index += WARP_NUM)
             {
-                inline_buffer_load_dword(
+                inline_buffer_load_dword_wait(
                     sorted_token_ids_element[m_tile],
                     std::min(bidx * BLOCK_M + m_tile * MFMA_M + col_id + index * 4,
                              int(sorted_token_lens - 1)),
@@ -166,8 +166,6 @@ __forceinline__ __device__ void gemm_nt_marlin_prefill_flat_route_fp8_bk64(
             g_row_B[n_tile * 2 + i] = index + i * 16 * 64;
         }
     }
-
-    vmcnt_only_wait(0);
 
     if constexpr (WARP_NUM >= MFMA_M / 4)
     {
@@ -542,7 +540,7 @@ __forceinline__ __device__ void gemm_nt_marlin_prefill_2_flat_route_fp8_bk64(
 #pragma unroll
     for (int m_tile = 0; m_tile < WARP_M / MFMA_M; m_tile++)
     {
-        inline_buffer_load_dword(
+        inline_buffer_load_dword_wait(
             sorted_token_ids_element[m_tile],
             std::min(bidx * BLOCK_M + m_tile * MFMA_M + col_id + A_index * 4,
                      int(sorted_token_lens - 1)),
@@ -561,8 +559,6 @@ __forceinline__ __device__ void gemm_nt_marlin_prefill_2_flat_route_fp8_bk64(
             g_row_B[n_tile * 2 + i] = index + i * 16;
         }
     }
-
-    vmcnt_only_wait(0);
 
 #pragma unroll
     for (int m_tile = 0; m_tile < WARP_M / MFMA_M; m_tile++)
