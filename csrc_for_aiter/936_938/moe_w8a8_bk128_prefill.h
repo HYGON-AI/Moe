@@ -89,7 +89,7 @@ __forceinline__ __device__ void gemm_nt_marlin_prefill_up_fp8_bk64(
     {
         for (int index = warp_id; index < MFMA_M / 4; index += WARP_NUM)
         {
-            inline_buffer_load_dword(sorted_token_ids_element[m_tile], std::min(bidx * BLOCK_M + m_tile * MFMA_M + col_id + index * 4, int(sorted_token_lens - 1)), g_sorted_token_ids_offset, 0);
+            inline_buffer_load_dword_wait(sorted_token_ids_element[m_tile], std::min(bidx * BLOCK_M + m_tile * MFMA_M + col_id + index * 4, int(sorted_token_lens - 1)), g_sorted_token_ids_offset, 0);
         }
     }
 
@@ -102,8 +102,6 @@ __forceinline__ __device__ void gemm_nt_marlin_prefill_up_fp8_bk64(
             g_row_B[n_tile * 2 + i] = index + i * 16;
         }
     }
-
-    vmcnt_only_wait(0);
 
 #pragma unroll
     for (int m_tile = 0; m_tile < WARP_M / MFMA_M; m_tile++)
@@ -786,7 +784,7 @@ __forceinline__ __device__ void gemm_nt_marlin_prefill_down_fp8_bk64(
 #pragma unroll
     for (int m_tile = 0; m_tile < WARP_M / MFMA_M; m_tile++)
     {
-        inline_buffer_load_dword(sorted_token_ids_element[m_tile], std::min(bidx * BLOCK_M + m_tile * MFMA_M + col_id + A_index * 4, int(sorted_token_lens - 1)), g_sorted_token_ids_offset, 0);
+        inline_buffer_load_dword_wait(sorted_token_ids_element[m_tile], std::min(bidx * BLOCK_M + m_tile * MFMA_M + col_id + A_index * 4, int(sorted_token_lens - 1)), g_sorted_token_ids_offset, 0);
     }
 
 #pragma unroll
@@ -798,8 +796,6 @@ __forceinline__ __device__ void gemm_nt_marlin_prefill_down_fp8_bk64(
             g_row_B[n_tile * 2 + i] = index + i * 16;
         }
     }
-
-    vmcnt_only_wait(0);
 
 #pragma unroll
     for (int m_tile = 0; m_tile < WARP_M / MFMA_M; m_tile++)
@@ -1386,7 +1382,7 @@ __global__ void __launch_bounds__(512, 1) MOE_W8A8_I8_PERCHANNEL_MARLIN_HIP_NT_P
         {
             int m_idx = min_tile_m * 16 + i * 4 + col_id;
             int it = m_idx / 4;
-            inline_buffer_load_dword(sorted_token_ids_element_store[it], m_idx, g_sorted_token_ids_offset, bidx * BLOCK_SIZE_M);
+            inline_buffer_load_dword_wait(sorted_token_ids_element_store[it], m_idx, g_sorted_token_ids_offset, bidx * BLOCK_SIZE_M);
         }
     }
 
@@ -1659,7 +1655,7 @@ __global__ void __launch_bounds__(512, 1) MOE_W8A8_I8_PERCHANNEL_MARLIN_HIP_NT_P
         {
             int m_idx = min_tile_m * 16 + i * 4 + col_id;
             int it = m_idx / 4;
-            inline_buffer_load_dword(sorted_token_ids_element_store[it], m_idx, g_sorted_token_ids_offset, bidx * BLOCK_SIZE_M);
+            inline_buffer_load_dword_wait(sorted_token_ids_element_store[it], m_idx, g_sorted_token_ids_offset, bidx * BLOCK_SIZE_M);
         }
     }
 

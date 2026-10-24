@@ -1591,7 +1591,7 @@ __global__ void __launch_bounds__(512, 1) MOE_W8A8_I8_PERCHANNEL_MARLIN_HIP_NT_P
   for (int min_tile_m = 0; min_tile_m < WARP_M / mfma_m; min_tile_m++)
   {
     int m_idx = min_tile_m * mfma_m + row_id;
-    inline_buffer_load_dword(sorted_token_ids_element_store[min_tile_m], m_idx, g_sorted_token_ids_offset, bidx * BLOCK_SIZE_M);
+    inline_buffer_load_dword_wait(sorted_token_ids_element_store[min_tile_m], m_idx, g_sorted_token_ids_offset, bidx * BLOCK_SIZE_M);
   }
 
   float *b_scale_ptr = weight_scale + weight_scale_offset + warp_n_id * WARP_N;
@@ -1861,7 +1861,7 @@ __global__ void __launch_bounds__(512, 1) MOE_W8A8_I8_PERCHANNEL_MARLIN_HIP_NT_P
   for (int min_tile_m = 0; min_tile_m < WARP_M / mfma_m; min_tile_m++)
   {
     int m_idx = min_tile_m * mfma_m + row_id;
-    inline_buffer_load_dword(sorted_token_ids_element_store[min_tile_m], m_idx, g_sorted_token_ids_offset, bidx * BLOCK_SIZE_M);
+    inline_buffer_load_dword_wait(sorted_token_ids_element_store[min_tile_m], m_idx, g_sorted_token_ids_offset, bidx * BLOCK_SIZE_M);
   }
 
   float *b_scale_ptr = weight_scale + weight_scale_offset + warp_n_id * WARP_N;
