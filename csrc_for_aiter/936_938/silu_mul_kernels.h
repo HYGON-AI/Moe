@@ -945,17 +945,46 @@ namespace moe_c
     }
   }
 
+  // Exact BF16 RNE, including NaN payloads, without divergent conversion paths.
+  __device__ __forceinline__ __hip_bfloat16 silu_bf16_rne_select(float value)
+  {
+    const uint32_t bits = __float_as_uint(value);
+    const uint32_t rounded = bits + 0x7fff + ((bits >> 16) & 1);
+    const uint32_t special = bits | ((bits & 0xffff) ? 0x10000 : 0);
+    const uint32_t exponent = bits & 0x7f800000;
+    uint32_t selected;
+    asm("v_cmp_eq_u32 vcc, %4, %1\n\t"
+        "v_cndmask_b32 %0, %2, %3, vcc"
+        : "=v"(selected)
+        : "v"(exponent), "v"(rounded), "v"(special), "s"(0x7f800000)
+        : "vcc");
+    __hip_bfloat16 result;
+    *reinterpret_cast<uint16_t *>(&result) = selected >> 16;
+    return result;
+  }
+
   // Each block handles ROWS_PER_BLOCK consecutive M rows on the same N-tile.
   template <typename scalar_t, int BLOCK_SIZE_N, int VEC_SIZE, int ROWS_PER_BLOCK,
-            bool N_DIV, bool M_DIV, int ACTIVATION>
+            bool N_DIV, bool M_DIV, int ACTIVATION, bool N640_FAST = false>
   __launch_bounds__(BLOCK_SIZE_N / VEC_SIZE,
                     (BLOCK_SIZE_N / VEC_SIZE <= 128 ? 2 : 1)) __global__
       void glu_kernel(
           scalar_t *__restrict__ out,         // [M, N]
           const scalar_t *__restrict__ input, // [M, 2N]
-          int M, int N, float beta1, float beta2)
+          int M, int runtime_N, float beta1, float beta2)
   {
+    const int N = N640_FAST ? 640 : runtime_N;
     using native_scalar_t = native_t<scalar_t>;
+    static_assert(!N640_FAST ||
+                  (std::is_same_v<native_scalar_t, __hip_bfloat16> &&
+                   BLOCK_SIZE_N == 128 && VEC_SIZE == 2 &&
+                   ROWS_PER_BLOCK == 8 && N_DIV && M_DIV && ACTIVATION == 0));
+    if constexpr (N640_FAST)
+    {
+      // Keep the standalone kernel's lane guard: it improves gfx936 code generation.
+      if (threadIdx.x >= BLOCK_SIZE_N / VEC_SIZE)
+        return;
+    }
     constexpr int kElemsPerDword = 4 / static_cast<int>(sizeof(native_scalar_t));
 
     const int pid = blockIdx.x;
@@ -1023,7 +1052,7 @@ namespace moe_c
 #pragma unroll
       for (int r = 0; r < kHalf; ++r)
       {
-        silu_load_gate_up<kDwords, true>(
+        silu_load_gate_up<kDwords, !N640_FAST>(
             gate_buf[r], up_buf[r], gate_dw_r[r], up_dw_r[r]);
       }
 
@@ -1035,7 +1064,7 @@ namespace moe_c
         const int prefetch_idx = r + kHalf;
         if (prefetch_idx < ROWS_PER_BLOCK)
         {
-          silu_load_gate_up<kDwords, true>(
+          silu_load_gate_up<kDwords, !N640_FAST>(
               gate_buf[prefetch_idx], up_buf[prefetch_idx],
               gate_dw_r[prefetch_idx], up_dw_r[prefetch_idx]);
         }
@@ -1056,6 +1085,16 @@ namespace moe_c
             const float u0 = static_cast<float>(up_vals[i]);
             const float g1 = static_cast<float>(gate_vals[i + 1]);
             const float u1 = static_cast<float>(up_vals[i + 1]);
+            if constexpr (N640_FAST)
+            {
+              const float a0 = static_cast<float>(silu_bf16_rne_select(silu_fast(g0)));
+              const float a1 = static_cast<float>(silu_bf16_rne_select(silu_fast(g1)));
+              const __hip_bfloat16 lo = silu_bf16_rne_select(a0 * u0);
+              const __hip_bfloat16 hi = silu_bf16_rne_select(a1 * u1);
+              out_packed[d] = static_cast<uint32_t>(*reinterpret_cast<const uint16_t *>(&lo)) |
+                             (static_cast<uint32_t>(*reinterpret_cast<const uint16_t *>(&hi)) << 16);
+            }
+            else
 #if defined(__gfx938__)
             if constexpr (ACTIVATION == 0)
             {
@@ -1071,7 +1110,14 @@ namespace moe_c
               out_packed[d] = silu_pack_bf16_pair(r0, r1);
             }
           }
-          silu_store_out<kDwords>(out_dw_r[r], out_packed);
+          if constexpr (N640_FAST)
+          {
+            silu_gmem_store<4, true>(out_dw_r[r], out_packed);
+          }
+          else
+          {
+            silu_store_out<kDwords>(out_dw_r[r], out_packed);
+          }
         }
         else
         {
@@ -1930,6 +1976,20 @@ namespace moe_c
 
     const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    if constexpr (ACTIVATION == 0)
+    {
+      if (input.scalar_type() == at::ScalarType::BFloat16 && N == 640 &&
+          M >= 8192 && M % 8 == 0 && rows_per_block == 1 && vec_size == 2 &&
+          std::strncmp(at::cuda::getCurrentDeviceProperties()->gcnArchName, "gfx936", 6) == 0)
+      {
+        auto *out_ptr = reinterpret_cast<__hip_bfloat16 *>(out.data_ptr());
+        const auto *in_ptr = reinterpret_cast<const __hip_bfloat16 *>(input.data_ptr());
+        glu_kernel<__hip_bfloat16, 128, 2, 8, true, true, 0, true>
+            <<<(M / 8) * 5, 64, 0, stream>>>(out_ptr, in_ptr, M, N, 0.0f, 0.0f);
+        return;
+      }
+    }
 
     constexpr const char *dispatch_name =
         (ACTIVATION == 0) ? "silu_and_mul" : ((ACTIVATION == 3) ? "gelu_and_mul" : ((ACTIVATION == 4) ? "gelu_tanh_and_mul" : "situ_glu"));
