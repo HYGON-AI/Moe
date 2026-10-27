@@ -492,6 +492,8 @@ __device__ vec4_fp32 mmac_fp8(const vec<Element, 8> &v1, const vec<Element, 8> &
 // __builtin_amdgcn_sched_barrier(0);
 #if defined(__gfx938__)
     v3 = __builtin_hcu_mmac_f32_16x16x32_fp8_fp8_lit_lts(v1, v2, v3, 0, 0);
+#elif defined(__gfx92a__)
+    v3 = __builtin_hcu_mmac_f32_16x16x32_fp8_fp8(v1, v2, v3);
 #else
     v3 = {0, 0, 0, 0};
 #endif
