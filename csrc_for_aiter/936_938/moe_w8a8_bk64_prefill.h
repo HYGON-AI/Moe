@@ -33,6 +33,118 @@ __forceinline__ __device__ int moe_w8a8_route_topk_id(
 }
 #endif
 
+// gfx92a's non-literal FP8 MMAC needs an LDS staging step. The up and down
+// projections use different register-to-column permutations, so both the
+// C tile and its channel scale are normalized before the routed row store.
+template <typename scalar_t, int BLOCK_SIZE_M, int BLOCK_SIZE_N>
+constexpr int prefill_output_lds_bytes_fp8()
+{
+    return BLOCK_SIZE_M * (BLOCK_SIZE_N + 32) * sizeof(scalar_t);
+}
+
+template <typename scalar_t,
+          int WARP_NUM,
+          int BLOCK_SIZE_M,
+          int BLOCK_SIZE_N,
+          int WARP_M,
+          int WARP_N,
+          int N_LOOP_NUM,
+          bool IS_DOWN>
+__forceinline__ __device__ void prefill_store_output_via_lds_fp8(
+    scalar_t *output_lds,
+    scalar_t *g_output,
+    const vec4_fp32 (&C_reg)[N_LOOP_NUM][(WARP_M / 16) * (WARP_N / 16)],
+    const float (&b_scale)[N_LOOP_NUM][WARP_N / 16][4],
+    const float (&weight_dot_a_scale)[WARP_M / 16],
+    const int32_t *sorted_token_ids,
+    int bidx,
+    int warp_n_id,
+    uint32_t size_n,
+    uint32_t valid_route_count)
+{
+    static_assert(BLOCK_SIZE_M == WARP_M, "LDS writeback requires BLOCK_SIZE_M == WARP_M");
+    static_assert(BLOCK_SIZE_N == WARP_NUM * WARP_N, "LDS writeback requires N-only wave split");
+
+    constexpr int LDS_STRIDE = BLOCK_SIZE_N + 32;
+    constexpr int THREADS_PER_ROW = BLOCK_SIZE_N / 8;
+    constexpr int ROWS_PER_PASS = WARP_NUM * 64 / THREADS_PER_ROW;
+    constexpr int PASSES = (BLOCK_SIZE_M + ROWS_PER_PASS - 1) / ROWS_PER_PASS;
+
+    const int lane_id = threadIdx.x & 63;
+    const int row_id = lane_id & 15;
+    const int col_id = lane_id >> 4;
+    const int out_row = threadIdx.x / THREADS_PER_ROW;
+    const int out_col = (threadIdx.x % THREADS_PER_ROW) * 8;
+
+    int out_token_index[PASSES];
+    bool out_valid[PASSES];
+#pragma unroll
+    for (int p = 0; p < PASSES; ++p)
+    {
+        const int m = out_row + p * ROWS_PER_PASS;
+        const int32_t route_id = sorted_token_ids[bidx * BLOCK_SIZE_M +
+                                                  min(m, BLOCK_SIZE_M - 1)];
+        out_token_index[p] = route_id;
+        out_valid[p] = m < BLOCK_SIZE_M && route_id >= 0 &&
+                       static_cast<uint32_t>(route_id) < valid_route_count;
+    }
+
+#pragma unroll
+    for (int n_loop = 0; n_loop < N_LOOP_NUM; ++n_loop)
+    {
+        __syncthreads();
+#pragma unroll
+        for (int min_tile_m = 0; min_tile_m < WARP_M / 16; ++min_tile_m)
+        {
+#pragma unroll
+            for (int min_tile_n = 0; min_tile_n < WARP_N / 32; ++min_tile_n)
+            {
+                const int tile_idx0 = min_tile_m * (WARP_N / 16) + min_tile_n * 2;
+                const int tile_idx1 = tile_idx0 + 1;
+                const int m = min_tile_m * 16 + row_id;
+                const float scale = weight_dot_a_scale[min_tile_m];
+#pragma unroll
+                for (int reg_id = 0; reg_id < 4; ++reg_id)
+                {
+                    if constexpr (!IS_DOWN)
+                    {
+                        const int n0 = min_tile_n * 32 + reg_id * 4 + col_id + warp_n_id * WARP_N;
+                        output_lds[m * LDS_STRIDE + n0] =
+                            b32_to_b16<scalar_t>(C_reg[n_loop][tile_idx0][reg_id] *
+                                                 scale * b_scale[n_loop][min_tile_n * 2][reg_id]);
+                        output_lds[m * LDS_STRIDE + n0 + 16] =
+                            b32_to_b16<scalar_t>(C_reg[n_loop][tile_idx1][reg_id] *
+                                                 scale * b_scale[n_loop][min_tile_n * 2 + 1][reg_id]);
+                    }
+                    else
+                    {
+                        const int n0 = min_tile_n * 32 + reg_id * 8 + col_id * 2 + warp_n_id * WARP_N;
+                        output_lds[m * LDS_STRIDE + n0] =
+                            b32_to_b16<scalar_t>(C_reg[n_loop][tile_idx0][reg_id] *
+                                                 scale * b_scale[n_loop][min_tile_n * 2][reg_id]);
+                        output_lds[m * LDS_STRIDE + n0 + 1] =
+                            b32_to_b16<scalar_t>(C_reg[n_loop][tile_idx1][reg_id] *
+                                                 scale * b_scale[n_loop][min_tile_n * 2 + 1][reg_id]);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int p = 0; p < PASSES; ++p)
+        {
+            if (out_valid[p])
+            {
+                const int m = out_row + p * ROWS_PER_PASS;
+                *reinterpret_cast<vec_element_8<scalar_t> *>(
+                    &g_output[out_token_index[p] * size_n + BLOCK_SIZE_N * n_loop + out_col]) =
+                    *reinterpret_cast<const vec_element_8<scalar_t> *>(
+                        &output_lds[m * LDS_STRIDE + out_col]);
+            }
+        }
+    }
+}
+
 template <bool Is_store_A,
           int A_prefetch_level,
           int B_prefetch_level,
@@ -362,10 +474,17 @@ __forceinline__ __device__ void gemm_nt_marlin_prefill_flat_route_fp8_bk64(
                         for (int k_tile = 0; k_tile < WARP_K / MFMA_K; k_tile++)
                         {
                             C_reg[n_loop - 1][m_tile * (WARP_N / MFMA_N) + n_tile * 2 + it] =
+#if defined(__gfx92a__)
+                                mmac_fp8<Element>(
+                                    *(vec<Element, 8> *)(&A_reg[m_tile][0].int8t_array[k_tile]),
+                                    *(vec<Element, 8> *)(&B_reg[n_tile * 2 + it][stage_b_flag][0].int8t_array[k_tile]),
+                                    C_reg[n_loop - 1][m_tile * (WARP_N / MFMA_N) + n_tile * 2 + it]);
+#else
                                 mmac_fp8_lit<Element>(
                                     *(vec<Element, 8> *)(&A_reg[m_tile][0].int8t_array[k_tile]),
                                     *(vec<Element, 8> *)(&B_reg[n_tile * 2 + it][stage_b_flag][0].int8t_array[k_tile]),
                                     C_reg[n_loop - 1][m_tile * (WARP_N / MFMA_N) + n_tile * 2 + it]);
+#endif
                         }
                     }
                 }
@@ -452,10 +571,17 @@ __forceinline__ __device__ void gemm_nt_marlin_prefill_flat_route_fp8_bk64(
                     for (int k_tile = 0; k_tile < WARP_K / MFMA_K; k_tile++)
                     {
                         C_reg[n_loop_num - 1][m_tile * (WARP_N / MFMA_N) + n_tile * 2 + it] =
+#if defined(__gfx92a__)
+                            mmac_fp8<Element>(
+                                *(vec<Element, 8> *)(&A_reg[m_tile][0].int8t_array[k_tile]),
+                                *(vec<Element, 8> *)(&B_reg[n_tile * 2 + it][stage_b_flag][0].int8t_array[k_tile]),
+                                C_reg[n_loop_num - 1][m_tile * (WARP_N / MFMA_N) + n_tile * 2 + it]);
+#else
                             mmac_fp8_lit<Element>(
                                 *(vec<Element, 8> *)(&A_reg[m_tile][0].int8t_array[k_tile]),
                                 *(vec<Element, 8> *)(&B_reg[n_tile * 2 + it][stage_b_flag][0].int8t_array[k_tile]),
                                 C_reg[n_loop_num - 1][m_tile * (WARP_N / MFMA_N) + n_tile * 2 + it]);
+#endif
                     }
                 }
             }
@@ -680,10 +806,17 @@ __forceinline__ __device__ void gemm_nt_marlin_prefill_2_flat_route_fp8_bk64(
                         for (int k_tile = 0; k_tile < WARP_K / MFMA_K; k_tile++)
                         {
                             C_reg[n_loop - 1][m_tile * (WARP_N / MFMA_N) + n_tile * 2 + it] =
+#if defined(__gfx92a__)
+                                mmac_fp8<Element>(
+                                    *(vec<Element, 8> *)(&A_reg[m_tile][0].int8t_array[k_tile]),
+                                    *(vec<Element, 8> *)(&B_reg[n_tile * 2 + it][stage_b_flag][0].int8t_array[k_tile]),
+                                    C_reg[n_loop - 1][m_tile * (WARP_N / MFMA_N) + n_tile * 2 + it]);
+#else
                                 mmac_fp8_lit<Element>(
                                     *(vec<Element, 8> *)(&A_reg[m_tile][0].int8t_array[k_tile]),
                                     *(vec<Element, 8> *)(&B_reg[n_tile * 2 + it][stage_b_flag][0].int8t_array[k_tile]),
                                     C_reg[n_loop - 1][m_tile * (WARP_N / MFMA_N) + n_tile * 2 + it]);
+#endif
                         }
                     }
                 }
@@ -727,10 +860,17 @@ __forceinline__ __device__ void gemm_nt_marlin_prefill_2_flat_route_fp8_bk64(
                     for (int k_tile = 0; k_tile < WARP_K / MFMA_K; k_tile++)
                     {
                         C_reg[n_loop_num - 1][m_tile * (WARP_N / MFMA_N) + n_tile * 2 + it] =
+#if defined(__gfx92a__)
+                            mmac_fp8<Element>(
+                                *(vec<Element, 8> *)(&A_reg[m_tile][0].int8t_array[k_tile]),
+                                *(vec<Element, 8> *)(&B_reg[n_tile * 2 + it][stage_b_flag][0].int8t_array[k_tile]),
+                                C_reg[n_loop_num - 1][m_tile * (WARP_N / MFMA_N) + n_tile * 2 + it]);
+#else
                             mmac_fp8_lit<Element>(
                                 *(vec<Element, 8> *)(&A_reg[m_tile][0].int8t_array[k_tile]),
                                 *(vec<Element, 8> *)(&B_reg[n_tile * 2 + it][stage_b_flag][0].int8t_array[k_tile]),
                                 C_reg[n_loop_num - 1][m_tile * (WARP_N / MFMA_N) + n_tile * 2 + it]);
+#endif
                     }
                 }
             }
