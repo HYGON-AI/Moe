@@ -1,7 +1,7 @@
 # Hygon MOE_C Operators
 
 This repository provides high-performance Mixture-of-Experts (MOE) operators for
-Hygon DCU. It contains MOE GEMM kernels, common support kernels, Python dispatch
+Hygon GPU. It contains MOE GEMM kernels, common support kernels, Python dispatch
 wrappers, operator configuration files, and local correctness tests.
 
 The operator APIs and test cases are kept compatible with the AITER MOE call
