@@ -1,15 +1,15 @@
 {
     "1": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 0
+        "MODE": 3
     },
     "2": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 0
+        "MODE": 3
     },
     "3": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 1
+        "MODE": 3
     },
     "4": {
         "BLOCK_SIZE_M": 16,
@@ -25,62 +25,82 @@
     },
     "7": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 1
+        "MODE": 3
     },
     "8": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 1
+        "MODE": 3
     },
     "9": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 1
+        "MODE": 3
     },
     "10": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 1
+        "MODE": 3
     },
     "11": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 1
+        "MODE": 3
     },
     "12": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 1
+        "MODE": 3
     },
     "13": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 1
+        "MODE": 3
     },
     "14": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 1
+        "MODE": 3
     },
     "15": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 1
+        "MODE": 3
     },
     "16": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 1
+        "MODE": 3
     },
     "32": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 1
+        "MODE": 3
     },
     "64": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 1
+        "MODE": 3
     },
     "128": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 1
+        "MODE": 3
     },
     "256": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 1
+        "MODE": 3
     },
     "512": {
         "BLOCK_SIZE_M": 16,
-        "MODE": 5
+        "MODE": 3
+    },
+    "1024": {
+        "BLOCK_SIZE_M": 48,
+        "MODE": 9
+    },
+    "2048": {
+        "BLOCK_SIZE_M": 64,
+        "MODE": 8
+    },
+    "4096": {
+        "BLOCK_SIZE_M": 48,
+        "MODE": 9
+    },
+    "8192": {
+        "BLOCK_SIZE_M": 128,
+        "MODE": 14
+    },
+    "16384": {
+        "BLOCK_SIZE_M": 128,
+        "MODE": 14
     }
 }
