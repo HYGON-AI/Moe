@@ -1,6 +1,6 @@
 # Hygon MOE_C 算子仓库
 
-本仓库提供面向 Hygon DCU 的 Mixture-of-Experts（MOE）高性能算子实现，主要包含
+本仓库提供面向 Hygon GPU 的 Mixture-of-Experts（MOE）高性能算子实现，主要包含
 MOE GEMM kernel、公共支撑 kernel、Python 路由封装、算子配置和本地验证脚本。
 
 本仓库中的算子接口和测试用例与 AITER 的 MOE 调用链保持兼容，可作为 AITER
