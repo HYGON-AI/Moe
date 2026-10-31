@@ -295,6 +295,22 @@ namespace W4A16_UTILS
         __forceinline__ __device__ void dequant_fp4_e2m1_e8m0(uint32_t q, uint8_t scale, scalar_t2 *res)
         {
             uint32_t *out = reinterpret_cast<uint32_t *>(res);
+#if defined(__gfx92a__)
+            uint16_t v[8];
+#pragma unroll
+            for (int pack_id = 0; pack_id < 4; pack_id++)
+            {
+                const uint32_t code0 = (q >> (pack_id * 4)) & 0x0f;
+                const uint32_t code1 = (q >> (pack_id * 4 + 16)) & 0x0f;
+                v[pack_id] = fp4_e2m1_e8m0_to_bits<Element>(code0, scale);
+                v[pack_id + 4] = fp4_e2m1_e8m0_to_bits<Element>(code1, scale);
+            }
+#pragma unroll
+            for (int j = 0; j < 4; j++)
+            {
+                out[j] = static_cast<uint32_t>(v[2 * j]) | (static_cast<uint32_t>(v[2 * j + 1]) << 16);
+            }
+#else
 #pragma unroll
             for (int pack_id = 0; pack_id < 4; pack_id++)
             {
@@ -304,6 +320,7 @@ namespace W4A16_UTILS
                 const uint16_t v1 = fp4_e2m1_e8m0_to_bits<Element>(code1, scale);
                 out[pack_id] = static_cast<uint32_t>(v0) | (static_cast<uint32_t>(v1) << 16);
             }
+#endif
         }
 
         __forceinline__ __device__ float e8m0_to_float_fast(uint8_t scale)
@@ -346,6 +363,22 @@ namespace W4A16_UTILS
             {
                 uint32_t *out = reinterpret_cast<uint32_t *>(res);
                 const float scale_f = e8m0_to_float_fast(scale);
+#if defined(__gfx92a__)
+                float v[8];
+#pragma unroll
+                for (int pack_id = 0; pack_id < 4; pack_id++)
+                {
+                    const uint32_t code0 = (q >> (pack_id * 4)) & 0x0f;
+                    const uint32_t code1 = (q >> (pack_id * 4 + 16)) & 0x0f;
+                    v[pack_id] = fp4_lut[code0] * scale_f;
+                    v[pack_id + 4] = fp4_lut[code1] * scale_f;
+                }
+#pragma unroll
+                for (int j = 0; j < 4; j++)
+                {
+                    out[j] = pack_bf16_pair_from_f32(v[2 * j], v[2 * j + 1]);
+                }
+#else
 #pragma unroll
                 for (int pack_id = 0; pack_id < 4; pack_id++)
                 {
@@ -355,6 +388,7 @@ namespace W4A16_UTILS
                     const float v1 = fp4_lut[code1] * scale_f;
                     out[pack_id] = pack_bf16_pair_from_f32(v0, v1);
                 }
+#endif
             }
         }
 

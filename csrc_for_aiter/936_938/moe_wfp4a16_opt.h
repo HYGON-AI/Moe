@@ -139,8 +139,13 @@ __global__ void __launch_bounds__(512, 1) GEMM_NT_1STAGE(
                 for (int32_t r_i = 0; r_i < 2; r_i++)
                 {
                   int32_t reg_id = r_o * 2 + r_i;
+#if defined(__gfx92a__)
+                  int32_t col = warp_n_id * WARP_N + min_tile_n * mfma_n +
+                                reg_id * 4 + (lane_id / 16);
+#else
                   int32_t col = warp_n_id * WARP_N + min_tile_n * mfma_n +
                                 r_o * 8 + (lane_id / 16) * 2 + r_i;
+#endif
                   g_output[token_index * size_n + col] =
                       Dtype::float2num(mul_topk_weight ? C_reg[0][min_tile_m * WARP_N / mfma_n + min_tile_n][reg_id] *
                                                              weight_dot_a_scale[min_tile_m]
@@ -498,8 +503,13 @@ __global__ void __launch_bounds__(512, 1) GEMM_NT_1STAGE_WFP4A16(
                 for (int32_t r_i = 0; r_i < 2; r_i++)
                 {
                   int32_t reg_id = r_o * 2 + r_i;
+#if defined(__gfx92a__)
+                  int32_t col = warp_n_id * WARP_N + min_tile_n * mfma_n +
+                                reg_id * 4 + (lane_id / 16);
+#else
                   int32_t col = warp_n_id * WARP_N + min_tile_n * mfma_n +
                                 r_o * 8 + (lane_id / 16) * 2 + r_i;
+#endif
                   g_output[token_index * size_n + col] =
                       Dtype::float2num(mul_topk_weight ? C_reg[0][min_tile_m * WARP_N / mfma_n + min_tile_n][reg_id] *
                                                              weight_dot_a_scale[min_tile_m]
