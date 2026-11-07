@@ -2611,6 +2611,11 @@ def validate_channelwise_reduce_k(quant, mode, reduce_k, is_bottom, out_n=None):
 W4A16_GROUP_SIZE = 32  # GROUP_K of the launchers
 
 
+def w4a16_fuse_silu(mode) -> bool:
+    """GEMM1 prefill profile 3xx (K digit 1): silu_and_mul is fused, output [M, topk, N / 2]; mode - 100 is the unfused twin."""
+    return mode // 100000 % 10 == 1 and mode % 1000 // 100 == 3
+
+
 CSV_NAMES = {
     "int8_w4a8": "tuned_moe_c_w4a8_channel.csv",
     "int8_w8a8": "tuned_moe_c_w8a8_int8_channel.csv",
@@ -4333,8 +4338,14 @@ def fused_experts_impl_marlin(hidden_states: torch.Tensor,
                 raise ValueError("channelwise GEMM1/GEMM2 must have the same BLOCK_SIZE_M")
             if _moe_c_config_uses_moe_align(config2, use_fp8_w8a8) != use_moe_align_sorting:
                 raise ValueError("channelwise GEMM1/GEMM2 must use the same routing layout")
-        dual_routing = False
+        fuse_silu = dual_routing = False
         if use_int4_w4a16 and not find_best and config2 is not None:
+            # GEMM1 may fuse silu_and_mul; fall back to the unfused twin (mode - 100) otherwise.
+            fuse_silu = w4a16_fuse_silu(config["MODE"])
+            if fuse_silu and not (activation == "silu" and is_gated and gemm1_alpha is None
+                                  and gemm1_limit is None):
+                config = dict(config, MODE=int(config["MODE"]) - 100)
+                fuse_silu = False
             dual_routing = int(config["BLOCK_SIZE_M"]) != int(config2["BLOCK_SIZE_M"])
         w4a16_gemm2_routing = None
         if use_w16a16:
@@ -4412,7 +4423,7 @@ def fused_experts_impl_marlin(hidden_states: torch.Tensor,
 
         invoke_fused_moe_kernel_marlin(curr_hidden_states,
                                 w1,
-                                intermediate_cache1,
+                                intermediate_cache2 if fuse_silu else intermediate_cache1,
                                 curr_a1_scale,
                                 w1_scale,
                                 w1_zp,
@@ -4440,7 +4451,9 @@ def fused_experts_impl_marlin(hidden_states: torch.Tensor,
                                 block_shape=block_shape,
                                 real_size_k=fp8_original_k if use_fp8_w8a8 else None)
 
-        if activation == "silu" and is_gated and gemm1_alpha is None:
+        if fuse_silu:
+                pass  # GEMM1 already wrote silu(gate) * up into intermediate_cache2
+        elif activation == "silu" and is_gated and gemm1_alpha is None:
                 moe_c_silu_and_mul(
                     intermediate_cache2,
                     intermediate_cache1.view(-1, N),

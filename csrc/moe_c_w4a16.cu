@@ -56,6 +56,14 @@ static void run_moe_w4a16_gemm(torch::Tensor &input,
   auto &kernels = first_stage
                       ? (prefill ? kernel_maps_gemm1_prefill_w4a16<scalar_t> : kernel_maps_gemm1_decode_w4a16<scalar_t>)
                       : (prefill ? kernel_maps_gemm2_prefill_w4a16<scalar_t> : kernel_maps_gemm2_decode_w4a16<scalar_t>);
+  if (first_stage && prefill)
+  {
+    // Fused-silu modes write [M, topk, N / 2]; every other GEMM1 mode writes [M, topk, N].
+    const int64_t cols = w4a16_prefill_fused_silu(mode) ? size_n / 2 : size_n;
+    TORCH_CHECK(output.numel() == (int64_t)size_m * top_k * cols,
+                "moe_c_moe_gemm_marlin_w4a16: GEMM1 prefill mode=", mode, " writes [", size_m, ", ", top_k,
+                ", ", cols, "], output has ", output.numel(), " elements");
+  }
   auto it = kernels.find(mode);
   TORCH_CHECK(it != kernels.end(),
               "moe_c_moe_gemm_marlin_w4a16: GEMM", first_stage ? 1 : 2, " ",

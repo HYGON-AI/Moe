@@ -487,7 +487,7 @@ def _w4a16_registered_modes(stage: int) -> List[int]:
 
 W4A16_QUANT = "int4_w4a16"
 PROFILES: Dict[str, QuantProfile] = {
-    W4A16_QUANT: RegisteredProfile(W4A16_QUANT, (0,), _w4a16_registered_modes),
+    W4A16_QUANT: RegisteredProfile(W4A16_QUANT, (0, 1), _w4a16_registered_modes),
     "fp8_w8a8": QuantProfile("fp8_w8a8", ("fp8_w8a8",), (0, 1), (0, 1, 2), (201, 202, 203, 204), _w8a8_fp8_modes()),
     "int8_w8a8": QuantProfile("int8_w8a8", ("int8_w8a8",), (0,), (0, 1, 2), (201, 202, 203, 204), _w8a8_int8_modes()),
     "int8_w4a8": QuantProfile("int8_w4a8", ("int8_w4a8",), (1,), (0, 1, 2, 3), (201, 202, 203, 204), _w4a8_modes()),

@@ -5,6 +5,7 @@
 
 #include "moe_w4a16_utils.h"
 #include "moe_w4a16_config.h"
+#include "moe_w4a16_prefill.h"
 
 template <
     typename Element,

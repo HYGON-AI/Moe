@@ -11,7 +11,7 @@ region, and only the GEMM launch is timed.
 
 For each M the tuner takes the fastest passing GEMM1 and GEMM2 independently (their BMs may
 differ; the runtime then aligns the routing once per distinct BM).  The objective is GEMM-only:
-gemm1 + a separate silu_and_mul + gemm2.  A GPU fault kills the
+gemm1 (+ a separate silu_and_mul when the mode does not fuse it) + gemm2.  A GPU fault kills the
 process, so a supervising parent records the running candidate as ``crashed`` and resumes.
 
 Results are merged into a ``tuned_moe_c_w4a16_group.csv`` (default under --out-dir).  The runtime
@@ -48,7 +48,7 @@ class CandidateRow:
     bm: int
     status: str  # ok | mismatch | failed | crashed
     latency_us: Optional[float] = None
-    # GEMM1 pays a separate silu_and_mul pass; it is part of the objective.
+    # GEMM1 modes without fused silu pay a separate silu_and_mul pass; it is part of the objective.
     epilogue_us: float = 0.0
     max_abs: Optional[float] = None
     mismatch_ratio: Optional[float] = None
@@ -108,6 +108,7 @@ class StageData:
     def __init__(self, a, qweight, scale, zeros, topk_weights, out_shape, reference, top_k):
         self.a, self.qweight, self.scale, self.zeros = a, qweight, scale, zeros
         self.topk_weights, self.out_shape, self.reference, self.top_k = topk_weights, out_shape, reference, top_k
+        self.fused_reference = None  # GEMM1 only: silu(gate) * up of ``reference``
 
 
 def make_inputs(m: int, args, dtype):
@@ -143,6 +144,10 @@ def make_inputs(m: int, args, dtype):
 
     # GEMM1: hidden [M, K] x W1 [E, 2N, K] -> [M, topk, 2N]  (gate = first N columns, up = last N)
     gemm1 = stage(randn(e, 2 * n, k), hidden, token_of_row, None, (m, topk, 2 * n), topk)
+    # fused-silu modes write silu(gate) * up as [M, topk, N]
+    act_ref = gemm1.reference.float()
+    gemm1.fused_reference = (torch.nn.functional.silu(act_ref[..., :n]) * act_ref[..., n:]).to(dtype)
+    del act_ref
     # GEMM2: an independent [M*topk, N] activation x W2 [E, K, N] -> [M, topk, K],
     # scaled by the routed topk weight.
     a2 = randn(m * topk, n)
@@ -169,11 +174,15 @@ def silu_cost_us(data, args) -> float:
 
 def bench_candidate(m, stage_name, mode, data, routing, args) -> CandidateRow:
     import torch
+    from moe_utils.fused_moe_c import w4a16_fuse_silu
     from moe_utils.moe_ops import moe_c_moe_gemm_marlin_w4a16
 
+    fused = w4a16_fuse_silu(mode)
     row = CandidateRow(m, stage_name, mode, mode // 1000 % 100 * 16, status="failed")
     sorted_ids, expert_ids, num_post = routing
     reference, out_shape = data.reference, data.out_shape
+    if fused:
+        reference, out_shape = data.fused_reference, data.fused_reference.shape
     out = torch.full(out_shape, float("nan"), device="cuda", dtype=reference.dtype)
 
     def run():
@@ -202,7 +211,7 @@ def bench_candidate(m, stage_name, mode, data, routing, args) -> CandidateRow:
         row.error = "non-finite output" if not finite else f"mismatch_ratio={row.mismatch_ratio:.4g}"
         return row
     row.latency_us = _event_time_us(run, args.warmup, args.iters)
-    if stage_name == "gemm1":
+    if stage_name == "gemm1" and not fused:
         row.epilogue_us = silu_cost_us(data, args)
     row.status = "ok"
     return row
@@ -288,7 +297,7 @@ def tune(args) -> int:
 
     summary = {"shape": {"arch": arch, "cu": cu, "e": args.e, "n": args.n, "k": args.k,
                          "topk": args.topk, "dtype": args.dtype, "group_size": args.group_size},
-               "objective": "gemm1_us + silu_and_mul_us + gemm2_us; BMs may differ (dual align)", "m_results": {}}
+               "objective": "gemm1_us (+ silu_and_mul_us if unfused) + gemm2_us; BMs may differ (dual align)", "m_results": {}}
     configs = {"gemm1": {}, "gemm2": {}}
     missing = []
     for m in args.m:
@@ -349,7 +358,7 @@ def main(argv=None) -> int:
     parser.add_argument("--arch", default=None, help="default: detected from the device")
     parser.add_argument("--cu", "--num-cu", dest="cu", type=int, default=None,
                         help="default: the device CU count, as used by the runtime lookup")
-    parser.add_argument("--families", nargs="+", choices=("decode",), default=["decode"],
+    parser.add_argument("--families", nargs="+", choices=("decode", "prefill"), default=["decode", "prefill"],
                         help="kernel families to sweep when --gemm{1,2}-modes are not given")
     parser.add_argument("--gemm1-modes", nargs="+", type=int, default=None)
     parser.add_argument("--gemm2-modes", nargs="+", type=int, default=None)
