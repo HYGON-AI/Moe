@@ -3,6 +3,14 @@
 
 #include <unordered_map>
 #include <functional>
+#include <vector>
+#include <algorithm>
+
+// HIPC mode format shared with W8A8: S F K MM VVV (see csrc/moe_c_common.h).
+// W4A16 kernels consume moe_align ids, so SORTING is always 1; FAMILY 0 is decode.
+#define MOE_W4A16_MODE(STAGE, SORTING, FAMILY, BM, PROFILE) \
+    ((STAGE) * 10000000 + (SORTING) * 1000000 + (FAMILY) * 100000 + \
+     ((BM) / 16) * 1000 + (PROFILE))
 
 template <typename T>
 struct GemmParams_w4a16
@@ -63,12 +71,6 @@ struct GemmParams_w4a16
     bool is_marlin;                         // 是否使用weight重排
 };
 
-template <int BLOCK_SIZE_M, int BLOCK_SIZE_N, int BLOCK_SIZE_K, int WARP_M, int WARP_N, int WARP_K, typename T>
-void launch_moe_w4a16_first_stage_prefill(const GemmParams_w4a16<T> &params);
-
-template <int BLOCK_SIZE_M, int BLOCK_SIZE_N, int BLOCK_SIZE_K, int WARP_M, int WARP_N, int WARP_K, typename T>
-void launch_moe_w4a16_second_stage_prefill(const GemmParams_w4a16<T> &params);
-
 template <int BLOCK_SIZE_M, int BLOCK_SIZE_N, int BLOCK_SIZE_K, int WARP_M, int WARP_N, int WARP_K, int STAGES, typename T>
 void launch_moe_w4a16_first_stage_decode(const GemmParams_w4a16<T> &params);
 
@@ -78,77 +80,64 @@ void launch_moe_w4a16_second_stage_decode(const GemmParams_w4a16<T> &params);
 template <typename scalar_t>
 using KernelFunc_w4a16 = std::function<void(const GemmParams_w4a16<scalar_t> &)>;
 
+// Kernel registration.  BM is written once: it is both the BM field of the map key and the first
+// template argument of the launcher, so a key can never disagree with its kernel.  The map keys
+// (all four maps) are the only list of valid modes; moe_c_w4a16_modes() exports them to the tuner.
+#define W4A16_UNPAREN(...) __VA_ARGS__
+#define W4A16_DECODE(STAGE, PROFILE, BM, BN, BK, WM, WN, WK, ST, FN)                              \
+    {MOE_W4A16_MODE(STAGE, 1, 0, BM, PROFILE), [](const GemmParams_w4a16<scalar_t> &p)             \
+     { FN<BM, BN, BK, WM, WN, WK, ST, scalar_t>(p); }}
 template <typename scalar_t>
 static std::unordered_map<int, KernelFunc_w4a16<scalar_t>> kernel_maps_gemm1_prefill_w4a16 = {
-
 };
 
 template <typename scalar_t>
 static std::unordered_map<int, KernelFunc_w4a16<scalar_t>> kernel_maps_gemm2_prefill_w4a16 = {
-
 };
 
 template <typename scalar_t>
 static std::unordered_map<int, KernelFunc_w4a16<scalar_t>> kernel_maps_gemm1_decode_w4a16 = {
-    {0, [](const GemmParams_w4a16<scalar_t> &p)
-     { launch_moe_w4a16_first_stage_decode<16, 16, 512, 16, 16, 128, 2, scalar_t>(p); }},
-    {1, [](const GemmParams_w4a16<scalar_t> &p)
-     { launch_moe_w4a16_first_stage_decode<16, 32, 512, 16, 32, 128, 2, scalar_t>(p); }},
-    {3, [](const GemmParams_w4a16<scalar_t> &p)
-     { launch_moe_w4a16_first_stage_decode<16, 32, 256, 16, 16, 128, 2, scalar_t>(p); }},
-    {4, [](const GemmParams_w4a16<scalar_t> &p)
-     { launch_moe_w4a16_first_stage_decode<16, 256, 128, 16, 64, 128, 2, scalar_t>(p); }},
-    {5, [](const GemmParams_w4a16<scalar_t> &p)
-     { launch_moe_w4a16_first_stage_decode<16, 128, 256, 16, 64, 128, 2, scalar_t>(p); }},
-    {6, [](const GemmParams_w4a16<scalar_t> &p)
-     { launch_moe_w4a16_first_stage_decode<32, 128, 256, 32, 64, 128, 2, scalar_t>(p); }},
-    {7, [](const GemmParams_w4a16<scalar_t> &p)
-     { launch_moe_w4a16_first_stage_decode<32, 256, 128, 32, 64, 128, 2, scalar_t>(p); }},
-    {8, [](const GemmParams_w4a16<scalar_t> &p)
-     { launch_moe_w4a16_first_stage_decode<64, 128, 128, 64, 32, 128, 2, scalar_t>(p); }},
-    {9, [](const GemmParams_w4a16<scalar_t> &p)
-     { launch_moe_w4a16_first_stage_decode<48, 128, 128, 48, 32, 128, 2, scalar_t>(p); }},
-    {10, [](const GemmParams_w4a16<scalar_t> &p)
-     { launch_moe_w4a16_first_stage_decode<48, 256, 128, 48, 64, 128, 2, scalar_t>(p); }},
-    {11, [](const GemmParams_w4a16<scalar_t> &p)
-     { launch_moe_w4a16_first_stage_decode<64, 256, 128, 64, 64, 128, 2, scalar_t>(p); }},
-    {12, [](const GemmParams_w4a16<scalar_t> &p)
-     { launch_moe_w4a16_first_stage_decode<128, 128, 128, 64, 64, 128, 2, scalar_t>(p); }},
-    {13, [](const GemmParams_w4a16<scalar_t> &p)
-     { launch_moe_w4a16_first_stage_decode<128, 256, 64, 64, 64, 64, 1, scalar_t>(p); }},
-    {14, [](const GemmParams_w4a16<scalar_t> &p)
-     { launch_moe_w4a16_first_stage_decode<128, 128, 64, 64, 64, 64, 1, scalar_t>(p); }},
-
+    W4A16_DECODE(1, 101, 16, 16, 512, 16, 16, 128, 2, launch_moe_w4a16_first_stage_decode),
+    W4A16_DECODE(1, 102, 16, 32, 512, 16, 32, 128, 2, launch_moe_w4a16_first_stage_decode),
+    W4A16_DECODE(1, 103, 16, 32, 256, 16, 16, 128, 2, launch_moe_w4a16_first_stage_decode),
+    W4A16_DECODE(1, 104, 16, 256, 128, 16, 64, 128, 2, launch_moe_w4a16_first_stage_decode),
+    W4A16_DECODE(1, 105, 16, 128, 256, 16, 64, 128, 2, launch_moe_w4a16_first_stage_decode),
+    W4A16_DECODE(1, 101, 32, 128, 256, 32, 64, 128, 2, launch_moe_w4a16_first_stage_decode),
+    W4A16_DECODE(1, 102, 32, 256, 128, 32, 64, 128, 2, launch_moe_w4a16_first_stage_decode),
+    W4A16_DECODE(1, 101, 48, 128, 128, 48, 32, 128, 2, launch_moe_w4a16_first_stage_decode),
+    W4A16_DECODE(1, 102, 48, 256, 128, 48, 64, 128, 2, launch_moe_w4a16_first_stage_decode),
+    W4A16_DECODE(1, 101, 64, 128, 128, 64, 32, 128, 2, launch_moe_w4a16_first_stage_decode),
+    W4A16_DECODE(1, 102, 64, 256, 128, 64, 64, 128, 2, launch_moe_w4a16_first_stage_decode),
+    W4A16_DECODE(1, 101, 128, 128, 128, 64, 64, 128, 2, launch_moe_w4a16_first_stage_decode),
+    W4A16_DECODE(1, 102, 128, 256, 64, 64, 64, 64, 1, launch_moe_w4a16_first_stage_decode),
+    W4A16_DECODE(1, 103, 128, 128, 64, 64, 64, 64, 1, launch_moe_w4a16_first_stage_decode),
 };
 
 template <typename scalar_t>
 static std::unordered_map<int, KernelFunc_w4a16<scalar_t>> kernel_maps_gemm2_decode_w4a16 = {
-    {0, [](const GemmParams_w4a16<scalar_t> &p)
-     { launch_moe_w4a16_second_stage_decode<16, 64, 128, 16, 16, 128, 2, scalar_t>(p); }},
-    {1, [](const GemmParams_w4a16<scalar_t> &p)
-     { launch_moe_w4a16_second_stage_decode<16, 128, 128, 16, 32, 128, 2, scalar_t>(p); }},
-    {2, [](const GemmParams_w4a16<scalar_t> &p)
-     { launch_moe_w4a16_second_stage_decode<16, 256, 128, 16, 64, 128, 2, scalar_t>(p); }},
-    {3, [](const GemmParams_w4a16<scalar_t> &p)
-     { launch_moe_w4a16_second_stage_decode<32, 256, 128, 32, 64, 128, 2, scalar_t>(p); }},
-    {4, [](const GemmParams_w4a16<scalar_t> &p)
-     { launch_moe_w4a16_second_stage_decode<32, 128, 256, 32, 64, 128, 2, scalar_t>(p); }},
-    {5, [](const GemmParams_w4a16<scalar_t> &p)
-     { launch_moe_w4a16_second_stage_decode<64, 128, 128, 64, 32, 128, 2, scalar_t>(p); }},
-    {6, [](const GemmParams_w4a16<scalar_t> &p)
-     { launch_moe_w4a16_second_stage_decode<48, 128, 128, 48, 32, 128, 2, scalar_t>(p); }},
-    {13, [](const GemmParams_w4a16<scalar_t> &p)
-     { launch_moe_w4a16_second_stage_decode<48, 256, 128, 48, 64, 128, 2, scalar_t>(p); }},
-    {7, [](const GemmParams_w4a16<scalar_t> &p)
-     { launch_moe_w4a16_second_stage_decode<64, 256, 128, 64, 64, 128, 2, scalar_t>(p); }},
-    {8, [](const GemmParams_w4a16<scalar_t> &p)
-     { launch_moe_w4a16_second_stage_decode<128, 128, 128, 64, 64, 128, 2, scalar_t>(p); }},
-    {9, [](const GemmParams_w4a16<scalar_t> &p)
-     { launch_moe_w4a16_second_stage_decode<128, 256, 64, 64, 64, 64, 1, scalar_t>(p); }},
-    {10, [](const GemmParams_w4a16<scalar_t> &p)
-     { launch_moe_w4a16_second_stage_decode<256, 128, 128, 64, 64, 128, 2, scalar_t>(p); }},
-    {11, [](const GemmParams_w4a16<scalar_t> &p)
-     { launch_moe_w4a16_second_stage_decode<128, 128, 64, 64, 64, 64, 1, scalar_t>(p); }},
-    {12, [](const GemmParams_w4a16<scalar_t> &p)
-     { launch_moe_w4a16_second_stage_decode<128, 384, 64, 64, 64, 64, 1, scalar_t>(p); }},
+    W4A16_DECODE(2, 101, 16, 64, 128, 16, 16, 128, 2, launch_moe_w4a16_second_stage_decode),
+    W4A16_DECODE(2, 102, 16, 128, 128, 16, 32, 128, 2, launch_moe_w4a16_second_stage_decode),
+    W4A16_DECODE(2, 103, 16, 256, 128, 16, 64, 128, 2, launch_moe_w4a16_second_stage_decode),
+    W4A16_DECODE(2, 101, 32, 256, 128, 32, 64, 128, 2, launch_moe_w4a16_second_stage_decode),
+    W4A16_DECODE(2, 102, 32, 128, 256, 32, 64, 128, 2, launch_moe_w4a16_second_stage_decode),
+    W4A16_DECODE(2, 101, 48, 128, 128, 48, 32, 128, 2, launch_moe_w4a16_second_stage_decode),
+    W4A16_DECODE(2, 102, 48, 256, 128, 48, 64, 128, 2, launch_moe_w4a16_second_stage_decode),
+    W4A16_DECODE(2, 101, 64, 128, 128, 64, 32, 128, 2, launch_moe_w4a16_second_stage_decode),
+    W4A16_DECODE(2, 102, 64, 256, 128, 64, 64, 128, 2, launch_moe_w4a16_second_stage_decode),
+    W4A16_DECODE(2, 101, 128, 128, 128, 64, 64, 128, 2, launch_moe_w4a16_second_stage_decode),
+    W4A16_DECODE(2, 102, 128, 256, 64, 64, 64, 64, 1, launch_moe_w4a16_second_stage_decode),
+    W4A16_DECODE(2, 103, 128, 128, 64, 64, 64, 64, 1, launch_moe_w4a16_second_stage_decode),
+    W4A16_DECODE(2, 104, 128, 384, 64, 64, 64, 64, 1, launch_moe_w4a16_second_stage_decode),
+    W4A16_DECODE(2, 101, 256, 128, 128, 64, 64, 128, 2, launch_moe_w4a16_second_stage_decode),
 };
+
+// Every registered mode of one stage (decode and prefill), sorted.
+inline std::vector<int64_t> w4a16_registered_modes(int stage)
+{
+    std::vector<int64_t> modes;
+    auto add = [&](const auto &map) { for (const auto &kv : map) modes.push_back(kv.first); };
+    if (stage == 1) { add(kernel_maps_gemm1_decode_w4a16<half>); add(kernel_maps_gemm1_prefill_w4a16<half>); }
+    else            { add(kernel_maps_gemm2_decode_w4a16<half>); add(kernel_maps_gemm2_prefill_w4a16<half>); }
+    std::sort(modes.begin(), modes.end());
+    return modes;
+}

@@ -145,7 +145,9 @@ def _try_get_moe_c_config(
     block_size: int,
     k: Optional[int] = None,
     top_k: Optional[int] = None,
+    indtype: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
+    """Look up a tuned moe_c config (``indtype`` keys the W4A16 CSV; it must match ``str(compute_dtype)``)."""
     try:
         from .fused_moe_c import get_moe_configs_marlin
 
@@ -154,8 +156,13 @@ def _try_get_moe_c_config(
                 E=e,
                 N=n,
                 dtype="int4_w4a16",
+                block_n=0,
+                block_k=block_size,
                 is_bottom=False,
                 use_moe_wna16_cuda=True,
+                K=k,
+                top_k=top_k,
+                indtype=indtype,
             )
         elif quant_type == MoeQuantType.WFP4A16:
             configs = get_moe_configs_marlin(
@@ -548,7 +555,8 @@ def get_aiter_moe_config(
     if spec_sol_type is not None:
         # Only try the specified backend
         if spec_sol_type == MoeSolutionType.MOE_C:
-            config = _try_get_moe_c_config(quant_type, M, E, n, block_size, K, top_k)
+            config = _try_get_moe_c_config(quant_type, M, E, n, block_size, K, top_k,
+                                           indtype=str(dtype))
         elif spec_sol_type == MoeSolutionType.ASM:
             config = _try_get_asm_config(quant_type, M, E, n, K, top_k, block_size, use_shuffle)
         elif spec_sol_type == MoeSolutionType.TRITON:
@@ -573,14 +581,14 @@ def get_aiter_moe_config(
     if quant_type == MoeQuantType.W4A16:
         if dtype == torch.float16:
             candidates = [
-                (MoeSolutionType.MOE_C, lambda: _try_get_moe_c_config(quant_type, M, E, n, block_size, K)),
+                (MoeSolutionType.MOE_C, lambda: _try_get_moe_c_config(quant_type, M, E, n, block_size, K, top_k, indtype=str(dtype))),
                 (MoeSolutionType.TRITON, lambda: _try_get_triton_config(quant_type, M, E, n, block_size, K, top_k)),
             ]
         elif dtype == torch.bfloat16:
             candidates = [
                 (MoeSolutionType.ASM, lambda: _try_get_asm_config(quant_type, M, E, n, K, top_k, block_size, use_shuffle)),
                 (MoeSolutionType.TRITON, lambda: _try_get_triton_config(quant_type, M, E, n, block_size, K, top_k)),
-                (MoeSolutionType.MOE_C, lambda: _try_get_moe_c_config(quant_type, M, E, n, block_size)),
+                (MoeSolutionType.MOE_C, lambda: _try_get_moe_c_config(quant_type, M, E, n, block_size, K, top_k, indtype=str(dtype))),
 
             ]
         else:

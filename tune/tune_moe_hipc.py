@@ -203,6 +203,16 @@ def mode(stage: int, sorting: int, family: int, bm: int, profile: int) -> int:
     return stage * 10_000_000 + sorting * 1_000_000 + family * 100_000 + (bm // 16) * 1_000 + profile
 
 
+def _detect_arch(default: str = "gfx936") -> str:
+    """gcnArchName of device 0 (honouring --device via HIP_VISIBLE_DEVICES in the environment)."""
+    try:
+        import torch
+
+        return torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+    except Exception:
+        return default
+
+
 def default_cu_for_arch(arch: Optional[str]) -> Optional[int]:
     if arch == "gfx938":
         return 72
@@ -431,7 +441,53 @@ def _describe_mode(quant: str, cand: Candidate) -> ModeDescriptor:
     )
 
 
+class RegisteredProfile(QuantProfile):
+    """Profile for a quantizer whose kernels register themselves in C++ (W4A16).
+
+    Unlike the descriptor-table profiles above it keeps no mode table: candidate modes are
+    whatever the built library registered (moe_c_w4a16_modes), the tile/BM come from the mode
+    encoding, and K/N limits are enforced by the launchers, which reject a shape a mode cannot
+    run.  GEMM1 and GEMM2 may therefore use different BMs.
+    """
+
+    independent_bm = True
+
+    def __init__(self, name: str, families: Tuple[int, ...], list_modes):
+        self.name, self.categories = name, (name,)
+        self.allowed_sorting, self.allowed_families = (1,), families
+        self.ordinary_profiles, self.descriptors = (), {}
+        self._list_modes = list_modes
+
+    @property
+    def modes_by_stage(self) -> Dict[int, Tuple[int, ...]]:
+        return {stage: tuple(self._list_modes(stage)) for stage in (1, 2)}
+
+    def descriptor(self, mode_i: int, shape: Optional[Shape] = None) -> ModeDescriptor:
+        cand = decode_mode(mode_i)
+        if mode_i not in self.candidate_modes(cand.stage):
+            raise ValueError(f"mode={mode_i} is not registered for {self.name}")
+        return ModeDescriptor(quant=self.name, mode=mode_i, stage=cand.stage, sorting=cand.sorting,
+                              family=cand.family, kernel="registered in moe_w4a16_config.h", bm=cand.bm,
+                              bn=0, bk=0, wm=0, wn=0, wk=0, stages=0, nloop=1, k_step=1)
+
+    def candidate_modes(self, stage: int) -> Tuple[int, ...]:
+        return self.modes_by_stage.get(stage, ())
+
+    def validate(self, candidate: Candidate, shape: Shape, is_bottom: bool) -> Optional[str]:
+        if candidate.stage != (2 if is_bottom else 1):
+            return f"stage={candidate.stage}, expected={2 if is_bottom else 1}"
+        return None if self.owns_mode(candidate) else f"mode={candidate.mode} is not registered for {self.name}"
+
+
+def _w4a16_registered_modes(stage: int) -> List[int]:
+    from moe_utils.moe_ops import moe_c_w4a16_modes
+
+    return moe_c_w4a16_modes(stage)
+
+
+W4A16_QUANT = "int4_w4a16"
 PROFILES: Dict[str, QuantProfile] = {
+    W4A16_QUANT: RegisteredProfile(W4A16_QUANT, (0,), _w4a16_registered_modes),
     "fp8_w8a8": QuantProfile("fp8_w8a8", ("fp8_w8a8",), (0, 1), (0, 1, 2), (201, 202, 203, 204), _w8a8_fp8_modes()),
     "int8_w8a8": QuantProfile("int8_w8a8", ("int8_w8a8",), (0,), (0, 1, 2), (201, 202, 203, 204), _w8a8_int8_modes()),
     "int8_w4a8": QuantProfile("int8_w4a8", ("int8_w4a8",), (1,), (0, 1, 2, 3), (201, 202, 203, 204), _w4a8_modes()),
@@ -1101,10 +1157,37 @@ def _best_bm_pairs(rows: List[DirectBenchRow], m: int) -> List[Dict[str, Any]]:
     return groups
 
 
+def _tune_w4a16(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """W4A16 shares this CLI and its outputs (candidate CSV, best_summary.json, tuned CSV in
+    --out-dir) but not the descriptor tables: its candidate modes come from the C++ kernel maps
+    and its kernels fix GEMM1/GEMM2 BMs independently, so tune_moe_w4a16 runs the sweep."""
+    if not args.sweep_direct:
+        parser.error("--quant int4_w4a16 only supports tuning: pass --bench-direct --sweep-direct")
+    if args.list_modes or args.perf_only or args.skip_correctness or args.sweep_config_modes or args.recommended_only:
+        parser.error("--list-modes/--perf-only/--skip-correctness/--sweep-config-modes/--recommended-only "
+                     "do not apply to int4_w4a16 (modes come from the built library; correctness is always checked)")
+    if min(args.e, args.n, args.k, args.topk, *args.m) <= 0:
+        parser.error("tuning requires positive E/N/K/topk/M")
+    from tune import tune_moe_w4a16
+
+    argv = ["--e", args.e, "--n", args.n, "--k", args.k, "--topk", args.topk,
+            "--dtype", args.dtype or "bf16", "--warmup", args.warmup, "--iters", args.iters,
+            "--out-dir", args.out_dir]
+    if args.arch_given:
+        argv += ["--arch", args.arch]
+    if args.cu_given is not None:
+        argv += ["--cu", args.cu_given]  # otherwise the tuner uses the device CU count, as the runtime does
+    if args.device is not None:
+        argv += ["--device", args.device]
+    argv += ["--m", *args.m]
+    return tune_moe_w4a16.main([str(a) for a in argv])
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--quant", choices=sorted(PROFILES), required=True)
-    parser.add_argument("--arch", default="gfx936")
+    parser.add_argument("--arch", default=None,
+                        help="default: detected from the device (gfx936 when no GPU is visible)")
     parser.add_argument("--dtype", default=None)
     parser.add_argument("--e", type=int, default=0)
     parser.add_argument("--n", type=int, default=0)
@@ -1128,10 +1211,19 @@ def main() -> int:
     parser.add_argument("--direct-child", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--direct-stage", choices=("gemm1", "gemm2"), default="gemm1", help=argparse.SUPPRESS)
     parser.add_argument("--direct-mode", type=int, default=0, help=argparse.SUPPRESS)
-    parser.add_argument("--m", nargs="+", type=int, default=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024])
+    parser.add_argument("--m", nargs="+", type=int, default=None,
+                        help="token counts (default: 1..1024, or the W4A16 list up to 16384)")
     parser.add_argument("--device", default=None)
     args = parser.parse_args()
+    args.arch_given, args.cu_given = args.arch is not None, args.cu
+    if args.device is not None:
+        os.environ["HIP_VISIBLE_DEVICES"] = str(args.device)  # before CUDA initialises
+    args.arch = args.arch or _detect_arch()
     args.cu = resolve_cu(args.arch, args.cu)
+    if args.m is None:
+        args.m = [1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 6144, 8192, 16384] if args.quant == W4A16_QUANT else [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
+    if args.quant == W4A16_QUANT:
+        return _tune_w4a16(args, parser)
 
     if args.list_modes:
         profile = PROFILES[args.quant]
