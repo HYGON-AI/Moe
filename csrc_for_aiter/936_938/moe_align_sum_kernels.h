@@ -621,6 +621,181 @@ namespace moe_c
     }
   }
 
+  // Last-block part of the multi-block sgl align: padded exclusive scan of counts (block_size
+  // padding per expert) into sh[0..num_experts] and seg_start, num_tokens_post_pad and expert_ids.
+  // 256 threads, num_experts <= 1024.
+  __device__ __forceinline__ void sgl_moe_align_padded_scan(const int32_t *__restrict__ counts, int32_t *sh,
+                                                            int32_t *wsum, int32_t *__restrict__ seg_start,
+                                                            int32_t *__restrict__ expert_ids,
+                                                            int32_t *__restrict__ total_tokens_post_pad,
+                                                            int32_t num_experts, int32_t block_size,
+                                                            int32_t max_num_tokens_padded)
+  {
+    constexpr int NT = 256;
+    constexpr int PER = 4; // experts per thread: num_experts <= NT * PER
+    const int tid = threadIdx.x;
+    int v[PER], local = 0;
+#pragma unroll
+    for (int j = 0; j < PER; j++)
+    {
+      const int e = tid * PER + j;
+      v[j] = e < num_experts ? CEILDIV(__atomic_load_n(&counts[e], __ATOMIC_RELAXED), block_size) * block_size : 0;
+      local += v[j];
+    }
+    const int lane = tid & 63, wid = tid >> 6;
+    int x = local;
+#pragma unroll
+    for (int o = 1; o < 64; o <<= 1)
+    {
+      const int y = __shfl_up(x, o, 64);
+      if (lane >= o)
+        x += y;
+    }
+    if (lane == 63)
+      wsum[wid] = x;
+    __syncthreads();
+    int run = x - local;
+    for (int w = 0; w < wid; w++)
+      run += wsum[w];
+#pragma unroll
+    for (int j = 0; j < PER; j++)
+    {
+      const int e = tid * PER + j;
+      if (e < num_experts)
+        sh[e] = run;
+      run += v[j];
+    }
+    if (tid == NT - 1)
+      sh[num_experts] = run;
+    __syncthreads();
+    for (int i = tid; i <= num_experts; i += NT)
+      seg_start[i] = sh[i];
+    const int total = sh[num_experts];
+    if (tid == 0)
+      *total_tokens_post_pad = total;
+    // expert_ids: each thread writes the blocks of its experts, then the tail blocks are zeroed
+    const int num_blocks = total / block_size;
+    const int max_m_blocks = CEILDIV(max_num_tokens_padded, block_size);
+    for (int e = tid; e < num_experts; e += NT)
+      for (int i = sh[e] / block_size; i < sh[e + 1] / block_size; i++)
+        expert_ids[i] = e;
+    for (int i = num_blocks + tid; i < max_m_blocks; i += NT)
+      expert_ids[i] = 0;
+    __syncthreads(); // sh / wsum are reused by a second scan
+  }
+
+  // Multi-block sgl align (replaces the single counting block of sgl_moe_align_block_size_kernel).
+  // Every block histograms a slice of topk_ids in LDS (one global atomic per expert) and fills its
+  // slice of the sorted_token_ids padding; the last block to finish does the padded scan(s).  DUAL
+  // builds a second routing with block size block_size2 from the same counts (same slot order inside
+  // every expert segment).  Valid experts are [0, num_experts), anything else (e.g. -1) is skipped.
+  //   single: buf = counts[E] | cumsum[E + 1] | done[1]                 (cumsum = scatter cursor)
+  //   dual:   buf = counts[E] | rank[E] | seg[E + 1] | seg2[E + 1] | done[1]
+  // buf is zeroed by the caller.
+  template <typename scalar_t, bool DUAL>
+  __global__ void __launch_bounds__(256) sgl_moe_align_count_scan_kernel(
+      const scalar_t *__restrict__ topk_ids, int32_t *__restrict__ buf, int32_t *__restrict__ sorted_token_ids,
+      int32_t *__restrict__ expert_ids, int32_t *__restrict__ total_tokens_post_pad, int32_t num_experts,
+      int32_t block_size, size_t numel, int32_t max_num_tokens_padded, int32_t *__restrict__ sorted_token_ids2,
+      int32_t *__restrict__ expert_ids2, int32_t *__restrict__ total_tokens_post_pad2, int32_t block_size2,
+      int32_t max_num_tokens_padded2)
+  {
+    constexpr int NT = 256;
+    extern __shared__ int32_t sh[]; // histogram, then padded prefix [num_experts + 1]
+    __shared__ int32_t wsum[NT / 64];
+    __shared__ bool last;
+    int32_t *counts = buf;
+    int32_t *seg = DUAL ? buf + 2 * num_experts : buf + num_experts;
+    int32_t *seg2 = buf + 3 * num_experts + 1;
+    int32_t *done = DUAL ? buf + 4 * num_experts + 2 : buf + 2 * num_experts + 1;
+    const int tid = threadIdx.x;
+
+    for (int i = tid; i < num_experts; i += NT)
+      sh[i] = 0;
+    __syncthreads();
+    const size_t stride = (size_t)gridDim.x * NT;
+    for (size_t i = (size_t)blockIdx.x * NT + tid; i < numel; i += stride)
+    {
+      const int32_t e = static_cast<int32_t>(topk_ids[i]);
+      if (e >= 0 && e < num_experts)
+        atomicAdd(&sh[e], 1);
+    }
+    for (size_t i = (size_t)blockIdx.x * NT + tid; i < (size_t)max_num_tokens_padded; i += stride)
+      sorted_token_ids[i] = static_cast<int32_t>(numel);
+    if constexpr (DUAL)
+      for (size_t i = (size_t)blockIdx.x * NT + tid; i < (size_t)max_num_tokens_padded2; i += stride)
+        sorted_token_ids2[i] = static_cast<int32_t>(numel);
+    __syncthreads();
+    for (int i = tid; i < num_experts; i += NT)
+      if (sh[i])
+        atomicAdd(&counts[i], sh[i]);
+    __threadfence();
+    __syncthreads();
+    if (tid == 0)
+      last = atomicAdd(done, 1) == (int)gridDim.x - 1;
+    __syncthreads();
+    if (!last)
+      return;
+    __threadfence();
+    sgl_moe_align_padded_scan(counts, sh, wsum, seg, expert_ids, total_tokens_post_pad, num_experts, block_size,
+                              max_num_tokens_padded);
+    if constexpr (DUAL)
+      sgl_moe_align_padded_scan(counts, sh, wsum, seg2, expert_ids2, total_tokens_post_pad2, num_experts,
+                                block_size2, max_num_tokens_padded2);
+  }
+
+  // Scatter for the multi-block align: each block takes PER * 256 consecutive slots, ranks them per
+  // expert with LDS atomics and reserves its range of every expert segment with one global atomic
+  // (on the cursor `cumsum`, or for DUAL on rank[] with the slot written to both routings at
+  // seg[e] + rank and seg2[e] + rank).
+  template <typename scalar_t, int PER, bool DUAL>
+  __global__ void __launch_bounds__(256) sgl_moe_align_scatter_kernel(const scalar_t *__restrict__ topk_ids,
+                                                                      int32_t *__restrict__ sorted_token_ids,
+                                                                      int32_t *__restrict__ buf, int32_t num_experts,
+                                                                      size_t numel,
+                                                                      int32_t *__restrict__ sorted_token_ids2)
+  {
+    constexpr int NT = 256;
+    extern __shared__ int32_t sh[]; // per-expert count, then the block's base in the segment
+    int32_t *cursor = buf + num_experts; // rank[] (dual) or cumsum[] (single)
+    const int32_t *seg = buf + 2 * num_experts;
+    const int32_t *seg2 = buf + 3 * num_experts + 1;
+    for (int i = threadIdx.x; i < num_experts; i += NT)
+      sh[i] = 0;
+    __syncthreads();
+    const size_t base = (size_t)blockIdx.x * NT * PER;
+    int32_t ex[PER], rk[PER];
+#pragma unroll
+    for (int j = 0; j < PER; j++)
+    {
+      const size_t i = base + (size_t)j * NT + threadIdx.x;
+      ex[j] = i < numel ? static_cast<int32_t>(topk_ids[i]) : -1;
+      rk[j] = (ex[j] >= 0 && ex[j] < num_experts) ? atomicAdd(&sh[ex[j]], 1) : 0;
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < num_experts; i += NT)
+      sh[i] = sh[i] ? atomicAdd(&cursor[i], sh[i]) : 0;
+    __syncthreads();
+#pragma unroll
+    for (int j = 0; j < PER; j++)
+    {
+      const size_t i = base + (size_t)j * NT + threadIdx.x;
+      if (ex[j] >= 0 && ex[j] < num_experts)
+      {
+        const int32_t r = sh[ex[j]] + rk[j];
+        if constexpr (DUAL)
+        {
+          sorted_token_ids[seg[ex[j]] + r] = static_cast<int32_t>(i);
+          sorted_token_ids2[seg2[ex[j]] + r] = static_cast<int32_t>(i);
+        }
+        else
+        {
+          sorted_token_ids[r] = static_cast<int32_t>(i);
+        }
+      }
+    }
+  }
+
   template <typename scalar_t>
   __global__ void sgl_moe_token_sort_kernel(scalar_t *__restrict__ topk_ids,
                                             int32_t *sorted_token_ids,
@@ -997,50 +1172,104 @@ void moe_c_moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts,
   }
 }
 
+// scatter launch for PER slots per thread (1, 2, 4, 8 or 16)
+template <typename scalar_t, bool DUAL>
+static void moe_c_sgl_align_scatter(int per, int blocks, int threads, size_t lds, cudaStream_t stream,
+                                    const scalar_t *ids, int32_t *sorted, int32_t *buf, int32_t ne, size_t numel,
+                                    int32_t *sorted2)
+{
+  if (per == 16)
+    moe_c::sgl_moe_align_scatter_kernel<scalar_t, 16, DUAL><<<blocks, threads, lds, stream>>>(ids, sorted, buf, ne, numel, sorted2);
+  else if (per == 8)
+    moe_c::sgl_moe_align_scatter_kernel<scalar_t, 8, DUAL><<<blocks, threads, lds, stream>>>(ids, sorted, buf, ne, numel, sorted2);
+  else if (per == 4)
+    moe_c::sgl_moe_align_scatter_kernel<scalar_t, 4, DUAL><<<blocks, threads, lds, stream>>>(ids, sorted, buf, ne, numel, sorted2);
+  else if (per == 2)
+    moe_c::sgl_moe_align_scatter_kernel<scalar_t, 2, DUAL><<<blocks, threads, lds, stream>>>(ids, sorted, buf, ne, numel, sorted2);
+  else
+    moe_c::sgl_moe_align_scatter_kernel<scalar_t, 1, DUAL><<<blocks, threads, lds, stream>>>(ids, sorted, buf, ne, numel, sorted2);
+}
+
+// Multi-block sgl align; sorted_token_ids2 != nullptr also builds the block_size2 routing (dual).
+template <typename scalar_t>
+static void moe_c_sgl_align_launch(const torch::Tensor &topk_ids, int64_t num_experts, int64_t block_size,
+                                   torch::Tensor &sorted_token_ids, torch::Tensor &experts_ids,
+                                   torch::Tensor &num_tokens_post_pad, int64_t block_size2,
+                                   torch::Tensor *sorted_token_ids2, torch::Tensor *experts_ids2,
+                                   torch::Tensor *num_tokens_post_pad2)
+{
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const bool dual = sorted_token_ids2 != nullptr;
+  auto options_int = torch::TensorOptions().dtype(torch::kInt).device(topk_ids.device());
+  torch::Tensor buf = torch::zeros({(dual ? 4 : 2) * num_experts + (dual ? 3 : 2)}, options_int);
+  const size_t numel = topk_ids.numel();
+  const int64_t max_pad = sorted_token_ids.numel();
+  const int64_t max_pad2 = dual ? sorted_token_ids2->numel() : 0;
+  const int threads = 256;
+  const int64_t work = std::max<int64_t>({(int64_t)numel, max_pad, max_pad2});
+  const int count_blocks = (int)std::max<int64_t>(1, std::min<int64_t>(CEILDIV(work, threads * 4), 160));
+  const int32_t ne = static_cast<int32_t>(num_experts);
+  auto ids = topk_ids.data_ptr<scalar_t>();
+  int32_t *sorted2 = dual ? sorted_token_ids2->data_ptr<int32_t>() : nullptr;
+  int32_t *eids2 = dual ? experts_ids2->data_ptr<int32_t>() : nullptr;
+  int32_t *ntp2 = dual ? num_tokens_post_pad2->data_ptr<int32_t>() : nullptr;
+  if (dual)
+    moe_c::sgl_moe_align_count_scan_kernel<scalar_t, true><<<count_blocks, threads, (num_experts + 1) * sizeof(int32_t), stream>>>(
+        ids, buf.data_ptr<int32_t>(), sorted_token_ids.data_ptr<int32_t>(), experts_ids.data_ptr<int32_t>(),
+        num_tokens_post_pad.data_ptr<int32_t>(), ne, static_cast<int32_t>(block_size), numel,
+        static_cast<int32_t>(max_pad), sorted2, eids2, ntp2, static_cast<int32_t>(block_size2),
+        static_cast<int32_t>(max_pad2));
+  else
+    moe_c::sgl_moe_align_count_scan_kernel<scalar_t, false><<<count_blocks, threads, (num_experts + 1) * sizeof(int32_t), stream>>>(
+        ids, buf.data_ptr<int32_t>(), sorted_token_ids.data_ptr<int32_t>(), experts_ids.data_ptr<int32_t>(),
+        num_tokens_post_pad.data_ptr<int32_t>(), ne, static_cast<int32_t>(block_size), numel,
+        static_cast<int32_t>(max_pad), sorted2, eids2, ntp2, static_cast<int32_t>(block_size2),
+        static_cast<int32_t>(max_pad2));
+  if (numel == 0)
+    return;
+  // slots per scatter thread: as many as possible while keeping >= 160 blocks
+  const size_t per_block = threads * 160;
+  const int per = numel >= per_block * 16 ? 16 : numel >= per_block * 8 ? 8 : numel >= per_block * 4 ? 4
+                                                 : numel >= per_block * 2 ? 2 : 1;
+  const int scatter_blocks = (int)CEILDIV(numel, (size_t)threads * per);
+  const size_t lds = num_experts * sizeof(int32_t);
+  auto sorted = sorted_token_ids.data_ptr<int32_t>();
+  auto b = buf.data_ptr<int32_t>();
+  if (dual)
+    moe_c_sgl_align_scatter<scalar_t, true>(per, scatter_blocks, threads, lds, stream, ids, sorted, b, ne, numel, sorted2);
+  else
+    moe_c_sgl_align_scatter<scalar_t, false>(per, scatter_blocks, threads, lds, stream, ids, sorted, b, ne, numel, sorted2);
+}
+
 void moe_c_sgl_moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts,
                                     int64_t block_size,
                                     torch::Tensor sorted_token_ids,
                                     torch::Tensor experts_ids,
                                     torch::Tensor num_tokens_post_pad)
 {
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  TORCH_CHECK(num_experts == 256 || num_experts == 896,
-              "sgl_moe_align_block_size kernel only supports 256 or 896 experts.");
-
+  TORCH_CHECK(num_experts == 256 || num_experts == 384 || num_experts == 896,
+              "sgl_moe_align_block_size kernel only supports 256, 384 or 896 experts.");
   MOE_DISPATCH_INTEGRAL_TYPES(
       topk_ids.scalar_type(), "sgl_moe_align_block_size_kernel", [&]
-      {
-        // calc needed amount of shared mem for `cumsum` tensors
-        auto options_int =
-            torch::TensorOptions().dtype(torch::kInt).device(topk_ids.device());
-        torch::Tensor cumsum_buffer =
-            torch::zeros({num_experts + 1}, options_int);
-        const int threads = 1024;
-        const int scan_size = moe_c::next_pow2(static_cast<uint32_t>(num_experts));
-        const int64_t max_num_tokens_padded = sorted_token_ids.numel();
-        const size_t shared_mem_size =
-            (num_experts + (num_experts + 1) + scan_size) *
-            sizeof(int32_t);
+      { moe_c_sgl_align_launch<scalar_t>(topk_ids, num_experts, block_size, sorted_token_ids, experts_ids,
+                                         num_tokens_post_pad, 0, nullptr, nullptr, nullptr); });
+}
 
-        auto align_kernel =
-            moe_c::sgl_moe_align_block_size_kernel<scalar_t>;
-        align_kernel<<<2, threads, shared_mem_size, stream>>>(
-            topk_ids.data_ptr<scalar_t>(), sorted_token_ids.data_ptr<int32_t>(),
-            experts_ids.data_ptr<int32_t>(),
-            num_tokens_post_pad.data_ptr<int32_t>(),
-            static_cast<int32_t>(num_experts), block_size,
-            topk_ids.numel(), cumsum_buffer.data_ptr<int32_t>(), true,
-            scan_size, static_cast<int32_t>(max_num_tokens_padded));
-
-        const int block_threads = 256;
-        const int num_blocks =
-            (topk_ids.numel() + block_threads - 1) / block_threads;
-        const int max_blocks = 65535;
-        const int actual_blocks = std::min(num_blocks, max_blocks);
-        auto sort_kernel = moe_c::sgl_moe_token_sort_kernel<scalar_t>;
-        sort_kernel<<<actual_blocks, block_threads, 0, stream>>>(
-            topk_ids.data_ptr<scalar_t>(), sorted_token_ids.data_ptr<int32_t>(),
-            cumsum_buffer.data_ptr<int32_t>(), topk_ids.numel()); });
+// Two routings of the same topk_ids (block_size and block_size2) in one pass, e.g. a BM128 gemm1
+// and a BM64 gemm2.  Inside every expert segment both list the slots in the same order.
+void moe_c_sgl_moe_align_block_size_dual(torch::Tensor topk_ids, int64_t num_experts,
+                                         int64_t block_size, torch::Tensor sorted_token_ids,
+                                         torch::Tensor experts_ids, torch::Tensor num_tokens_post_pad,
+                                         int64_t block_size2, torch::Tensor sorted_token_ids2,
+                                         torch::Tensor experts_ids2, torch::Tensor num_tokens_post_pad2)
+{
+  TORCH_CHECK(num_experts == 256 || num_experts == 384 || num_experts == 896,
+              "sgl_moe_align_block_size_dual kernel only supports 256, 384 or 896 experts.");
+  MOE_DISPATCH_INTEGRAL_TYPES(
+      topk_ids.scalar_type(), "sgl_moe_align_block_size_dual_kernel", [&]
+      { moe_c_sgl_align_launch<scalar_t>(topk_ids, num_experts, block_size, sorted_token_ids, experts_ids,
+                                         num_tokens_post_pad, block_size2, &sorted_token_ids2, &experts_ids2,
+                                         &num_tokens_post_pad2); });
 }
 
 void moe_c_moe_sum(torch::Tensor &input,   // [num_tokens, topk, hidden_size]

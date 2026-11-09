@@ -46,6 +46,17 @@ TORCH_LIBRARY_FRAGMENT(moe_wna16, m) {
       torch::kCUDA,
       &moe_c_sgl_moe_align_block_size);
 
+  m.def(
+      "sgl_moe_align_block_size_dual("
+      "Tensor topk_ids, int num_experts, int block_size, "
+      "Tensor sorted_token_ids, Tensor experts_ids, Tensor num_tokens_post_pad, "
+      "int block_size2, Tensor sorted_token_ids2, Tensor experts_ids2, "
+      "Tensor num_tokens_post_pad2) -> ()");
+  m.impl(
+      "sgl_moe_align_block_size_dual",
+      torch::kCUDA,
+      &moe_c_sgl_moe_align_block_size_dual);
+
   m.def("moe_sum(Tensor input, Tensor output, Tensor topk_ids) -> ()");
   m.impl("moe_sum", torch::kCUDA, &moe_c_moe_sum);
 

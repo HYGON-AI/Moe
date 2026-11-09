@@ -423,10 +423,10 @@ if __name__ == "__main__":
                              "package; auto: aiter picks by priority")
     parser.add_argument("--e", type=int, default=256)
     parser.add_argument("--n", type=int, default=256, help="intermediate size")
-    parser.add_argument("--k", type=int, default=4096, help="model dim")
+    parser.add_argument("--k", type=int, default=2048, help="model dim")
     parser.add_argument("--topk", type=int, default=8)
     parser.add_argument("--tokens", "--m", nargs="+", type=int,
-                        default=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384])
+                        default=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 30720])
     parser.add_argument("--group_size", type=int, default=32)
     parser.add_argument("--has_zp", action="store_true", default=False)
     parser.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")

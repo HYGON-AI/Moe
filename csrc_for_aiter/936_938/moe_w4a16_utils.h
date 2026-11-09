@@ -426,7 +426,8 @@ __forceinline__ __device__ void gemm_nt_w4a16_stage1_b128_k64_marlinS_scale_ldx(
             __bf16 *p_tmp = (__bf16 *)&scale_reg;
             int32_t scale_iter = it_in / BLOCK_K;
             scale_iter = (scale_iter % 2) * (PACK_SCALES / 2) + (scale_iter / 2);
-            Element f_scale = scale_reg[it_in / BLOCK_K];
+            // Both FP16 and BF16 use the same interleaved Marlin scale layout.
+            Element f_scale = scale_reg[scale_iter];
             __bf16 bf_tmp = p_tmp[scale_iter];
             using __bf16x2 = __attribute__((__vector_size__(2 * sizeof(__bf16)))) __bf16;
             __bf16x2 bf2_tmp = {bf_tmp, bf_tmp};
@@ -451,7 +452,9 @@ __forceinline__ __device__ void gemm_nt_w4a16_stage1_b128_k64_marlinS_scale_ldx(
                 int32_t basic_row_a = g2r_a_row_id + i * G2R_A_ROWS;
                 int32_t basic_col_a = g2r_a_col_id;
                 int swizzled_col_a = (basic_row_a + basic_col_a) % G2R_A_COLS;
-                if constexpr (!DEQUANT_16BIT)
+                // FP16 dequant<half2, 4> returns K in (0,4,1,5,2,6,3,7)
+                // order even on gfx936. Match A to B, as the two-stage path does.
+                if constexpr (!DEQUANT_16BIT && std::is_same_v<Element, __hip_bfloat16>)
                 {
                     *reinterpret_cast<vec8_Element<Element> *>(&lds_A[basic_row_a * BLOCK_K + swizzled_col_a * ELEMENTS_PER_LD_A]) = a_val[i];
                 }

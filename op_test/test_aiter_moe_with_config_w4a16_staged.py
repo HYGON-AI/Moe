@@ -35,6 +35,9 @@ def build_case(m: int, args, dtype: torch.dtype):
     if cfg.need_shuffle_scale:
         data["w1_scales"], data["w2_scales"] = ref.aiter_moe_shfl_scale(
             data["w1_scales"], data["w2_scales"], cfg)
+    routing_dtype = {"fp32": torch.float32, "fp16": torch.float16,
+                     "bf16": torch.bfloat16}[getattr(args, "routing_dtype", "fp32")]
+    data["topk_weights"] = data["topk_weights"].to(routing_dtype)
 
     def run() -> torch.Tensor:
         return ref.aiter_moe(
@@ -64,15 +67,18 @@ def run_case(m: int, args) -> Dict[str, Any]:
     row = sc.measure(run, warmup=args.warmup, iters=args.iters,
                      check=None if args.no_check else check, test_graph=False)
     row.update(m=m, MODE=int(cfg.config["MODE"]),
-               BLOCK_SIZE_M=int(cfg.config["BLOCK_SIZE_M"]))
+               BLOCK_SIZE_M=int(cfg.config["BLOCK_SIZE_M"]),
+               routing_dtype=getattr(args, "routing_dtype", "fp32"))
     return row
 
 
 def main() -> None:
     parser = sc.base_parser("Profile standalone W4A16 MoE stages",
-                            e=384, n=256, k=7168, iters=50)
+                            e=256, n=256, k=4096, iters=50)
     parser.add_argument("--group-size", type=int, default=32)
     parser.add_argument("--has-zp", action="store_true")
+    parser.add_argument("--routing-dtype", choices=("fp32", "fp16", "bf16"), default="fp32",
+                        help="dtype of topk_weights; independent of activation --dtype")
     args = parser.parse_args()
     args.build_dir = sc.select_build_dir(args.build_dir, ["libmoe_w4a16.so"])
     sc.run_sweep(args, lambda m: run_case(m, args))

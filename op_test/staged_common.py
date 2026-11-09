@@ -60,7 +60,7 @@ _KERNEL_RULES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("routing", ("moe_align", "token_sort", "moe_sorting", "moesorting",
                  "fillfunctor")),
     ("quant", ("per_token_quant", "per_token_scaled_quant")),
-    ("gemm", ("moe_w4a8", "moe_w8a8", "gemm_nt_", "marlin")),
+    ("gemm", ("moe_w4a8", "moe_w8a8", "moe_w4a16_prefill", "gemm_nt_", "marlin")),
     ("activation", ("glu_kernel", "silu")),
     ("sum", ("moe_sum",)),
 )
@@ -98,11 +98,15 @@ def profile_stages(
 
     totals = {name: 0.0 for name in STAGE_NAMES}
     unknown: List[str] = []
-    quant_seen = gemm_seen = 0
+    quant_seen = gemm_seen = sum_seen = 0
     for event in kernels:
         stage = classify_kernel(event.name)
-        if stage == "routing" and gemm_seen:
-            quant_seen = gemm_seen = 0  # routing after the GEMMs starts a new call
+        # routing after both GEMMs (or the sum) starts a new call; routing between the GEMMs is
+        # gemm2's own block alignment (W4A16 BM128 gemm1 + BM64 gemm2)
+        if stage == "routing" and (gemm_seen >= 2 or sum_seen):
+            quant_seen = gemm_seen = sum_seen = 0
+        if stage == "sum":
+            sum_seen = 1
         if stage == "quant":
             quant_seen += 1
             stage = "quant1" if quant_seen == 1 else "quant2"
