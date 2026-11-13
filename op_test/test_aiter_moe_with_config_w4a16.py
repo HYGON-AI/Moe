@@ -3,6 +3,7 @@
 
 # Test for get_aiter_moe_config_w4a16 and aiter_moe_w4a16
 
+import argparse
 import torch
 import sys
 from pathlib import Path
@@ -23,9 +24,57 @@ from moe_utils.moe import (
     MoeQuantType,
     AiterMoeConfig,
 )
-from moe_utils.moe import w4a16_marlin_weight_1, w4a16_marlin_weight_2
 
 torch.set_default_device("cuda")
+
+# Solution-type strings are shared by moe_utils and aiter.moe.
+SOL_MOE_C = MoeSolutionType.MOE_C  # "moe_c"
+SOL_ASM = "asm"
+SOL_TRITON = "triton"
+
+# --backend value -> spec_sol_type passed to get_aiter_moe_config (None = auto).
+BACKEND_CHOICES = {
+    "moe-c": SOL_MOE_C,
+    "asm": SOL_ASM,
+    "triton": SOL_TRITON,
+    "auto": None,
+}
+
+
+class _MoeApi:
+    """The get-config / run / scale-shuffle entry points of one implementation."""
+
+    def __init__(self, get_config, run, shfl_scale):
+        self.get_aiter_moe_config = get_config
+        self.aiter_moe = run
+        self.aiter_moe_shfl_scale = shfl_scale
+
+
+def _moe_api(backend):
+    """moe_c runs through the standalone ``moe_utils``; ASM / Triton (and auto,
+    which may resolve to either) only exist in the ``aiter`` package, so it is
+    imported lazily and the default moe-c run does not depend on it."""
+    if backend == SOL_MOE_C:
+        return _MoeApi(get_aiter_moe_config, aiter_moe, aiter_moe_shfl_scale)
+    try:
+        from aiter import moe as aiter_moe_mod
+    except ImportError as exc:
+        raise RuntimeError(
+            f"backend={backend or 'auto'} needs the aiter package (aiter.moe), "
+            f"which could not be imported: {exc}") from exc
+    return _MoeApi(aiter_moe_mod.get_aiter_moe_config, aiter_moe_mod.aiter_moe,
+                   aiter_moe_mod.aiter_moe_shfl_scale)
+
+
+def _unsupported_reason(backend, dtype, has_zp):
+    """Combinations whose config lookup succeeds but whose kernel cannot run them."""
+    if backend == SOL_MOE_C and has_zp:
+        # The moe_c W4A16 kernels hard-code the zero point to 8 and ignore qzeros.
+        return "moe_c only supports symmetric weights (no zero points)"
+    if backend == SOL_ASM and dtype != torch.bfloat16:
+        # asm_fmoe_stage1 raises "unsupport current input type" for fp16.
+        return "asm W4A16 only supports bf16 activations"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -39,7 +88,9 @@ def _quantize_w4a16_weights(w_fp, group_size, has_zp, pack_for_backend):
         w_fp: Floating-point weight ``[out_features, in_features]``.
         group_size: Quantization group size along K.
         has_zp: Whether to produce zero-points.
-        pack_for_backend: currently ``"moe_c"`` in this standalone repository.
+        pack_for_backend: ``"moe_c"`` / ``"asm"`` / ``"triton"``; decides the
+            qzero packing: ASM packs two groups per byte along K/group,
+            moe_c and Triton pack two output rows per byte along N.
 
     Returns:
         (weight_ref, qweight, scales, qzeros_or_None)
@@ -56,7 +107,12 @@ def _quantize_w4a16_weights(w_fp, group_size, has_zp, pack_for_backend):
 
     qweight = qweight[:, 1::2] * 16 + qweight[:, ::2]
     if has_zp:
-        qzeros = qzeros[1::2, :] * 16 + qzeros[::2, :]
+        if pack_for_backend == SOL_ASM:
+            qzeros = qzeros[:, 1::2] * 16 + qzeros[:, ::2]
+        elif pack_for_backend in (SOL_MOE_C, SOL_TRITON):
+            qzeros = qzeros[1::2, :] * 16 + qzeros[::2, :]
+        else:
+            raise ValueError(f"unsupported W4A16 zero-point backend: {pack_for_backend}")
 
     return weight, qweight, scales, qzeros if has_zp else None
 
@@ -85,22 +141,26 @@ def prepare_w4a16_inputs(m, k, n, e, topk, group_size, has_zp, dtype,
     w2_scales = torch.empty((e, k, n // group_size), device="cuda",
                             dtype=dtype)
 
-    if has_zp:
+    # ASM packs qzeros along K/group, moe_c / Triton along N.
+    if backend == SOL_ASM:
+        w1_qzeros = torch.empty(
+            (e, 2 * n, k // group_size // pack_factor), device="cuda",
+            dtype=torch.uint8)
+        w2_qzeros = torch.empty(
+            (e, k, n // group_size // pack_factor), device="cuda",
+            dtype=torch.uint8)
+    else:
         w1_qzeros = torch.empty(
             (e, 2 * n // pack_factor, k // group_size), device="cuda",
             dtype=torch.uint8)
         w2_qzeros = torch.empty(
             (e, k // pack_factor, n // group_size), device="cuda",
             dtype=torch.uint8)
-    else:
-        # w1_qzeros = None
-        # w2_qzeros = None
-        w1_qzeros = torch.empty(
-                (e, 2 * n // pack_factor, k // group_size), device="cuda",
-                dtype=torch.uint8)
-        w2_qzeros = torch.empty(
-            (e, k // pack_factor, n // group_size), device="cuda",
-            dtype=torch.uint8)
+    if not has_zp:
+        # The native entry points require a qzero tensor even for symmetric
+        # W4A16.  Encode the midpoint (8) in both nibbles.
+        w1_qzeros.fill_(0x88)
+        w2_qzeros.fill_(0x88)
 
     w1_ref = w1_fp.clone()
     w2_ref = w2_fp.clone()
@@ -121,27 +181,10 @@ def prepare_w4a16_inputs(m, k, n, e, topk, group_size, has_zp, dtype,
         if has_zp and w_zp is not None:
             w_zp[expert_id] = qzeros
 
-    # For moe_c backend, apply marlin weight shuffle
-    if backend == "moe_c":
-        # w1_qweight_final = w4a16_marlin_weight_1(w1_qweight)
-        # w2_qweight_final = w4a16_marlin_weight_2(w2_qweight)
-        # w1_qweight_final = w1_qweight_final.view(-1).view(
-        #     torch.uint8).view(*w1_qweight.shape)
-        # w2_qweight_final = w2_qweight_final.view(-1).view(
-        #     torch.uint8).view(*w2_qweight.shape)
-        if config.need_shuffle_scale:
-            w1_scales, w2_scales = aiter_moe_shfl_scale(w1_scales,w2_scales,config)
-        # pmt_factor = 4
-        # pmt_factor2 = 4
-        # w1_scales_tm = w1_scales.reshape(e,2*n,(k // group_size // pmt_factor),pmt_factor).transpose(2,3).contiguous()
-        # w1_scales = w1_scales_tm.reshape(e,2*n,k // group_size)
-        # w2_scales_tm = w2_scales.reshape(e,k,(n // group_size // pmt_factor2),pmt_factor2).transpose(2,3).contiguous()
-        # w2_scales = w2_scales_tm.reshape(e,k,n // group_size)
-        w1_qweight_final = w1_qweight
-        w2_qweight_final = w2_qweight
-    else:
-        w1_qweight_final = w1_qweight
-        w2_qweight_final = w2_qweight
+    # Both the BW reference test and the active MOE_C MODE=4/2 kernel use
+    # canonical packed qweights.  Only the scale layout is backend-configured.
+    w1_qweight_final = w1_qweight
+    w2_qweight_final = w2_qweight
 
     topk_weights, topk_ids = fused_topk(input_tensor, score, topk, True)
 
@@ -165,25 +208,27 @@ def prepare_w4a16_inputs(m, k, n, e, topk, group_size, has_zp, dtype,
 # Test: get_aiter_moe_config (w4a16)
 # ---------------------------------------------------------------------------
 
-def test_get_config(m, k, n, e, topk, group_size, dtype):
-    """Test that get_aiter_moe_config returns a valid w4a16 config or
-    gracefully reports no-solution."""
+def test_get_config(m, k, n, e, topk, group_size, dtype, backend=SOL_MOE_C):
+    """Test that the W4A16 config of ``backend`` (None = auto) is available."""
     N1 = 2 * n  # gate + up
     N2 = k      # down / hidden_size
     K = k       # model dimension (uncompressed)
 
-    status, moe_cfg = get_aiter_moe_config(
+    status, moe_cfg = _moe_api(backend).get_aiter_moe_config(
         M=m, E=e, N1=N1, N2=N2, K=K,
         top_k=topk, block_size=group_size, dtype=dtype,
         quant_type=MoeQuantType.W4A16,
+        spec_sol_type=backend,
     )
 
     if status:
-        assert moe_cfg.solution_type is not None, \
-            "status=True but solution_type is None"
+        if backend is not None:
+            assert moe_cfg.solution_type == backend, (
+                f"requested backend {backend}, "
+                f"got {moe_cfg.solution_type}"
+            )
         assert moe_cfg.config is not None, \
             "status=True but config is None"
-        assert moe_cfg.solution_type == MoeSolutionType.MOE_C, f"Unexpected solution_type: {moe_cfg.solution_type}"
         assert moe_cfg.quant_type == MoeQuantType.W4A16
         logger.info(
             f"[get_config_w4a16] {m=}, {N1=}, {N2=}, {K=}, {e=}, {topk=}, "
@@ -230,45 +275,71 @@ def _run_aiter_moe_perf(hidden_states,
         global_num_experts,
         expert_map,
         routed_scaling_factor,
-        activation):
+        activation,
+        moe_fn=None):
 
         if inplace:
             mortal_input = hidden_states.clone()  # 保证inplace操作的正确性
         else:
             mortal_input = hidden_states
 
-        return aiter_moe(mortal_input, w1, w2, topk_weights, topk_ids, moe_config, inplace, activation, w1_scale, w2_scale, w1_zp, w2_zp, 
+        return (moe_fn or aiter_moe)(mortal_input, w1, w2, topk_weights, topk_ids, moe_config, inplace, activation, w1_scale, w2_scale, w1_zp, w2_zp,
                      a1_scale, a2_scale, block_shape, global_num_experts, expert_map, routed_scaling_factor, output_dtype=hidden_states.dtype)
 
 
-def test_aiter_moe_w4a16(m, k, n, e, topk, group_size, has_zp, dtype, inplace, routed_scaling_factor):
+def test_aiter_moe_w4a16(m, k, n, e, topk, group_size, has_zp, dtype, inplace, routed_scaling_factor,
+                         backend=SOL_MOE_C):
     """End-to-end: get config -> run aiter_moe -> compare with torch
-    reference."""
+    reference.  ``backend`` is moe_c / asm / triton, or None for auto."""
     N1 = 2 * n
     N2 = k
     K = k
 
-    status, moe_cfg = get_aiter_moe_config(
+    api = _moe_api(backend)
+    status, moe_cfg = api.get_aiter_moe_config(
         M=m, E=e, N1=N1, N2=N2, K=K,
         top_k=topk, block_size=group_size, dtype=dtype,
         quant_type=MoeQuantType.W4A16,
+        spec_sol_type=backend,
     )
 
     if not status:
         logger.info(
             f"[aiter_moe_w4a16] SKIP {m=}, {N1=}, {N2=}, {K=}, {e=}, {topk=}: "
-            f"no backend available"
+            f"no {backend or 'auto'} backend available"
         )
         return None
 
+    if backend is not None:
+        assert moe_cfg.solution_type == backend, (
+            f"requested backend {backend}, got {moe_cfg.solution_type}"
+        )
     backend = moe_cfg.solution_type
-    logger.info(
-        f"[aiter_moe_w4a16] {m=}, {N1=}, {N2=}, {K=}, {e=}, {topk=}, "
-        f"backend={backend}"
+    reason = _unsupported_reason(backend, dtype, has_zp)
+    if reason:
+        logger.info(f"[aiter_moe_w4a16] SKIP {m=}, backend={backend}: {reason}")
+        return None
+    # The weights below are prepared in the canonical (unshuffled) layout.
+    assert not moe_cfg.need_shuffle, (
+        f"backend={backend} config requires shuffled weights "
+        f"(need_shuffle=True), which this test does not prepare: {moe_cfg.config}"
     )
 
     data = prepare_w4a16_inputs(
         m, k, n, e, topk, group_size, has_zp, dtype, backend, moe_cfg)
+
+    logger.info(
+        f"[aiter_moe_w4a16] {m=}, {N1=}, {N2=}, {K=}, {e=}, {topk=}, "
+        f"backend={backend}, config={moe_cfg.config}, "
+        f"need_shuffle={moe_cfg.need_shuffle}, "
+        f"need_shuffle_scale={moe_cfg.need_shuffle_scale}, "
+        f"block_shape={[0, group_size]}"
+    )
+
+    if moe_cfg.need_shuffle_scale:
+        data["w1_scales"], data["w2_scales"] = api.aiter_moe_shfl_scale(
+            data["w1_scales"], data["w2_scales"], moe_cfg
+        )
 
     # Torch reference
     ref_out, _ = _run_torch_ref(
@@ -299,6 +370,7 @@ def test_aiter_moe_w4a16(m, k, n, e, topk, group_size, has_zp, dtype, inplace, r
         global_num_experts=e,
         expert_map=None,
         routed_scaling_factor=routed_scaling_factor,
+        moe_fn=api.aiter_moe,
     )
 
     msg = (f"[aiter_moe_w4a16] {m=}, {N1=}, {N2=}, {K=}, {e=}, {topk=}, "
@@ -334,44 +406,69 @@ if __name__ == "__main__":
             print(f"[ACCURACY FAILED] {exc}", flush=True)
             return None
 
-    dtype = dtypes.bf16
-    group_size = 32
-    has_zp = False
-    e = 384
-    topk = 8
-    k = 7168       # model_dim
-    n = 256        # intermediate_size
+    # Shapes that get a config and pass accuracy (gfx938, group_size 32, measured
+    # with M=1/64).  Unsupported shapes are skipped; a run where nothing ran exits non-zero.
+    #   moe-c : config keyed by (E, N) only: E=256 with N=256, or E=384 with
+    #           N in {256, 512, 1024, 2048}.  K and topk are free (K=2048/4096/7168,
+    #           topk=4/8 verified).  bf16 and fp16.  Symmetric weights only.
+    #   asm   : N=256, K=7168, topk<=8 (gw32 kernel), any E (128/256/384 verified).
+    #           bf16 only.  Zero points supported.
+    #   triton: installed configs are E=384, topk=8, N in {256, 512, 1024, 2048},
+    #           K>=2048 and a multiple of 1024 (KMin=2048,KMod=1024).  bf16 and
+    #           fp16.  Zero points supported.
+    #   auto  : aiter picks per dtype (bf16: asm > triton > moe_c; fp16: moe_c > triton).
+    parser = argparse.ArgumentParser(description="Test aiter_moe with group-wise w4a16 quantization")
+    parser.add_argument("--backend", choices=tuple(BACKEND_CHOICES), default="moe-c",
+                        help="moe-c: standalone moe_utils (default); asm / triton: aiter "
+                             "package; auto: aiter picks by priority")
+    parser.add_argument("--e", type=int, default=256)
+    parser.add_argument("--n", type=int, default=256, help="intermediate size")
+    parser.add_argument("--k", type=int, default=2048, help="model dim")
+    parser.add_argument("--topk", type=int, default=8)
+    parser.add_argument("--tokens", "--m", nargs="+", type=int,
+                        default=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 30720])
+    parser.add_argument("--group_size", type=int, default=32)
+    parser.add_argument("--has_zp", action="store_true", default=False)
+    parser.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
+    parser.add_argument("--output", default=None,
+                        help="CSV path (default test_aiter_moe_with_config_w4a16[_<backend>].csv)")
+    args = parser.parse_args()
+
+    backend = BACKEND_CHOICES[args.backend]
+    dtype = {"bf16": dtypes.bf16, "fp16": dtypes.fp16}[args.dtype]
+    group_size, has_zp = args.group_size, args.has_zp
+    e, topk, k, n = args.e, args.topk, args.k, args.n
     inplace = True
     routed_scaling_factor = 1.0
+    output = args.output or ("test_aiter_moe_with_config_w4a16.csv" if backend == SOL_MOE_C
+                             else f"test_aiter_moe_with_config_w4a16_{args.backend}.csv")
 
     # --- Part 1: test get_aiter_moe_config (w4a16) ---
     logger.info("=" * 60)
-    logger.info("Part 1: Testing get_aiter_moe_config for w4a16")
+    logger.info(f"Part 1: Testing get_aiter_moe_config for w4a16, backend={args.backend}")
     logger.info("=" * 60)
 
-    test_tokens = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
-    # test_tokens = [4096]
+    test_tokens = args.tokens
     for m in test_tokens:
-        test_get_config(m, k, n, e, topk, group_size, dtype)
+        test_get_config(m, k, n, e, topk, group_size, dtype, backend)
 
     # --- Part 2: test aiter_moe end-to-end (w4a16) ---
     logger.info("=" * 60)
-    logger.info("Part 2: Testing aiter_moe end-to-end for w4a16")
+    logger.info(f"Part 2: Testing aiter_moe end-to-end for w4a16, backend={args.backend}")
     logger.info("=" * 60)
 
-    df = []
+    rows = []
     for m in test_tokens:
-        # for n in [256, 512, 1024, 2048]:
         ret = run_accuracy_case(
             test_aiter_moe_w4a16,
             m, k, n, e, topk, group_size, has_zp, dtype, inplace,
-            routed_scaling_factor,
+            routed_scaling_factor, backend,
         )
         if ret is not None:
-            df.append(ret)
-    if df:
-        df = pd.DataFrame(df)
-        df.to_csv("test_aiter_moe_with_config_w4a16.csv", index=False)
+            rows.append(ret)
+    if rows:
+        df = pd.DataFrame(rows)
+        df.to_csv(output, index=False)
         logger.info(f"summary:\n{df}")
 
     if failed_cases:
@@ -382,3 +479,8 @@ if __name__ == "__main__":
         raise AssertionError(
             f"{len(failed_cases)} accuracy case(s) failed:\n{details}"
         )
+    if not rows:
+        # An explicitly requested backend that never ran is a failure, not a pass.
+        sys.exit(f"no case ran for backend={args.backend} ({e=}, {n=}, {k=}, {topk=}, "
+                 f"group_size={group_size}, dtype={args.dtype}); see the supported "
+                 f"shapes at the top of __main__")

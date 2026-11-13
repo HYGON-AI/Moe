@@ -87,7 +87,18 @@ __forceinline__ __device__ void gemm_nt_marlin_prefill_up_int8_bk64(
     {
         for (int index = warp_id; index < MFMA_M / 4; index += WARP_NUM)
         {
-            inline_buffer_load_dword(sorted_token_ids_element[m_tile], std::min(bidx * BLOCK_M + m_tile * MFMA_M + col_id + index * 4, int(sorted_token_lens - 1)), g_sorted_token_ids_offset, 0);
+            int token_offset_bytes = std::min(
+                bidx * BLOCK_M + m_tile * MFMA_M + col_id + index * 4,
+                int(sorted_token_lens - 1)) << 2;
+            // Complete the load before exposing its output to compiler-generated copies.
+            __builtin_amdgcn_sched_barrier(0);
+            asm volatile(
+                "buffer_load_dword %0, %1, %2, %3 offen\n\t"
+                "s_waitcnt vmcnt(0)\n\t"
+                : "=v"(sorted_token_ids_element[m_tile])
+                : "v"(token_offset_bytes), "s"(g_sorted_token_ids_offset), "s"(0)
+                : "memory");
+            __builtin_amdgcn_sched_barrier(0);
         }
     }
 

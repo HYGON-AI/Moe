@@ -102,6 +102,16 @@ endif()
 message(STATUS "MOE_C_ARCH_SOURCE_VARIANT: ${MOE_C_ARCH_SOURCE_VARIANT}")
 set(LOCAL_CSRC_DIR "${CMAKE_SOURCE_DIR}/csrc")
 set(BUILD_CSRC_DIR "${CMAKE_BINARY_DIR}/csrc")
+set(MOE_C_CK_ROOT "${CMAKE_SOURCE_DIR}/../composable_kernel" CACHE PATH
+    "Vendored Composable Kernel root used by optional local CK operators")
+if(EXISTS "${MOE_C_CK_ROOT}/include/ck_tile" AND
+   EXISTS "${MOE_C_CK_ROOT}/example_hcu/ck_tile/13_moe_sorting")
+    set(MOE_C_ENABLE_NATIVE_CK 1)
+    message(STATUS "Enabling local CK sorting from ${MOE_C_CK_ROOT}")
+else()
+    set(MOE_C_ENABLE_NATIVE_CK 0)
+    message(STATUS "Vendored CK sorting sources not found; using Python sorting fallback")
+endif()
 
 file(GLOB_RECURSE SHARED_SOURCE_FILES LIST_DIRECTORIES false CONFIGURE_DEPENDS "${SHARED_CSRC_DIR}/*")
 file(GLOB LOCAL_SOURCE_FILES LIST_DIRECTORIES false CONFIGURE_DEPENDS "${LOCAL_CSRC_DIR}/*")
@@ -164,7 +174,13 @@ if("${MOE_C_VGPR_TARGET_NUM}" MATCHES "(^|,)936(,|$)" OR "${MOE_C_VGPR_TARGET_NU
 endif()
 message(STATUS "MOE_C_VGPR_FLAG: ${MOE_C_VGPR_FLAG}")
 
-set(HIP_COMPILE_FLAGS ${HIP_COMPILE_FLAGS} -std=c++17 -mllvm ${MOE_C_VGPR_FLAG} -mllvm -disable-machine-sink  -mcode-object-version=4 -ffast-math -g -O3 -fno-strict-return -Wno-c++17-extensions -Wunused-result -w -fPIC --offload-arch=${ARCH_WITH_COMMAS} -I${PYTHON_INC} -I${SOURCE_INC} -I${SOURCE_INC_FOR_AITER} -I${PYTORCH_INC1} -I${PYTORCH_INC2} -I${PYBIND_INC} -I${WHL_INC} -I${ROCM_INC} -DUSE_ROCM)
+set(HIP_COMPILE_FLAGS ${HIP_COMPILE_FLAGS} -std=c++17 -mllvm ${MOE_C_VGPR_FLAG} -mllvm -disable-machine-sink  -mcode-object-version=4 -ffast-math -g -O3 -fno-strict-return -Wno-c++17-extensions -Wunused-result -w -fPIC --offload-arch=${ARCH_WITH_COMMAS} -I${PYTHON_INC} -I${SOURCE_INC} -I${SOURCE_INC_FOR_AITER} -I${PYTORCH_INC1} -I${PYTORCH_INC2} -I${PYBIND_INC} -I${WHL_INC} -I${ROCM_INC} -DUSE_ROCM -DMOE_C_ENABLE_NATIVE_CK=${MOE_C_ENABLE_NATIVE_CK})
+if(MOE_C_ENABLE_NATIVE_CK)
+    list(APPEND HIP_COMPILE_FLAGS
+        -I${MOE_C_CK_ROOT}/include
+        -I${MOE_C_CK_ROOT}/library/include
+        -I${MOE_C_CK_ROOT}/example_hcu/ck_tile/13_moe_sorting)
+endif()
 set(CMAKE_CXX_FLAGS ${HIP_COMPILE_FLAGS})
 
 function(configure_moe_c_library TARGET_NAME OUTPUT_NAME)

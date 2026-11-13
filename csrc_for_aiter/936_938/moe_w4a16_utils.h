@@ -281,6 +281,27 @@ using namespace W4A16_UTILS::SCALEHELPER;
     return __VA_ARGS__();                                   \
   } }();
 
+// gemm_nt_w4a16_stage_lambda_scale_ldx runs size_k / BLOCK_K stages per warp_k
+// (one 128-wide K slice each) and loads PACK_SCALES stage scales at once, so
+// PACK_SCALES must divide that stage count.  For BLOCK_K == WARP_K this keeps
+// the W4A16_SCALE_SWITCH choice (256 -> 2, otherwise 4).
+#define W4A16_KSPLIT_SCALE_SWITCH(k_stages, ...) \
+    [&] {                                                       \
+  if ((k_stages) % 4 == 0) {                             \
+    constexpr static int32_t PACK_SCALES = 4;                  \
+    return __VA_ARGS__();                                   \
+  }else {                                                  \
+    constexpr static int32_t PACK_SCALES = 2;\
+    return __VA_ARGS__();                                   \
+  } }();
+
+// LDS of the cross-warp_k partial-sum slabs in gemm_nt_w4a16_stage_lambda_scale_ldx.
+template <int BLOCK_M, int BLOCK_N, int BLOCK_K, int WARP_N, int WARP_K>
+constexpr int w4a16_ksplit_lds_bytes()
+{
+    return BLOCK_K > WARP_K ? int(sizeof(float)) * BLOCK_M * (WARP_N + 1) * (BLOCK_N / WARP_N) * (BLOCK_K / WARP_K - 1) : 0;
+}
+
 #define W4A16_STAGE1_SCALE_SWITCH(size_k, ...) \
     [&] {                                                       \
   if (size_k == 256) {                                   \
@@ -405,7 +426,8 @@ __forceinline__ __device__ void gemm_nt_w4a16_stage1_b128_k64_marlinS_scale_ldx(
             __bf16 *p_tmp = (__bf16 *)&scale_reg;
             int32_t scale_iter = it_in / BLOCK_K;
             scale_iter = (scale_iter % 2) * (PACK_SCALES / 2) + (scale_iter / 2);
-            Element f_scale = scale_reg[it_in / BLOCK_K];
+            // Both FP16 and BF16 use the same interleaved Marlin scale layout.
+            Element f_scale = scale_reg[scale_iter];
             __bf16 bf_tmp = p_tmp[scale_iter];
             using __bf16x2 = __attribute__((__vector_size__(2 * sizeof(__bf16)))) __bf16;
             __bf16x2 bf2_tmp = {bf_tmp, bf_tmp};
@@ -430,7 +452,9 @@ __forceinline__ __device__ void gemm_nt_w4a16_stage1_b128_k64_marlinS_scale_ldx(
                 int32_t basic_row_a = g2r_a_row_id + i * G2R_A_ROWS;
                 int32_t basic_col_a = g2r_a_col_id;
                 int swizzled_col_a = (basic_row_a + basic_col_a) % G2R_A_COLS;
-                if constexpr (!DEQUANT_16BIT)
+                // FP16 dequant<half2, 4> returns K in (0,4,1,5,2,6,3,7)
+                // order even on gfx936. Match A to B, as the two-stage path does.
+                if constexpr (!DEQUANT_16BIT && std::is_same_v<Element, __hip_bfloat16>)
                 {
                     *reinterpret_cast<vec8_Element<Element> *>(&lds_A[basic_row_a * BLOCK_K + swizzled_col_a * ELEMENTS_PER_LD_A]) = a_val[i];
                 }
@@ -637,14 +661,18 @@ __forceinline__ __device__ void gemm_nt_w4a16_stage_lambda_scale_ldx(
     int warp_k_id = warp_nk_id % warp_k_num;
     int warp_n_id = warp_nk_id / warp_k_num;
 
-    int k_start = warp_k_id * WARP_K;
-    int k_start_b = warp_k_id * WARP_K;
     constexpr int32_t IL_COUNT = 4;
     constexpr int32_t SCALE_RANGE = 32;
-    int k_start_scale_zeros = (col_id % IL_COUNT) * (size_k / SCALE_RANGE / IL_COUNT) + (col_id / IL_COUNT);
+    static_assert(WARP_K == READ_K_B && WARP_K == IL_COUNT * SCALE_RANGE, "stage helper assumes WARP_K == 128");
 
-    const int stage_offset = warp_k_num * WARP_K;
-    const int stage_offset_b = warp_k_num * WARP_K;
+    const int k_chunk = size_k / warp_k_num;
+    int k_start = 0;                         // A: stage offset inside each chunk
+    int k_start_b = warp_k_id * k_chunk;     // B: this warp's chunk
+    int k_start_scale_zeros = (col_id % IL_COUNT) * (size_k / SCALE_RANGE / IL_COUNT) + (col_id / IL_COUNT) +
+                              warp_k_id * (k_chunk / (SCALE_RANGE * IL_COUNT));
+
+    const int stage_offset = WARP_K;
+    const int stage_offset_b = WARP_K;
     const int stage_offset_scale_zeros = SCALE_CO_LOAD_COUNT;
 
     auto g_expert_scales = tcp_cache_swizzle_func<1, Element>(weight_scale_ptr);
@@ -668,8 +696,10 @@ __forceinline__ __device__ void gemm_nt_w4a16_stage_lambda_scale_ldx(
     constexpr int32_t A_BASIC_ROWS = WARP_NUM * 64 / A_BASIC_COLS;
     constexpr int32_t IT_LDS_STRIDE = A_BASIC_ROWS * A_BASIC_COLS;
     constexpr int32_t G2S_LDA_COUNT = BLOCK_M / A_BASIC_ROWS;
+    constexpr int32_t A_WARP_COLS = WARP_K / ElEMENTS; // LDS columns owned by one warp_k
     int32_t basic_col_id = threadIdx.x % A_BASIC_COLS;
     int32_t basic_row_id = threadIdx.x / A_BASIC_COLS;
+    const int a_col_k = (basic_col_id / A_WARP_COLS) * k_chunk + (basic_col_id % A_WARP_COLS) * ElEMENTS;
     int g_row_A[G2S_LDA_COUNT] /*bytes*/ = {0};
 
     extern __shared__ float lds_buffer[]; /*BM * BK */
@@ -684,7 +714,7 @@ __forceinline__ __device__ void gemm_nt_w4a16_stage_lambda_scale_ldx(
     for (int it_g2s = 0; it_g2s < G2S_LDA_COUNT; it_g2s++)
     {
         int sorted_token_idx = sorted_token_ids_offset[std::min(bidx * BLOCK_M + it_g2s * A_BASIC_ROWS + basic_row_id, int(sorted_token_lens - 1))];
-        g_row_A[it_g2s] = ((std::min(sorted_token_idx / top_k, max_n_len_offset - 1)) * size_k + basic_col_id * ElEMENTS) / ElEMENTS;
+        g_row_A[it_g2s] = ((std::min(sorted_token_idx / top_k, max_n_len_offset - 1)) * size_k + a_col_k) / ElEMENTS;
     }
 
 #pragma unroll
@@ -777,7 +807,7 @@ __forceinline__ __device__ void gemm_nt_w4a16_stage_lambda_scale_ldx(
             for (int k_tile = 0; k_tile < WARP_K / READ_K_A; k_tile++)
             {
                 int row = warp_m_id * WARP_M + m_tile * MFMA_M + row_id;
-                int col = (row + (k_tile + col_id * (WARP_K / READ_K_A))) % A_BASIC_COLS;
+                int col = (row + (warp_k_id * A_WARP_COLS + k_tile + col_id * (WARP_K / READ_K_A))) % A_BASIC_COLS;
                 A_reg[m_tile][it_stage].input_half8[k_tile] = buffer_a[0][row * A_BASIC_COLS + col];
             }
         }
@@ -1106,11 +1136,13 @@ __forceinline__ __device__ void gemm_nt_w4a16_stage_lambda_scale_ldx(
         const int32_t next_stage = (it_stage + 1) % STAGE;
         const int32_t cur_stage = it_stage % STAGE;
         g2r(next_stage);
-        vmcnt_wait_w4a16(((WARP_N / MFMA_N) * (WARP_K / READ_K_B) + G2S_LDA_COUNT) + (WARP_N / MFMA_N) * (WARP_K / READ_K_B) * 2);
+        // wait cur_stage(A); count = next_stage(A + B) + cur_stage(scale + B)
+        vmcnt_wait_w4a16(((WARP_N / MFMA_N) * (WARP_K / READ_K_B) + G2S_LDA_COUNT) + (WARP_N / MFMA_N) * (WARP_K / READ_K_B) + WARP_N / MFMA_N);
         matrixA_r2s(cur_stage);
         __builtin_amdgcn_sched_barrier(0);
         __syncthreads();
         matrix_s2r(cur_stage);
+        // wait cur_stage(B + scale); count = next_stage(A + B)
         vmcnt_wait_w4a16((WARP_N / MFMA_N) * (WARP_K / READ_K_B) + G2S_LDA_COUNT);
         dequant_and_matmul(cur_stage, it_stage);
         advance_AB_offset();
@@ -1171,7 +1203,7 @@ __forceinline__ __device__ void gemm_nt_w4a16_stage_lambda_scale_ldx(
     }
     __builtin_amdgcn_sched_barrier(0);
 
-    for (int it_k = 0; it_k < (size_k / (WARP_K * SCALE_CO_LOAD_COUNT) - 1 /*leave one stage remainder*/); it_k++)
+    for (int it_k = 0; it_k < (k_chunk / (WARP_K * SCALE_CO_LOAD_COUNT) - 1 /*leave one stage remainder*/); it_k++)
     {
         first_stage(0);
 #pragma unroll
@@ -1194,6 +1226,11 @@ __forceinline__ __device__ void gemm_nt_w4a16_stage_lambda_scale_ldx(
     if constexpr (warp_k_num > 1)
     {
         constexpr int pading_n = WARP_N + 1;
+        // One [BLOCK_M, pading_n] fp32 slab per (warp_n, warp_k > 0); see w4a16_ksplit_lds_bytes.
+        constexpr int slab = BLOCK_M * pading_n;
+
+        // The slabs alias the A buffer: wait until every warp has read its last A tile.
+        __syncthreads();
 
         if (warp_k_id > 0)
         { // 0和1 只需要 warpk_id为1去拷贝数据
@@ -1203,7 +1240,7 @@ __forceinline__ __device__ void gemm_nt_w4a16_stage_lambda_scale_ldx(
 #pragma unroll
                 for (int n_tile = 0; n_tile < WARP_N / MFMA_N; n_tile++)
                 {
-                    *(floatx4 *)(&out_smem_w4a16[(warp_m_id * WARP_M + m_tile * MFMA_M + row_id) * pading_n + n_tile * 16 + col_id * 4 + (warp_k_id - 1 + warp_n_id * (warp_k_num - 1)) * pading_n * 16]) = C_reg[0][m_tile * (WARP_N / MFMA_N) + n_tile];
+                    *(floatx4 *)(&out_smem_w4a16[(warp_m_id * WARP_M + m_tile * MFMA_M + row_id) * pading_n + n_tile * 16 + col_id * 4 + (warp_k_id - 1 + warp_n_id * (warp_k_num - 1)) * slab]) = C_reg[0][m_tile * (WARP_N / MFMA_N) + n_tile];
                 }
             }
         }
@@ -1221,7 +1258,7 @@ __forceinline__ __device__ void gemm_nt_w4a16_stage_lambda_scale_ldx(
 #pragma unroll
                     for (int k_tile = 0; k_tile < warp_k_num - 1; k_tile++)
                     {
-                        floatx4 temp = *(floatx4 *)(&out_smem_w4a16[(warp_m_id * WARP_M + m_tile * MFMA_M + row_id) * pading_n + n_tile * 16 + col_id * 4 + (k_tile + warp_n_id * (warp_k_num - 1)) * pading_n * 16]);
+                        floatx4 temp = *(floatx4 *)(&out_smem_w4a16[(warp_m_id * WARP_M + m_tile * MFMA_M + row_id) * pading_n + n_tile * 16 + col_id * 4 + (k_tile + warp_n_id * (warp_k_num - 1)) * slab]);
 #pragma unroll
                         for (int i = 0; i < 4; ++i)
                         {
@@ -1231,5 +1268,8 @@ __forceinline__ __device__ void gemm_nt_w4a16_stage_lambda_scale_ldx(
                 }
             }
         }
+
+        // The caller reuses this LDS for the output tile right after.
+        __syncthreads();
     }
 }

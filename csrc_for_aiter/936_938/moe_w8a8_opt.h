@@ -541,7 +541,7 @@ __global__ void __launch_bounds__(512, 1) MOE_W8A8_I8_PERCHANNEL_MARLIN_HIP_NT_P
     {
       const int32_t sorted_token_ids_element = sorted_token_ids[std::min(bidx * BLOCK_SIZE_M + m_idx, int(sorted_token_lens - 1))];
       const int32_t token_ids = sorted_token_ids_element & 0x00FFFFFF;
-      const int32_t topk_ids = sorted_token_ids_element & 0xFF000000;
+      const int32_t topk_ids = (uint32_t)(sorted_token_ids_element & 0xFF000000) >> 24;
       int token_index = token_ids * real_topk /* top_k */ + topk_ids;
 
       if (topk_ids < real_topk)
@@ -829,7 +829,6 @@ __global__ void __launch_bounds__(512, 1) MOE_W8A8_I8_PERCHANNEL_MARLIN_HIP_NT_P
   auto g_sorted_token_ids_offset = tcp_cache_swizzle_func_no<64, int32_t>(sorted_token_ids);
 
   {
-
     for (int min_tile_m = 0; min_tile_m < WARP_M / mfma_m; min_tile_m++)
     {
       for (int i = 0; i < 4; i++)
@@ -1057,7 +1056,7 @@ __global__ void __launch_bounds__(512, 1) MOE_W8A8_I8_PERCHANNEL_MARLIN_HIP_NT_D
     {
       const int32_t sorted_token_ids_element = sorted_token_ids[std::min(bidx * BLOCK_SIZE_M + m_idx, int(sorted_token_lens - 1))];
       const int32_t token_ids = sorted_token_ids_element & 0x00FFFFFF;
-      const int32_t topk_ids = sorted_token_ids_element & 0xFF000000;
+      const int32_t topk_ids = (sorted_token_ids_element & 0xFF000000) >> 24;
       int token_index = token_ids * real_topk /* top_k */ + topk_ids;
 
       if (topk_ids < real_topk)
@@ -1322,7 +1321,7 @@ __global__ void __launch_bounds__(512, 1) MOE_W8A8_I8_PERCHANNEL_MARLIN_HIP_NT_D
     {
       const int32_t sorted_token_ids_element = sorted_token_ids[std::min(bidx * BLOCK_SIZE_M + m_idx, int(sorted_token_lens - 1))];
       const int32_t token_ids = sorted_token_ids_element & 0x00FFFFFF;
-      const int32_t topk_ids = sorted_token_ids_element & 0xFF000000;
+      const int32_t topk_ids = (sorted_token_ids_element & 0xFF000000) >> 24;
       int token_index = token_ids * real_topk /* top_k */ + topk_ids;
 
       if (topk_ids < real_topk)
@@ -1584,6 +1583,51 @@ __global__ void __launch_bounds__(512, 1) MOE_W8A8_I8_PERCHANNEL_MARLIN_HIP_NT_P
   moe_w8a8_setprio_normal();
   __builtin_amdgcn_sched_barrier(0);
 
+#if defined(__gfx92a__)
+  float b_scale_reordered[n_loop_num][WARP_N / mfma_n][4];
+  if (tensorwise_scale)
+  {
+    const float expert_b_scale_lds = weight_scale[expert_id];
+#pragma unroll
+    for (int n_loop = 0; n_loop < n_loop_num; ++n_loop)
+#pragma unroll
+      for (int idx = 0; idx < WARP_N / mfma_n; ++idx)
+#pragma unroll
+        for (int reg_id = 0; reg_id < 4; ++reg_id)
+          b_scale_reordered[n_loop][idx][reg_id] = expert_b_scale_lds;
+  }
+  else
+  {
+    float *b_scale_ptr_lds = weight_scale + weight_scale_offset + warp_n_id * WARP_N;
+#pragma unroll
+    for (int n_loop = 0; n_loop < n_loop_num; ++n_loop)
+#pragma unroll
+      for (int min_tile_n = 0; min_tile_n < WARP_N / 32; ++min_tile_n)
+#pragma unroll
+        for (int i = 0; i < 2; ++i)
+#pragma unroll
+          for (int reg_id = 0; reg_id < 4; ++reg_id)
+            b_scale_reordered[n_loop][min_tile_n * 2 + i][reg_id] =
+                b_scale_ptr_lds[BLOCK_SIZE_N * n_loop + min_tile_n * 32 + i * 16 + reg_id * 4 + col_id];
+  }
+
+  float weight_dot_a_scale_lds[WARP_M / mfma_m];
+#pragma unroll
+  for (int idx = 0; idx < WARP_M / mfma_m; ++idx)
+  {
+    const int sorted_idx = std::min(bidx * BLOCK_SIZE_M + idx * mfma_m + row_id,
+                                    int(sorted_token_lens - 1));
+    const int route_id = sorted_token_ids[sorted_idx];
+    const int token_id = moe_w8a8_route_token_id(route_id, real_topk);
+    const int token_safe = std::min(token_id, int(size_m - 1));
+    weight_dot_a_scale_lds[idx] = *(input_scale + token_safe * stride_asm);
+  }
+
+  prefill_store_output_via_lds_fp8<scalar_t, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N,
+                                   WARP_M, WARP_N, n_loop_num, false>(
+      output_lds, g_output, C_reg, b_scale_reordered, weight_dot_a_scale_lds,
+      sorted_token_ids, bidx, warp_n_id, size_n, valid_route_count);
+#else
   int32_t sorted_token_ids_element_store[store_size];
   auto g_sorted_token_ids_offset = tcp_cache_swizzle_func_no<64, int32_t>(sorted_token_ids);
 
@@ -1591,7 +1635,7 @@ __global__ void __launch_bounds__(512, 1) MOE_W8A8_I8_PERCHANNEL_MARLIN_HIP_NT_P
   for (int min_tile_m = 0; min_tile_m < WARP_M / mfma_m; min_tile_m++)
   {
     int m_idx = min_tile_m * mfma_m + row_id;
-    inline_buffer_load_dword(sorted_token_ids_element_store[min_tile_m], m_idx, g_sorted_token_ids_offset, bidx * BLOCK_SIZE_M);
+    inline_buffer_load_dword_wait(sorted_token_ids_element_store[min_tile_m], m_idx, g_sorted_token_ids_offset, bidx * BLOCK_SIZE_M);
   }
 
   float *b_scale_ptr = weight_scale + weight_scale_offset + warp_n_id * WARP_N;
@@ -1675,6 +1719,7 @@ __global__ void __launch_bounds__(512, 1) MOE_W8A8_I8_PERCHANNEL_MARLIN_HIP_NT_P
       }
     }
   }
+#endif
 }
 
 template <
@@ -1854,6 +1899,50 @@ __global__ void __launch_bounds__(512, 1) MOE_W8A8_I8_PERCHANNEL_MARLIN_HIP_NT_P
   }
   moe_w8a8_setprio_normal();
 
+#if defined(__gfx92a__)
+  float b_scale_reordered[n_loop_num][WARP_N / mfma_n][4];
+  if (tensorwise_scale)
+  {
+    const float expert_b_scale_lds = weight_scale[expert_id];
+#pragma unroll
+    for (int n_loop = 0; n_loop < n_loop_num; ++n_loop)
+#pragma unroll
+      for (int idx = 0; idx < WARP_N / mfma_n; ++idx)
+#pragma unroll
+        for (int reg_id = 0; reg_id < 4; ++reg_id)
+          b_scale_reordered[n_loop][idx][reg_id] = expert_b_scale_lds;
+  }
+  else
+  {
+    float *b_scale_ptr_lds = weight_scale + weight_scale_offset + warp_n_id * WARP_N;
+#pragma unroll
+    for (int n_loop = 0; n_loop < n_loop_num; ++n_loop)
+#pragma unroll
+      for (int min_tile_n = 0; min_tile_n < WARP_N / 32; ++min_tile_n)
+#pragma unroll
+        for (int i = 0; i < 2; ++i)
+#pragma unroll
+          for (int reg_id = 0; reg_id < 4; ++reg_id)
+            b_scale_reordered[n_loop][min_tile_n * 2 + i][reg_id] =
+                b_scale_ptr_lds[BLOCK_SIZE_N * n_loop + min_tile_n * 32 + reg_id * 8 + col_id * 2 + i];
+  }
+
+  float weight_dot_a_scale_lds[WARP_M / mfma_m];
+#pragma unroll
+  for (int idx = 0; idx < WARP_M / mfma_m; ++idx)
+  {
+    const int sorted_idx = std::min(bidx * BLOCK_SIZE_M + idx * mfma_m + row_id,
+                                    int(sorted_token_lens - 1));
+    const int route_id = sorted_token_ids[sorted_idx];
+    const int token_safe = std::min(route_id, int(size_m - 1));
+    weight_dot_a_scale_lds[idx] = topk_weights[token_safe] * *(input_scale + token_safe * stride_asm);
+  }
+
+  prefill_store_output_via_lds_fp8<scalar_t, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N,
+                                   WARP_M, WARP_N, n_loop_num, true>(
+      output_lds, g_output, C_reg, b_scale_reordered, weight_dot_a_scale_lds,
+      sorted_token_ids, bidx, warp_n_id, size_n, valid_route_count);
+#else
   int32_t sorted_token_ids_element_store[store_size];
   auto g_sorted_token_ids_offset = tcp_cache_swizzle_func_no<64, int32_t>(sorted_token_ids);
 
@@ -1861,7 +1950,7 @@ __global__ void __launch_bounds__(512, 1) MOE_W8A8_I8_PERCHANNEL_MARLIN_HIP_NT_P
   for (int min_tile_m = 0; min_tile_m < WARP_M / mfma_m; min_tile_m++)
   {
     int m_idx = min_tile_m * mfma_m + row_id;
-    inline_buffer_load_dword(sorted_token_ids_element_store[min_tile_m], m_idx, g_sorted_token_ids_offset, bidx * BLOCK_SIZE_M);
+    inline_buffer_load_dword_wait(sorted_token_ids_element_store[min_tile_m], m_idx, g_sorted_token_ids_offset, bidx * BLOCK_SIZE_M);
   }
 
   float *b_scale_ptr = weight_scale + weight_scale_offset + warp_n_id * WARP_N;
@@ -1956,6 +2045,7 @@ __global__ void __launch_bounds__(512, 1) MOE_W8A8_I8_PERCHANNEL_MARLIN_HIP_NT_P
       }
     }
   }
+#endif
 }
 
 template <int BLOCK_SIZE_M, int BLOCK_SIZE_N, int BLOCK_SIZE_K, int WARP_M, int WARP_N, int WARP_K, int STAGES, typename T, typename T_hidden>
@@ -2031,7 +2121,12 @@ void launch_moe_w8a8_second_stage_prefill(const GemmParams<T, T_hidden> &params)
   gridDim.y = DIVIDE(params.size_n, BLOCK_SIZE_N * n_loop_num); // n方向
   gridDim.x = 1;                                                // k方向
 
+#if defined(__gfx92a__)
+  const int lds_size = std::max(BLOCK_SIZE_M * WARP_K * 2,
+                                prefill_output_lds_bytes_fp8<T_hidden, BLOCK_SIZE_M, BLOCK_SIZE_N>());
+#else
   const int lds_size = BLOCK_SIZE_M * WARP_K * 2;
+#endif
 
   const int shared_mem_size = lds_size; // + BLOCK_SIZE_M * 4 * 2 + 32; // 额外分配sort_token_ids的空间
   const hipStream_t stream = at::cuda::getCurrentHIPStream();
@@ -2193,7 +2288,8 @@ void launch_moe_w8a8_first_stage_prefill_fp8_nloop(const GemmParams<T, T_hidden>
   blockDim.y = 1;
   blockDim.z = 1;
 
-  const int lds_size = BLOCK_SIZE_M * WARP_K * 2;
+  const int lds_size = std::max(BLOCK_SIZE_M * WARP_K * 2,
+                                prefill_output_lds_bytes_fp8<T_hidden, BLOCK_SIZE_M, BLOCK_SIZE_N>());
   const int shared_mem_size = lds_size;
 
   const hipStream_t stream = at::cuda::getCurrentHIPStream();
@@ -2264,7 +2360,8 @@ void launch_moe_w8a8_second_stage_prefill_fp8_nloop(const GemmParams<T, T_hidden
   gridDim.y = DIVIDE(params.size_n, BLOCK_SIZE_N * n_loop_num); // n方向
   gridDim.x = 1;                                                // k方向
 
-  const int lds_size = BLOCK_SIZE_M * WARP_K * 2;
+  const int lds_size = std::max(BLOCK_SIZE_M * WARP_K * 2,
+                                prefill_output_lds_bytes_fp8<T_hidden, BLOCK_SIZE_M, BLOCK_SIZE_N>());
 
   const int shared_mem_size = lds_size; // + BLOCK_SIZE_M * 4 * 2 + 32; // 额外分配sort_token_ids的空间
   const hipStream_t stream = at::cuda::getCurrentHIPStream();

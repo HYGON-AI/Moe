@@ -51,6 +51,7 @@ from .moe_ops import (
     moe_c_moe_wna16_gemm_2,
     moe_c_moe_wna16_gemm_base,
     moe_c_sgl_moe_align_block_size,
+    moe_c_sgl_moe_align_block_size_dual,
     moe_c_silu_and_mul,
     moe_c_situ_glu,
     moe_c_topk_softmax,
@@ -186,16 +187,23 @@ def _per_token_quant_int8(
 
 
 def per_token_quant_int8(x):
+    """Quantize each token to int8 using a float32 max-absolute scale.
+
+    Device-time measurements on the W4A8 shapes show this triton kernel is
+    2-4x faster than the native moe_c quant op, so it is used for all M.
+    """
+    assert x.is_contiguous()
     M = x.numel() // x.shape[-1]
     N = x.shape[-1]
-    x_q = torch.empty_like(x, device=x.device, dtype=torch.int8)
-    scales = torch.empty(x.shape[:-1] + (1,),
-                         device=x.device, dtype=torch.float32)
+    x_q = torch.empty_like(x, dtype=torch.int8)
+    scales = torch.empty(x.shape[:-1] + (1,), device=x.device, dtype=torch.float32)
     BLOCK = triton.next_power_of_2(N)
-    # heuristics for number of warps
-    num_warps = min(max(BLOCK // 256, 1), 8)
-
-    assert x.is_contiguous()
+    if BLOCK >= 4096:
+        num_warps = 4
+    elif BLOCK >= 2048:
+        num_warps = 2
+    else:
+        num_warps = min(max(BLOCK // 256, 1), 8)
     _per_token_quant_int8[(M,)](
         x,
         x_q,
@@ -207,8 +215,8 @@ def per_token_quant_int8(x):
         num_warps=num_warps,
         num_stages=1,
     )
-
     return x_q, scales
+
 
 # ck_sorting算子
 def moe_sorting_ck(
@@ -1533,8 +1541,8 @@ def moe_align_block_size(
     num_tokens_post_pad = torch.empty((1),
                                       dtype=torch.int32,
                                       device=topk_ids.device)
-    if num_experts >= 224:
-        if num_experts not in (256, 896):
+    if num_experts >= 224 and num_experts != 512:
+        if num_experts not in (256, 384, 896):
             # Triton fallback only writes valid blocks. Keep padding/tail safe
             # without changing the Triton kernel semantics.
             sorted_ids.fill_(topk_ids.numel())
@@ -1548,7 +1556,7 @@ def moe_align_block_size(
                 num_tokens_post_pad,
             )
         else:
-            # Currently supports num_experts=256/896.
+            # Currently supports num_experts=256/384/896.
             moe_c_sgl_moe_align_block_size(
                 topk_ids,
                 num_experts,
@@ -1567,157 +1575,97 @@ def moe_align_block_size(
 
 
 
-# def generate_sum_configs():
-#     configs = []
-#     for block_m in [16, 32, 64, 128]:
-#         for block_n in [32, 64, 128, 256]:
-#             for num_warps in [2, 4, 8, 16]:
-#                 for num_stages in [1, 2]:
-#                     config = triton.Config({
-#                         'BLOCK_SIZE_M': block_m,
-#                         'BLOCK_SIZE_N': block_n,
-#                     }, num_warps=num_warps, num_stages=num_stages)
-#                 configs.append(config)
-#     return configs
+def moe_align_block_size_dual(
+    topk_ids: torch.Tensor,
+    block_size: int,
+    block_size2: int,
+    num_experts: int,
+    expert_map: torch.Tensor = None
+) -> Tuple[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """moe_align_block_size for two block sizes in one pass (e.g. a BM128 gemm1 and a BM64 gemm2).
+    Returns the two (sorted_token_ids, expert_ids, num_tokens_post_padded) routings."""
+    if num_experts not in (256, 384, 896):
+        # the fused kernel is only instantiated for these expert counts
+        return (moe_align_block_size(topk_ids, block_size, num_experts, expert_map),
+                moe_align_block_size(topk_ids, block_size2, num_experts, expert_map))
 
-# @triton.autotune(
-#     key=['M', 'N', 'top_k','compute_type'],
-#     # configs=generate_sum_configs(),
-#     configs = [
-#                 triton.Config({'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 32  }, num_warps=4),
-#                 triton.Config({'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 64 },  num_warps=8),
-#                 triton.Config({'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 128 }, num_warps=8),
-#                 triton.Config({'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 128 }, num_warps=16),
-#               ],
-#     # perf_debug=True,
-# )
+    def alloc(bs):
+        max_num_tokens_padded = topk_ids.numel() + num_experts * (bs - 1)
+        return (torch.empty((max_num_tokens_padded, ), dtype=torch.int32, device=topk_ids.device),
+                torch.empty((triton.cdiv(max_num_tokens_padded, bs), ), dtype=torch.int32, device=topk_ids.device),
+                torch.empty((1, ), dtype=torch.int32, device=topk_ids.device))
 
+    r1, r2 = alloc(block_size), alloc(block_size2)
+    moe_c_sgl_moe_align_block_size_dual(topk_ids, num_experts, block_size, *r1, block_size2, *r2)
+    if expert_map is not None:
+        r1 = (r1[0], expert_map[r1[1]], r1[2])
+        r2 = (r2[0], expert_map[r2[1]], r2[2])
+    return r1, r2
 
-device_name = get_device_name()
-if device_name=='K100_AI':
-    moe_sum_best_configs = {
-        # M, topK, N
-        (1,    8, 7168): {'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 32,  "num_warps" : 4 },
-        (4,    8, 7168): {'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 128, "num_warps" : 16},
-        (16,   8, 7168): {'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 256, "num_warps" : 16},
-        (32,   8, 7168): {'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 256, "num_warps" : 16},
-        (64,   8, 7168): {'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 256, "num_warps" : 16},
-        (128,  8, 7168): {'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 256, "num_warps" : 16},
-    }
-elif device_name=='BW200' or device_name.upper().startswith('BW'):
-    moe_sum_best_configs = {
-        # M, topK, N
-        (1,    8, 7168): {'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 32,  "num_warps" : 4} ,
-        (4,    8, 7168): {'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 128, "num_warps" : 16},
-        (16,   8, 7168): {'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 256, "num_warps" : 16},
-        (32,   8, 7168): {'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 256, "num_warps" : 16},
-        (64,   8, 7168): {'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 256, "num_warps" : 16},
-        (128,  8, 7168): {'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 256, "num_warps" : 16},
-    }
-else:
-    moe_sum_best_configs = {}
 
 def get_moe_sum_config(M, top_k, N):
+    # 1D row-tile reduction: small M favours low occupancy per CU, large M wider tiles.
+    if M < 32:
+        return {"BLOCK_SIZE": 128, "num_warps": 1}
+    return {"BLOCK_SIZE": 512, "num_warps": 4}
 
-    if moe_sum_best_configs:
-        # config = moe_sum_best_configs[min(moe_sum_best_configs.keys(), key=lambda x: abs(x[0] - M))] #torch.compile不支持
-        best_key = None
-        min_diff = float('inf')
-        for key in moe_sum_best_configs.keys():
-            diff = abs(key[0] - M)
-            if diff < min_diff:
-                min_diff = diff
-                best_key = key
-        config = moe_sum_best_configs[best_key]
-
-    else:
-        if M < 32:
-            config = {'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 64,  "num_warps" : 4}
-        else:
-            config = {'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 128, "num_warps" : 8}
-
-    return config
 
 @triton.heuristics({
-    'block_m_dividable': lambda nargs: nargs['M'] % nargs['BLOCK_SIZE_M'] == 0,
-    'block_n_dividable': lambda nargs: nargs['N'] % nargs['BLOCK_SIZE_N'] == 0,
+    "n_dividable": lambda args: (args["N"] % args["BLOCK_SIZE"]) == 0,
 })
-
-
 @triton.jit
 def moe_sum_kernel(
-    # Pointers to matrices
     output_ptr,             # [M, N]
     input_ptr,              # [M, top_k, N]
-    # Matrix dimensions
-    M: tl.constexpr,
+    M,
     N: tl.constexpr,
     top_k: tl.constexpr,
-    # Meta-parameters
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
+    routed_scaling_factor,
+    BLOCK_SIZE: tl.constexpr,
     stride_output_m,
     stride_output_n,
     stride_input_m,
     stride_input_k,
     stride_input_n,
     compute_type: tl.constexpr,
-    block_m_dividable: tl.constexpr,
-    block_n_dividable: tl.constexpr,
+    n_dividable: tl.constexpr,
 ):
-    """
-    Args:
-        output_ptr: shape [M, N]
-        input_ptr: shape[M, top_k, N]
-    """
     tl.assume(stride_output_m >= 0)
     tl.assume(stride_output_n >= 0)
     tl.assume(stride_input_m >= 0)
     tl.assume(stride_input_k >= 0)
     tl.assume(stride_input_n >= 0)
 
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE)
     pid = tl.program_id(axis=0)
-
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-
     pid_m = pid // num_pid_n
     pid_n = pid % num_pid_n
-
-    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-
-    mask_m = offs_m < M
+    offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask_n = offs_n < N
 
-    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-
+    acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+    input_row_ptr = input_ptr + pid_m.to(tl.int64) * stride_input_m
     for k in range(top_k):
-        input_ptrs = input_ptr + (offs_m[:, None] * stride_input_m +
-                                 k * stride_input_k + offs_n[None, :] * stride_input_n).to(tl.int32)
-        if block_m_dividable:
+        input_ptrs = input_row_ptr + (k * stride_input_k + offs_n * stride_input_n)
+        if n_dividable:
             x = tl.load(input_ptrs)
         else:
-            x = tl.load(input_ptrs,
-                        mask=mask_m[:, None] & mask_n[None, :],
-                        other=0.0)
+            x = tl.load(input_ptrs, mask=mask_n, other=0.0)
+        acc += x.to(tl.float32)
 
-        acc += x
-
+    acc *= routed_scaling_factor
     acc = acc.to(compute_type)
-
-    output_ptrs = output_ptr + (offs_m[:, None] * stride_output_m +
-                                offs_n[None, :] * stride_output_n).to(tl.int32)
-
-    if block_m_dividable and block_n_dividable:
+    output_ptrs = output_ptr + (pid_m.to(tl.int64) * stride_output_m +
+                                offs_n * stride_output_n)
+    if n_dividable:
         tl.store(output_ptrs, acc)
     else:
-        tl.store(output_ptrs, acc, mask=mask_m[:, None] & mask_n[None, :])
+        tl.store(output_ptrs, acc, mask=mask_n)
 
 
 def triton_moe_sum_noaiter(input_tensor,
-                   output_tensor,
-                   routed_scaling_factor: float = 1.0):
+                           output_tensor,
+                           routed_scaling_factor: float = 1.0):
     """
     Args:
         input_tensor: [M, top_k, N]
@@ -1725,28 +1673,21 @@ def triton_moe_sum_noaiter(input_tensor,
     """
     M, top_k, N = input_tensor.shape
 
-    # 计算grid
-    # grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(
-    #                                  N, META['BLOCK_SIZE_N']), )
-    config = get_moe_sum_config(M, top_k, N)
-    grid = (triton.cdiv(M, config['BLOCK_SIZE_M']) * triton.cdiv(N, config['BLOCK_SIZE_N']),)
-
-    # Check constraints.
-    assert output_tensor.dtype == torch.float16 or \
-           output_tensor.dtype == torch.bfloat16 or \
-           output_tensor.dtype == torch.float32
-
-    if output_tensor.dtype == torch.float16:
-        compute_type = tl.float16
-    elif output_tensor.dtype == torch.bfloat16:
-        compute_type = tl.bfloat16
-    elif output_tensor.dtype == torch.float32:
-        compute_type = tl.float32
+    compute_type = {
+        torch.float16: tl.float16,
+        torch.bfloat16: tl.bfloat16,
+        torch.float32: tl.float32,
+    }[output_tensor.dtype]
 
     assert input_tensor.is_contiguous()
     assert output_tensor.is_contiguous()
     assert input_tensor.shape[0] == output_tensor.shape[0]
     assert input_tensor.shape[2] == output_tensor.shape[1]
+    if M == 0:
+        return output_tensor
+
+    config = get_moe_sum_config(M, top_k, N)
+    grid = (M * triton.cdiv(N, config["BLOCK_SIZE"]),)
 
     moe_sum_kernel[grid](
         output_tensor,
@@ -1754,6 +1695,7 @@ def triton_moe_sum_noaiter(input_tensor,
         M,
         N,
         top_k,
+        routed_scaling_factor,
         stride_output_m=output_tensor.stride(0),
         stride_output_n=output_tensor.stride(1),
         stride_input_m=input_tensor.stride(0),
@@ -1762,10 +1704,8 @@ def triton_moe_sum_noaiter(input_tensor,
         compute_type=compute_type,
         **config,
     )
-    if routed_scaling_factor != 1.0:
-        output_tensor.mul_(routed_scaling_factor)
-
     return output_tensor
+
 
 def invoke_fused_moe_kernel(A: torch.Tensor,
                             B: torch.Tensor,
@@ -2136,6 +2076,28 @@ def _resolve_moe_compute_dtype(
         f"Unsupported hidden_states dtype: {hidden_states_dtype}")
 
 
+def _moe_c_mode_uses_moe_align(mode) -> bool:
+    try:
+        mode = int(mode)
+    except (TypeError, ValueError):
+        return False
+    return mode >= 10000000 and ((mode // 1000000) % 10) == 1
+
+
+def _moe_c_config_uses_moe_align(config, use_fp8_w8a8: bool) -> bool:
+    mode = int(config.get("MODE", 0))
+    if 10000000 <= mode < 30000000:
+        return _moe_c_mode_uses_moe_align(mode)
+    sorting_method = config.get("SORTING_METHOD")
+    if sorting_method == "moe_align":
+        return True
+    if sorting_method == "ck_sorting":
+        return False
+    if "MODE" in config:
+        return _moe_c_mode_uses_moe_align(mode)
+    return use_fp8_w8a8
+
+
 def _torch_dtype_to_triton(dtype: torch.dtype):
     if dtype == torch.bfloat16:
         return tl.bfloat16
@@ -2223,10 +2185,12 @@ def invoke_fused_moe_kernel_marlin(A: torch.Tensor,
                             use_int4_w4a16_base: bool,
                             use_w16a16: bool,
                             is_bottom: bool,
-                            key_selected:int,
+                            selected_m_key: Optional[int] = None,
+                            key_selected: Optional[int] = None,
                             block_shape: Optional[List[int]] = None,
                             real_size_k: Optional[int] = None) -> None:
     find_best = os.getenv("WHICH_TO_TEST")
+    key_selected = selected_m_key if selected_m_key is not None else key_selected
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
 
@@ -2644,24 +2608,34 @@ def validate_channelwise_reduce_k(quant, mode, reduce_k, is_bottom, out_n=None):
         (f" or have remainder {tail}" if tail is not None else ""))
 
 
+W4A16_GROUP_SIZE = 32  # GROUP_K of the launchers
+
+
+def w4a16_fuse_silu(mode) -> bool:
+    """GEMM1 prefill profile 3xx (K digit 1): silu_and_mul is fused, output [M, topk, N / 2]; mode - 100 is the unfused twin."""
+    return mode // 100000 % 10 == 1 and mode % 1000 // 100 == 3
+
+
 CSV_NAMES = {
     "int8_w4a8": "tuned_moe_c_w4a8_channel.csv",
     "int8_w8a8": "tuned_moe_c_w8a8_int8_channel.csv",
     "fp8_w8a8": "tuned_moe_c_w8a8_fp8_channel.csv",
+    "int4_w4a16": "tuned_moe_c_w4a16_group.csv",
 }
 FIELDS = ("arch", "quant_type", "indtype", "token", "inter_dim", "model_dim",
           "expert", "topk", "q_size_n", "q_size_k", "sol_type", "sol_id", "time_us", "cu_num")
 QUANT_TYPES = {"fp8_w8a8": "fp8_w8a8_channel", "int8_w8a8": "int8_w8a8_channel",
-               "int8_w4a8": "int8_w4a8_channel"}
+               "int8_w4a8": "int8_w4a8_channel", "int4_w4a16": "int4_w4a16_group"}
 
 
-def decode_pair(sol_id):
+def decode_pair(sol_id, same_bm=True):
+    """W4A16 passes same_bm=False: each stage may use its own BM (dual routing)."""
     parts = sol_id.split("+")
     assert len(parts) == 2, f"Invalid moe_c sol_id: {sol_id}"
     modes = tuple(int(part) for part in parts)
     assert modes[0] // 10000000 == 1 and modes[1] // 10000000 == 2, sol_id
     bms = tuple(mode // 1000 % 100 * 16 for mode in modes)
-    assert bms[0] > 0 and bms[0] == bms[1], f"moe_c BM mismatch: {sol_id}"
+    assert bms[0] > 0 and bms[1] > 0 and (bms[0] == bms[1] or not same_bm), f"moe_c BM mismatch: {sol_id}"
     assert modes[0] // 1000000 % 10 == modes[1] // 1000000 % 10, (
         f"moe_c routing mismatch: {sol_id}")
     return modes, bms[0]
@@ -2675,14 +2649,16 @@ def _read_table(path, mtime_ns, size):
         assert set(FIELDS) <= set(reader.fieldnames or ()), f"Invalid moe_c CSV header: {path}"
         for line, row in enumerate(reader, 2):
             assert row["sol_type"] == "moe_c", f"{path}:{line}: invalid sol_type"
-            assert int(row["q_size_n"]) == int(row["q_size_k"]) == 0, (
-                f"{path}:{line}: expected channelwise quantization")
-            modes, _ = decode_pair(row["sol_id"])
             quant = next((q for q, label in QUANT_TYPES.items() if label == row["quant_type"]), None)
             assert quant is not None, f"{path}:{line}: invalid quant_type"
+            w4a16 = quant == "int4_w4a16"
+            assert int(row["q_size_n"]) == 0 and int(row["q_size_k"]) == (W4A16_GROUP_SIZE if w4a16 else 0), (
+                f"{path}:{line}: unexpected quantization group")
+            modes, _ = decode_pair(row["sol_id"], same_bm=not w4a16)
             n, k = int(row["inter_dim"]), int(row["model_dim"])
-            validate_channelwise_reduce_k(quant, modes[0], k, False, 2 * n)
-            validate_channelwise_reduce_k(quant, modes[1], n, True, k)
+            if not w4a16:  # W4A16 modes are validated by the tuner that wrote them
+                validate_channelwise_reduce_k(quant, modes[0], k, False, 2 * n)
+                validate_channelwise_reduce_k(quant, modes[1], n, True, k)
             key = (row["arch"], row["quant_type"], row["indtype"],
                    int(row["inter_dim"]), int(row["model_dim"]), int(row["expert"]),
                    int(row["topk"]) if row["topk"] else None,
@@ -2719,8 +2695,9 @@ def find_csv_config(root, arch, quant, e, n, k, topk, cu, bottom, indtype=None):
     table = min(candidates, key=lambda item: item[0])[1]
     result = {}
     for token, sol in table.items():
-        modes, bm = decode_pair(sol)
-        result[token] = {"MODE": modes[int(bottom)], "BLOCK_SIZE_M": bm}
+        modes, _ = decode_pair(sol, same_bm=quant != "int4_w4a16")
+        mode = modes[int(bottom)]
+        result[token] = {"MODE": mode, "BLOCK_SIZE_M": mode // 1000 % 100 * 16}
     return result
 
 
@@ -2732,7 +2709,7 @@ def write_config_csv(path, rows):
             for row in csv.DictReader(stream):
                 merged[tuple(str(row[field]) for field in FIELDS if field not in ("sol_id", "time_us"))] = row
     for row in rows:
-        decode_pair(row["sol_id"])
+        decode_pair(row["sol_id"], same_bm=row["quant_type"] != QUANT_TYPES["int4_w4a16"])
         merged[tuple(str(row[field]) for field in FIELDS if field not in ("sol_id", "time_us"))] = row
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w", newline="") as stream:
@@ -2747,15 +2724,16 @@ def rows_from_pair(top, bottom, arch, quant, e, n, k, topk=None, cu=None,
     rows = []
     for token in sorted(top, key=int):
         sol = f"{top[token]['MODE']}+{bottom[token]['MODE']}"
-        _, bm = decode_pair(sol)
-        for config in (top[token], bottom[token]):
+        modes, _ = decode_pair(sol, same_bm=quant != "int4_w4a16")
+        for config, mode in zip((top[token], bottom[token]), modes):
+            bm = mode // 1000 % 100 * 16
             assert int(config.get("BLOCK_SIZE_M", bm)) == bm, f"Config BM disagrees with {sol}"
         for indtype in indtypes:
             rows.append(dict(zip(FIELDS, (arch, QUANT_TYPES[quant], indtype, int(token), n, k,
-                                         e, topk if topk is not None else "", 0, 0, "moe_c", sol,
+                                         e, topk if topk is not None else "", 0,
+                                         W4A16_GROUP_SIZE if quant == "int4_w4a16" else 0, "moe_c", sol,
                                          (times or {}).get(str(token), ""), cu if cu is not None else ""))))
     return rows
-
 
 
 def _find_closest_channelwise_config(
@@ -2861,12 +2839,19 @@ def get_config_file_name(E: int,
 
 
 def _get_gfx_version() -> str:
-    return torch.cuda.get_device_properties(0).gcnArchName.split(':')[0]
+    env_arch = os.getenv("GPU_ARCHS") or os.getenv("PYTORCH_ROCM_ARCH")
+    if env_arch:
+        return env_arch.split(";")[0].split(",")[0]
+    if torch.cuda.is_available():
+        return torch.cuda.get_device_properties(0).gcnArchName.split(':')[0]
+    return "gfx938"
 
 
 def _resolve_num_cu(arch: Optional[str], num_cu: Optional[int] = None) -> Optional[int]:
     if num_cu is not None:
         return num_cu
+    if not torch.cuda.is_available():
+        return None
     return torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
 
 
@@ -3149,6 +3134,12 @@ def get_moe_configs_marlin(
     if dtype in ("fp8_w8a8", "int8_w8a8", "int8_w4a8"):
         return _find_closest_channelwise_config(
             E, N, dtype, is_bottom, K, top_k, resolved_cu, arch, indtype=indtype)
+    if dtype == "int4_w4a16" and block_k in (None, W4A16_GROUP_SIZE):
+        # Tuned CSV first; untuned shapes fall back to the JSON files below.
+        csv_config = find_csv_config(_moe_c_config_root(), arch, dtype, E, N, K, top_k,
+                                     resolved_cu, is_bottom, indtype)
+        if csv_config is not None:
+            return csv_config
     csv_config = _load_fp8_channel_csv_config(E, N, K, dtype, is_bottom, top_k, resolved_cu)
     if csv_config is not None:
         return csv_config
@@ -3415,9 +3406,10 @@ def try_get_optimal_moe_config_marlin(
                 top_k=top_k,
             )
             if configs:
-                key_selected = min(configs.keys(), key=lambda x: abs(x - M))
-                config = dict(configs[key_selected])
-                config["key_selected"] = key_selected
+                selected_m_key = min(configs.keys(), key=lambda x: abs(x - M))
+                config = dict(configs[selected_m_key])
+                config["selected_m_key"] = selected_m_key
+                config["key_selected"] = selected_m_key
             else:
                 logger.warning("W16A16 Marlin config fallback for M=%s", M)
                 config = get_default_config(
@@ -3426,7 +3418,7 @@ def try_get_optimal_moe_config_marlin(
             return config
 
         logical_k = None
-        if dtype in ("int8_w4a8", "fp4_w4a8"):
+        if dtype in ("int8_w4a8", "fp4_w4a8", "int4_w4a16"):
             logical_k = w2_shape[1]
         elif dtype in ("fp8_w8a8", "int8_w8a8") and block_shape is None:
             logical_k = w2_shape[1] if is_bottom else w1_shape[2]
@@ -3445,9 +3437,10 @@ def try_get_optimal_moe_config_marlin(
         if configs:
             # If an optimal configuration map has been found, look up the
             # optimal config
-            key_selected = min(configs.keys(), key=lambda x: abs(x - M))
-            config = dict(configs[key_selected])
-            config["key_selected"] = key_selected
+            selected_m_key = min(configs.keys(), key=lambda x: abs(x - M))
+            config = dict(configs[selected_m_key])
+            config["selected_m_key"] = selected_m_key
+            config["key_selected"] = selected_m_key
         else:
             # Else use the default config
             config = get_default_config(M, E, N, w1_shape[2], top_k, dtype,
@@ -4296,11 +4289,13 @@ def fused_experts_impl_marlin(hidden_states: torch.Tensor,
                 "MODE": int(w16a16_config[0]),
                 "BLOCK_SIZE_M": int(w16a16_config[1]),
                 "DELTA": int(w16a16_config[2]),
+                "selected_m_key": tokens_in_chunk,
                 "key_selected": tokens_in_chunk,
             }, {
                 "MODE": int(w16a16_config[3]),
                 "BLOCK_SIZE_M": int(w16a16_config[4]),
                 "DELTA": int(w16a16_config[5]),
+                "selected_m_key": tokens_in_chunk,
                 "key_selected": tokens_in_chunk,
             })
         elif use_w16a16:
@@ -4322,7 +4317,7 @@ def fused_experts_impl_marlin(hidden_states: torch.Tensor,
                 config = get_config_func(tokens_in_chunk, is_bottom=False)
             config2 = None
         channelwise = (use_fp8_w8a8 or use_int8_w8a8 or use_int8_w4a8) and block_shape is None
-        if use_fp4_w4a8 or channelwise:
+        if use_fp4_w4a8 or channelwise or use_int4_w4a16:
             config2 = get_config_func(
                 tokens_in_chunk,
                 is_bottom=True,
@@ -4337,13 +4332,22 @@ def fused_experts_impl_marlin(hidden_states: torch.Tensor,
                          if a2_scale is not None else None)
 
         find_best = os.environ.get("WHICH_TO_TEST")
-        sorting_method = _channel_mode_sorting(int(config["MODE"]))
-        use_moe_align_sorting = sorting_method == "moe_align"
-        if channelwise:
-            if config["BLOCK_SIZE_M"] != config2["BLOCK_SIZE_M"]:
+        use_moe_align_sorting = _moe_c_config_uses_moe_align(config, use_fp8_w8a8)
+        if channelwise and config2 is not None:
+            if config.get("BLOCK_SIZE_M") != config2.get("BLOCK_SIZE_M"):
                 raise ValueError("channelwise GEMM1/GEMM2 must have the same BLOCK_SIZE_M")
-            if sorting_method != _channel_mode_sorting(int(config2["MODE"])):
+            if _moe_c_config_uses_moe_align(config2, use_fp8_w8a8) != use_moe_align_sorting:
                 raise ValueError("channelwise GEMM1/GEMM2 must use the same routing layout")
+        fuse_silu = dual_routing = False
+        if use_int4_w4a16 and not find_best and config2 is not None:
+            # GEMM1 may fuse silu_and_mul; fall back to the unfused twin (mode - 100) otherwise.
+            fuse_silu = w4a16_fuse_silu(config["MODE"])
+            if fuse_silu and not (activation == "silu" and is_gated and gemm1_alpha is None
+                                  and gemm1_limit is None):
+                config = dict(config, MODE=int(config["MODE"]) - 100)
+                fuse_silu = False
+            dual_routing = int(config["BLOCK_SIZE_M"]) != int(config2["BLOCK_SIZE_M"])
+        w4a16_gemm2_routing = None
         if use_w16a16:
             assert config2 is not None
             block_size_m1 = int(BM if find_best else config["BLOCK_SIZE_M"])
@@ -4392,7 +4396,12 @@ def fused_experts_impl_marlin(hidden_states: torch.Tensor,
                                                                                 )
 
         else:
-            if(use_int4_w4a16 or use_fp4_w4a16 or use_int8_w4a8 or use_fp4_w4a8 or use_int8_w8a16):
+            if dual_routing:
+                (sorted_token_ids, expert_ids, num_tokens_post_padded), w4a16_gemm2_routing = (
+                    moe_align_block_size_dual(curr_topk_ids, int(config["BLOCK_SIZE_M"]),
+                                              int(config2["BLOCK_SIZE_M"]),
+                                              global_num_experts, expert_map))
+            elif(use_int4_w4a16 or use_fp4_w4a16 or use_int8_w4a8 or use_fp4_w4a8 or use_int8_w8a16):
                 sorted_token_ids, expert_ids, num_tokens_post_padded = (
                     moe_align_block_size(curr_topk_ids, config["BLOCK_SIZE_M"],
                                         global_num_experts, expert_map))
@@ -4414,7 +4423,7 @@ def fused_experts_impl_marlin(hidden_states: torch.Tensor,
 
         invoke_fused_moe_kernel_marlin(curr_hidden_states,
                                 w1,
-                                intermediate_cache1,
+                                intermediate_cache2 if fuse_silu else intermediate_cache1,
                                 curr_a1_scale,
                                 w1_scale,
                                 w1_zp,
@@ -4438,12 +4447,18 @@ def fused_experts_impl_marlin(hidden_states: torch.Tensor,
                                 use_int4_w4a16_base=use_int4_w4a16_base,
                                 use_w16a16=use_w16a16,
                                 is_bottom = False,
-                                key_selected=config.get("key_selected"),
+                                selected_m_key=config.get("selected_m_key", config.get("key_selected")),
                                 block_shape=block_shape,
                                 real_size_k=fp8_original_k if use_fp8_w8a8 else None)
 
-        if activation == "silu" :
-                moe_c_silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
+        if fuse_silu:
+                pass  # GEMM1 already wrote silu(gate) * up into intermediate_cache2
+        elif activation == "silu" and is_gated and gemm1_alpha is None:
+                moe_c_silu_and_mul(
+                    intermediate_cache2,
+                    intermediate_cache1.view(-1, N),
+                    limit=gemm1_limit,
+                )
 
         elif activation == "situ":
                 moe_c_situ_glu(
@@ -4464,13 +4479,17 @@ def fused_experts_impl_marlin(hidden_states: torch.Tensor,
                 )
         
 
+        expert_ids_for_gemm2, num_tokens_post_padded_for_gemm2 = expert_ids, num_tokens_post_padded
         if use_w16a16:
             assert config2 is not None
             config = config2
             sorted_token_ids_for_gemm2 = sorted_token_ids2
-        elif (use_fp4_w4a8 or channelwise) and config2 is not None:
+        elif (use_fp4_w4a8 or channelwise or use_int4_w4a16) and config2 is not None:
             config = config2
             sorted_token_ids_for_gemm2 = sorted_token_ids
+            if w4a16_gemm2_routing is not None:
+                sorted_token_ids_for_gemm2, expert_ids_for_gemm2, num_tokens_post_padded_for_gemm2 = (
+                    w4a16_gemm2_routing)
         else:
             if use_moe_wna16_cuda and config_dtype in ["int4_w4a16","fp4_w4a16","int8_w8a8","fp8_w8a8","int8_w8a16", "int8_w4a8", "fp4_w4a8"] :
                 config = get_config_func(tokens_in_chunk,is_bottom=True,use_moe_wna16_cuda=use_moe_wna16_cuda)
@@ -4488,8 +4507,8 @@ def fused_experts_impl_marlin(hidden_states: torch.Tensor,
                                 curr_topk_weights,
                                 curr_topk_ids,
                                 sorted_token_ids_for_gemm2,
-                                expert_ids,
-                                num_tokens_post_padded,
+                                expert_ids_for_gemm2,
+                                num_tokens_post_padded_for_gemm2,
                                 True,
                                 top_k_num,
                                 int(config["MODE"]),
@@ -4505,7 +4524,7 @@ def fused_experts_impl_marlin(hidden_states: torch.Tensor,
                                 use_int4_w4a16_base=use_int4_w4a16_base,
                                 use_w16a16=use_w16a16,
                                 is_bottom = True,
-                                key_selected=config.get("key_selected") ,
+                                selected_m_key=config.get("selected_m_key", config.get("key_selected")) ,
                                 block_shape=block_shape,
                                 real_size_k=None)
         mode_use_triton_moe_sum = out_hidden_states.dtype == torch.float16 or  \

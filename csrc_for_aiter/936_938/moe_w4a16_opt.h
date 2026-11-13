@@ -5,6 +5,7 @@
 
 #include "moe_w4a16_utils.h"
 #include "moe_w4a16_config.h"
+#include "moe_w4a16_prefill.h"
 
 template <
     typename Element,
@@ -383,6 +384,22 @@ __global__ void __launch_bounds__(512, 1) GEMM_NT_2STAGE(
   }
 }
 
+// Dynamic LDS of the decode launchers.  1-stage: the epilogue stages BM / 2 output rows per phase, so
+// tiles with BM / 2 * BN * sizeof(T) > 16 KiB need more than the 16 KiB main-loop buffers.
+// 2-stage: BM * BN output tile plus store pad; the hardware limit is 64 KiB per block, so a tile
+// that asks for more (BM256 x BN128 bf16: 66560 B) is clamped to it.
+template <int BLOCK_SIZE_M, int BLOCK_SIZE_N, int BLOCK_SIZE_K, int WARP_N, int WARP_K, int STAGES, typename T>
+constexpr int w4a16_decode_lds_bytes()
+{
+  constexpr int kMaxLds = 64 * 1024;
+  if constexpr (STAGES == 1)
+    return std::max<int>(16 * 1024, BLOCK_SIZE_M / 2 * BLOCK_SIZE_N * (int)sizeof(T));
+  else
+    return std::min<int>(kMaxLds, std::max<int>({BLOCK_SIZE_M * BLOCK_SIZE_N * (int)sizeof(T) + 1024 /*for store pad*/,
+                                                 BLOCK_SIZE_M * BLOCK_SIZE_K * (int)sizeof(T),
+                                                 w4a16_ksplit_lds_bytes<BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_N, WARP_K>()}));
+}
+
 template <int BLOCK_SIZE_M, int BLOCK_SIZE_N, int BLOCK_SIZE_K, int WARP_M, int WARP_N, int WARP_K, int STAGES, typename T>
 void launch_moe_w4a16_first_stage_decode(const GemmParams_w4a16<T> &params)
 {
@@ -408,8 +425,11 @@ void launch_moe_w4a16_first_stage_decode(const GemmParams_w4a16<T> &params)
     gridDim.y = 1;                                                                                      // k方向
     auto arch = W4A16_UTILS::ARCH::getArch();
 
-    const int lds_size = (STAGES == 1) ? (16 * 1024) : std::max(BLOCK_SIZE_M * BLOCK_SIZE_N * sizeof(T) + 1024 /*for store pad*/, BLOCK_SIZE_M * BLOCK_SIZE_K * sizeof(T));
+    const int lds_size = w4a16_decode_lds_bytes<BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_N, WARP_K, STAGES, T>();
     const int shared_mem_size = lds_size;
+    const int k_stages = params.size_k / BLOCK_SIZE_K; // stages per warp_k in the 2-stage helper
+    TORCH_CHECK(STAGES == 1 || (params.size_k % BLOCK_SIZE_K == 0 && k_stages >= 2 && k_stages % 2 == 0),
+                "moe_w4a16 gemm1: size_k=", params.size_k, " is not supported with BLOCK_SIZE_K=", BLOCK_SIZE_K);
 
     if constexpr (STAGES == 1)
     {
@@ -437,7 +457,7 @@ void launch_moe_w4a16_first_stage_decode(const GemmParams_w4a16<T> &params)
     {
 
       W4A16_ARCH_SWITCH(arch, [&]
-                        { W4A16_SCALE_SWITCH(params.size_k, [&]
+                        { W4A16_KSPLIT_SCALE_SWITCH(k_stages, [&]
                                              { GEMM_NT_2STAGE<T, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, GROUP_N,
                                                               GROUP_K, STAGES, mul_topk_weight, INTERLEAVE, DEQUANT_16BIT, PACK_SCALES><<<gridDim, blockDim, shared_mem_size, stream>>>(
                                                    params.ptr_A,
@@ -473,8 +493,11 @@ void launch_moe_w4a16_second_stage_decode(const GemmParams_w4a16<T> &params)
   blockDim.z = 1;
   auto arch = W4A16_UTILS::ARCH::getArch();
 
-  const int lds_size = (STAGES == 1) ? (16 * 1024) : std::max(BLOCK_SIZE_M * BLOCK_SIZE_N * sizeof(T) + 1024 /*for store pad*/, BLOCK_SIZE_M * BLOCK_SIZE_K * sizeof(T));
+  const int lds_size = w4a16_decode_lds_bytes<BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_N, WARP_K, STAGES, T>();
   const int shared_mem_size = lds_size;
+  const int k_stages = params.size_k / BLOCK_SIZE_K; // stages per warp_k in the 2-stage helper
+  TORCH_CHECK(STAGES == 1 || (params.size_k % BLOCK_SIZE_K == 0 && k_stages >= 2 && k_stages % 2 == 0),
+              "moe_w4a16 gemm2: size_k=", params.size_k, " is not supported with BLOCK_SIZE_K=", BLOCK_SIZE_K);
 
   const hipStream_t stream = at::cuda::getCurrentHIPStream();
 
@@ -513,7 +536,7 @@ void launch_moe_w4a16_second_stage_decode(const GemmParams_w4a16<T> &params)
     {
 
       W4A16_ARCH_SWITCH(arch, [&]
-                        { W4A16_SCALE_SWITCH(params.size_k, [&]
+                        { W4A16_KSPLIT_SCALE_SWITCH(k_stages, [&]
                                              { GEMM_NT_2STAGE<T, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, GROUP_N,
                                                               GROUP_K, STAGES, mul_topk_weight, INTERLEAVE, DEQUANT_16BIT, PACK_SCALES><<<gridDim, blockDim, shared_mem_size, stream>>>(
                                                    params.ptr_A,
