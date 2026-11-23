@@ -32,9 +32,9 @@
       inline_s_load_dwordx4(token_index_arr.vec4_i32[m], g_s_sorted_token_ids, 0);                                                                                                        \
     }                                                                                                                                                                                     \
                                                                                                                                                                                           \
-    __builtin_amdgcn_sched_barrier(0);                                                                                                                                                    \
+    __builtin_hcu_sched_barrier(0);                                                                                                                                                    \
     asm volatile("s_waitcnt lgkmcnt(0)");                                                                                                                                                 \
-    __builtin_amdgcn_sched_barrier(0);                                                                                                                                                    \
+    __builtin_hcu_sched_barrier(0);                                                                                                                                                    \
                                                                                                                                                                                           \
     for (int m = 0; m < BLOCK_SIZE_M / 16; m++)                                                                                                                                           \
     {                                                                                                                                                                                     \
@@ -50,16 +50,16 @@
       const int32_t token_index = token_index_arr.i32[m_id];                                                                                                                              \
       if (token_index / top_k < size_m)                                                                                                                                                   \
       {                                                                                                                                                                                   \
-        int lds_offset = __builtin_amdgcn_readfirstlane((warp_id * (BLOCK_SIZE_M / WARP_NUM) + m_id) * BLOCK_SIZE_K / 2 + (warp_id * ((BLOCK_SIZE_M + WARP_NUM - 1) / WARP_NUM) + m_id)); \
+        int lds_offset = __builtin_hcu_readfirstlane((warp_id * (BLOCK_SIZE_M / WARP_NUM) + m_id) * BLOCK_SIZE_K / 2 + (warp_id * ((BLOCK_SIZE_M + WARP_NUM - 1) / WARP_NUM) + m_id)); \
         origin_k += token_index / top_k * size_k + blockIdx.x * BLOCK_SIZE_K_LOOPS * BLOCK_SIZE_K + k_loop * BLOCK_SIZE_K;                                                                \
         inline_buffer_load_dword_lds(block_input, g_input, lds_offset, 0, origin_k / 2);                                                                                                  \
       }                                                                                                                                                                                   \
     }                                                                                                                                                                                     \
                                                                                                                                                                                           \
-    __builtin_amdgcn_sched_barrier(0);                                                                                                                                                    \
+    __builtin_hcu_sched_barrier(0);                                                                                                                                                    \
     asm volatile("s_waitcnt vmcnt(0) \n\t"                                                                                                                                                \
                  "s_barrier");                                                                                                                                                            \
-    __builtin_amdgcn_sched_barrier(0);                                                                                                                                                    \
+    __builtin_hcu_sched_barrier(0);                                                                                                                                                    \
                                                                                                                                                                                           \
     /*左矩阵提前到这里空出lds（lds直接读到register）的使用给酉矩阵（16k）提高并行度（4个blocks）   */                                                                                     \
     _Pragma("unroll") for (int tmp_k = 0; tmp_k < (BLOCK_SIZE_K / 32); tmp_k++)                                                                                                           \
@@ -78,10 +78,10 @@
         }                                                                                                                                                                                 \
       }                                                                                                                                                                                   \
     }                                                                                                                                                                                     \
-    __builtin_amdgcn_sched_barrier(0);                                                                                                                                                    \
+    __builtin_hcu_sched_barrier(0);                                                                                                                                                    \
     asm volatile("s_waitcnt lgkmcnt(0) \n\t"                                                                                                                                              \
                  "s_barrier");                                                                                                                                                            \
-    __builtin_amdgcn_sched_barrier(0);                                                                                                                                                    \
+    __builtin_hcu_sched_barrier(0);                                                                                                                                                    \
                                                                                                                                                                                           \
     { /*stage 1 load data*/                                                                                                                                                               \
       constexpr int W_LOAD_REQUESTS = WARP_N / 4;                                                                                                                                         \
@@ -90,17 +90,17 @@
                                                                                                                                                                                           \
       {                                                                                                                                                                                   \
                                                                                                                                                                                           \
-        __builtin_amdgcn_sched_barrier(0);                                                                                                                                                \
+        __builtin_hcu_sched_barrier(0);                                                                                                                                                \
         _Pragma("unroll") for (int load = 0; load < W_LOAD_REQUESTS; ++load)                                                                                                              \
         {                                                                                                                                                                                 \
           int w_warp_buffer_load_lds_offset = warp_id * 80 * 8 + load * 4 * 80 * 8;                                                                                                       \
           int gvOffset_s = 0;                                                                                                                                                             \
           lds_stage_offset = stage_id * (80 * BLOCK_SIZE_K / 8);                                                                                                                          \
           int gvOffset_v = (weight_offset + load * 4 * size_n);                                                                                                                           \
-          int lds_offset = __builtin_amdgcn_readfirstlane(w_warp_buffer_load_lds_offset / pack_factor + lds_stage_offset);                                                                \
+          int lds_offset = __builtin_hcu_readfirstlane(w_warp_buffer_load_lds_offset / pack_factor + lds_stage_offset);                                                                \
           inline_buffer_load_dword_lds(weight_lds, g_expert_qweight, lds_offset, gvOffset_s, gvOffset_v);                                                                                 \
         }                                                                                                                                                                                 \
-        __builtin_amdgcn_sched_barrier(0);                                                                                                                                                \
+        __builtin_hcu_sched_barrier(0);                                                                                                                                                \
       }                                                                                                                                                                                   \
                                                                                                                                                                                           \
     } /*global-> lds (copy from fa)*/                                                                                                                                                     \
@@ -115,14 +115,14 @@
   auto g_expert_scales = tcp_cache_swizzle_func<1, scalar_t>(expert_scales);                                                                                                              \
                                                                                                                                                                                           \
   {                                                                                                                                                                                       \
-    __builtin_amdgcn_sched_barrier(0);                                                                                                                                                    \
+    __builtin_hcu_sched_barrier(0);                                                                                                                                                    \
     int scales_offset_tmp =                                                                                                                                                               \
         (scale_offset_n * size_k + offset_k) / group_size / GROUPS;                                                                                                                       \
     if constexpr (GROUPS == 2)                                                                                                                                                            \
     {                                                                                                                                                                                     \
       inline_buffer_load_dword<float, 2>(expert_scales_groups.float_array[0], scales_offset_tmp, g_expert_scales, 0);                                                                     \
     }                                                                                                                                                                                     \
-    __builtin_amdgcn_sched_barrier(0);                                                                                                                                                    \
+    __builtin_hcu_sched_barrier(0);                                                                                                                                                    \
                                                                                                                                                                                           \
     if (has_zp)                                                                                                                                                                           \
     {                                                                                                                                                                                     \
@@ -145,31 +145,31 @@
                                                                                                                                                                                           \
     {                                                                                                                                                                                     \
                                                                                                                                                                                           \
-      __builtin_amdgcn_sched_barrier(0);                                                                                                                                                  \
+      __builtin_hcu_sched_barrier(0);                                                                                                                                                  \
       _Pragma("unroll") for (int load = 0; load < W_LOAD_REQUESTS; ++load)                                                                                                                \
       {                                                                                                                                                                                   \
         int w_warp_buffer_load_lds_offset = warp_id * 80 * 8 + load * 4 * 80 * 8;                                                                                                         \
         int gvOffset_s = 0;                                                                                                                                                               \
         lds_stage_offset = stage_id * (80 * BLOCK_SIZE_K / 8);                                                                                                                            \
         int gvOffset_v = (weight_offset + load * 4 * size_n);                                                                                                                             \
-        int lds_offset = __builtin_amdgcn_readfirstlane(w_warp_buffer_load_lds_offset / pack_factor + lds_stage_offset);                                                                  \
+        int lds_offset = __builtin_hcu_readfirstlane(w_warp_buffer_load_lds_offset / pack_factor + lds_stage_offset);                                                                  \
         inline_buffer_load_dword_lds(weight_lds, g_expert_qweight, lds_offset, gvOffset_s, gvOffset_v);                                                                                   \
       }                                                                                                                                                                                   \
-      __builtin_amdgcn_sched_barrier(0);                                                                                                                                                  \
+      __builtin_hcu_sched_barrier(0);                                                                                                                                                  \
     }                                                                                                                                                                                     \
                                                                                                                                                                                           \
-    __builtin_amdgcn_sched_barrier(0);                                                                                                                                                    \
+    __builtin_hcu_sched_barrier(0);                                                                                                                                                    \
     asm volatile("s_waitcnt vmcnt(4) \n\t"                                                                                                                                                \
                  "s_barrier");                                                                                                                                                            \
-    __builtin_amdgcn_sched_barrier(0);                                                                                                                                                    \
+    __builtin_hcu_sched_barrier(0);                                                                                                                                                    \
                                                                                                                                                                                           \
   } /*global-> lds (copy from fa)*/                                                                                                                                                       \
   else                                                                                                                                                                                    \
   {                                                                                                                                                                                       \
-    __builtin_amdgcn_sched_barrier(0);                                                                                                                                                    \
+    __builtin_hcu_sched_barrier(0);                                                                                                                                                    \
     asm volatile("s_waitcnt vmcnt(0) \n\t"                                                                                                                                                \
                  "s_barrier");                                                                                                                                                            \
-    __builtin_amdgcn_sched_barrier(0);                                                                                                                                                    \
+    __builtin_hcu_sched_barrier(0);                                                                                                                                                    \
   }                                                                                                                                                                                       \
                                                                                                                                                                                           \
   { /*stage 0 , ds read*/                                                                                                                                                                 \
@@ -180,7 +180,7 @@
         /*lds -> vgpr use ds_read_m; right matrix*/                                                                                                                                       \
                                                                                                                                                                                           \
         int *weight_v4int8 = (int *)(weight_lds);                                                                                                                                         \
-        __builtin_amdgcn_sched_barrier(0);                                                                                                                                                \
+        __builtin_hcu_sched_barrier(0);                                                                                                                                                \
         asm volatile("s_setprio 1");                                                                                                                                                      \
         _Pragma("unroll") for (int j = 0; j < (128 / 32); j++)                                                                                                                            \
         { /*k direction,K_TILE=64, (t0,t16,t32,t48) load 16 int8 data per loop*/                                                                                                          \
@@ -188,7 +188,7 @@
           inline_ds_read_b32_no_wait<int>(weight_v4int8, lds_offset, expert_w_reg[j].i32);                                                                                                \
         }                                                                                                                                                                                 \
         asm volatile("s_setprio 0");                                                                                                                                                      \
-        __builtin_amdgcn_sched_barrier(0);                                                                                                                                                \
+        __builtin_hcu_sched_barrier(0);                                                                                                                                                \
       }                                                                                                                                                                                   \
                                                                                                                                                                                           \
     } /*ds-read: register read data from lds*/                                                                                                                                            \
@@ -234,10 +234,10 @@
       } /*scale and zero data load*/                                                                                                                                                      \
     } /*register -> register*/                                                                                                                                                            \
                                                                                                                                                                                           \
-    __builtin_amdgcn_sched_barrier(0);                                                                                                                                                    \
+    __builtin_hcu_sched_barrier(0);                                                                                                                                                    \
     asm volatile("s_waitcnt lgkmcnt(0) \n\t"                                                                                                                                              \
                  "s_barrier");                                                                                                                                                            \
-    __builtin_amdgcn_sched_barrier(0);                                                                                                                                                    \
+    __builtin_hcu_sched_barrier(0);                                                                                                                                                    \
                                                                                                                                                                                           \
     _Pragma("unroll") for (int j = 0; j < K_TILE / 32; j++)                                                                                                                               \
     { /*k direction,K_TILE=64, (t0,t16,t32,t48) load 16 int8 data per loop*/                                                                                                              \
@@ -253,7 +253,7 @@
                                                                                                                                                                                           \
     /*======================================= mmac compute =============================================*/                                                                                \
     {                                                                                                                                                                                     \
-      __builtin_amdgcn_sched_barrier(0);                                                                                                                                                  \
+      __builtin_hcu_sched_barrier(0);                                                                                                                                                  \
                                                                                                                                                                                           \
       _Pragma("unroll") for (int m = 0; m < ((BLOCK_SIZE_M + 15) / 16) /*num_valid_tokens*/; m++)                                                                                         \
       {                                                                                                                                                                                   \
@@ -284,7 +284,7 @@
         }                                                                                                                                                                                 \
         asm volatile("s_setprio 0");                                                                                                                                                      \
       }                                                                                                                                                                                   \
-      __builtin_amdgcn_sched_barrier(0);                                                                                                                                                  \
+      __builtin_hcu_sched_barrier(0);                                                                                                                                                  \
                                                                                                                                                                                           \
     } /*stage 0 mmac*/                                                                                                                                                                    \
   } /*stage 0*/                                                                                                                                                                           \
@@ -379,7 +379,7 @@ __global__ void __launch_bounds__(256, 1) moe_wna16_gemm_kernel(
   auto g_sorted_token_ids = tcp_cache_swizzle_func<1, int32_t>(sorted_token_ids);
 
   int warp_id_vec = (threadIdx.x / 64); // warp id in a block
-  int warp_id = __builtin_amdgcn_readfirstlane(warp_id_vec);
+  int warp_id = __builtin_hcu_readfirstlane(warp_id_vec);
   int lane_id = (threadIdx.x & 63); // lane id, 0-63
 
   int laneid_shfl_4 = lane_id >> 4;

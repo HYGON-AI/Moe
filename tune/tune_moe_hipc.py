@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Unified HIPC moe_c config auditor and tune entry point.
 
-The HIPC mode namespace is shared by the channelwise quantizers and has the
+The HIPC mode namespace is shared by the HIPC quantizers and has the
 fixed-width form ``S F K MM VVV``::
 
     S   stage (1=GEMM1, 2=GEMM2)
@@ -11,27 +11,33 @@ fixed-width form ``S F K MM VVV``::
     VVV profile (the profile owns N_LOOP and other compile-time constants)
 
 This file deliberately keeps quantizer-specific legality in descriptors.  The
-common flow only decodes modes, validates config shape, writes reports, and
-delegates correctness/performance execution to the existing per-quant tests.
-It therefore cannot accidentally make an INT8 or W4A8 mode look like FP8.
+common flow decodes modes, validates shapes, and tunes independent GEMM stages.
+Quantizer-specific input preparation, references and pairing preserve the runtime
+contract for each profile.
 """
 
 import argparse
 import csv
 import gc
+import hashlib
 import json
 import os
 import subprocess
 import sys
+import tempfile
 from dataclasses import asdict, dataclass, replace
+from operator import attrgetter
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CONFIG_ROOT = ROOT / "moe_c_configs"
 sys.path.insert(0, str(ROOT))
-from moe_utils.fused_moe_c import CSV_NAMES, find_csv_config, rows_from_pair, write_config_csv
+from moe_utils.channel_mode import mode
+from moe_utils.w4a16_modes import (BSTAT_FALLBACK_TILE, DECODE_BK, DECODE_K, W4A16_CSV_NAME, W4A16_GROUP_SIZE,
+                                   W4A16_MODE_SCHEMA, W4A16_MODES_BY_STAGE, W4A16_SPECS, resolve_template)
+from tune.hipc_runtime import CHECKOUT_ROOT, CONFIG_ROOT, IN_AITER, fused_moe, ops
+from tune.w4a16_tune_utils import W4A16_TOLERANCES, W4A16BenchRow, bench_candidate, make_inputs
 
 
 @dataclass(frozen=True)
@@ -44,6 +50,7 @@ class Shape:
     dtype: str
     arch: str
     cu: Optional[int] = None
+    group_size: int = W4A16_GROUP_SIZE
 
 
 @dataclass(frozen=True)
@@ -127,24 +134,55 @@ class ModeDescriptor:
             return "shape exceeds CK sorting's 24-bit token / 8-bit topk encoding"
         if self.sorting == 1 and shape.m * shape.topk + shape.e * (self.bm - 1) >= 1 << 31:
             return "moe_align padded route indices exceed signed int32"
+        effective = self.for_shape(shape)
         out_n = shape.k if self.stage == 2 else 2 * shape.n
         reduce_k = shape.n if self.stage == 2 else shape.k
         # Zero dimensions are unknown in config filenames, not a tuning shape.
         if out_n:
-            if self.exact_out_n is not None and out_n != self.exact_out_n:
-                return f"out_n={out_n}, expected {self.exact_out_n}"
-            tile_n = self.for_shape(shape).tile_n
-            if not self.supports_n_tail and out_n % tile_n:
+            if effective.exact_out_n is not None and out_n != effective.exact_out_n:
+                return f"out_n={out_n}, expected {effective.exact_out_n}"
+            tile_n = effective.tile_n
+            if not effective.supports_n_tail and out_n % tile_n:
                 return f"out_n={out_n} is not divisible by tile_n={tile_n}"
         if reduce_k:
-            if self.supported_reduce_k and reduce_k not in self.supported_reduce_k:
-                return f"reduce_k={reduce_k} is not in {self.supported_reduce_k}"
-            if reduce_k < self.min_reduce_k:
-                return f"reduce_k={reduce_k} is below minimum {self.min_reduce_k}"
-            remainder = reduce_k % self.k_step
-            if remainder and remainder != self.k_tail:
-                return f"reduce_k={reduce_k} needs step={self.k_step}, tail={self.k_tail}"
+            if effective.supported_reduce_k and reduce_k not in effective.supported_reduce_k:
+                return f"reduce_k={reduce_k} is not in {effective.supported_reduce_k}"
+            if reduce_k < effective.min_reduce_k:
+                return f"reduce_k={reduce_k} is below minimum {effective.min_reduce_k}"
+            remainder = reduce_k % effective.k_step
+            if remainder and remainder != effective.k_tail:
+                return f"reduce_k={reduce_k} needs step={effective.k_step}, tail={effective.k_tail}"
         return None
+
+
+@dataclass(frozen=True)
+class W4A16ModeDescriptor(ModeDescriptor):
+    implementation: str = ""
+    template: Optional[Dict[str, int]] = None
+    fp16_overrides: Optional[Dict[str, int]] = None
+    unfused_mode: Optional[int] = None
+    selection_notes: Tuple[str, ...] = ()
+
+    def for_shape(self, shape: Shape) -> "W4A16ModeDescriptor":
+        out_n = shape.k if self.stage == 2 else 2 * shape.n
+        reduce_k = shape.n if self.stage == 2 else shape.k
+        implementation, params, notes = resolve_template(
+            self.implementation, self.template, self.fp16_overrides,
+            self.stage, shape.dtype, out_n, reduce_k,
+            output_rows=shape.m * shape.topk,
+        )
+        fields = _w4a16_launch_fields(self.stage, implementation, params)
+        return replace(self, implementation=implementation, template=params,
+                       fp16_overrides=None, selection_notes=tuple(notes), **fields)
+
+    def validate(self, shape: Shape) -> Optional[str]:
+        reduce_k = shape.k if self.stage == 1 else shape.n
+        if self.implementation == "legacy_decode" and shape.group_size == 128:
+            return "legacy decode requires group_size=32"
+        if (self.implementation == "legacy_decode" and self.template["st"] == 1
+                and reduce_k and reduce_k != 256 and reduce_k % (8 * self.template["bk"])):
+            return f"legacy single-stage decode cannot pack scales for reduce_k={reduce_k}"
+        return super().validate(shape)
 
 
 @dataclass(frozen=True)
@@ -193,14 +231,14 @@ def decode_mode(mode: int) -> Candidate:
     )
 
 
-def mode(stage: int, sorting: int, family: int, bm: int, profile: int) -> int:
-    if stage not in (1, 2) or sorting not in (0, 1):
-        raise ValueError("invalid mode prefix")
-    if bm <= 0 or bm % 16 or bm // 16 >= 100:
-        raise ValueError(f"BM is not representable: {bm}")
-    if not 0 < profile < 1000:
-        raise ValueError(f"profile is not representable: {profile}")
-    return stage * 10_000_000 + sorting * 1_000_000 + family * 100_000 + (bm // 16) * 1_000 + profile
+def _detect_arch(default: str = "gfx936") -> str:
+    """gcnArchName of device 0 (honouring --device via HIP_VISIBLE_DEVICES in the environment)."""
+    try:
+        import torch
+
+        return torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+    except Exception:
+        return default
 
 
 def default_cu_for_arch(arch: Optional[str]) -> Optional[int]:
@@ -335,6 +373,17 @@ def _w4a8_modes() -> Dict[int, Tuple[int, ...]]:
 
 
 def _describe_mode(quant: str, cand: Candidate) -> ModeDescriptor:
+    if quant == W4A16_QUANT:
+        spec = W4A16_SPECS[cand.mode]
+        unfused_mode = (mode(cand.stage, cand.sorting, cand.family, cand.bm, spec.unfused_profile)
+                        if spec.unfused_profile is not None else None)
+        return W4A16ModeDescriptor(
+            quant=quant, mode=cand.mode, stage=cand.stage, sorting=cand.sorting,
+            family=cand.family, bm=cand.bm, implementation=spec.implementation,
+            template=spec.template, fp16_overrides=spec.fp16_overrides,
+            unfused_mode=unfused_mode,
+            **_w4a16_launch_fields(cand.stage, spec.implementation, spec.template),
+        )
     up_k = (2048, 3072, 4096, 6144, 7168)
     fp8_up_k = (1280, *up_k)
     w8_down_k = (128, 256, 320, 384, 512, 640, 768, 1024, 1280, 2048)
@@ -431,7 +480,37 @@ def _describe_mode(quant: str, cand: Candidate) -> ModeDescriptor:
     )
 
 
+def _w4a16_launch_fields(stage: int, implementation: str, params: Dict[str, int]) -> Dict[str, Any]:
+    fields = dict(nloop=1, supports_n_tail=False, supported_reduce_k=(), k_step=256,
+                  bn=0, bk=128, wm=0, wn=0, wk=0, stages=2)
+    if implementation == "legacy_decode":
+        suffix = "first" if stage == 1 else "second"
+        fields.update(kernel=f"launch_moe_w4a16_{suffix}_stage_decode", stages=params["st"],
+                      k_step=2 * params["bk"] if params["st"] == 2 else params["bk"],
+                      # Keep a full output tile for these retune-only candidates.
+                      **{key: params[key] for key in ("bn", "bk", "wm", "wn", "wk")})
+        source = "moe_w4a16_opt.h"
+    elif implementation == "decode":
+        fields.update(kernel="launch_moe_w4a16_decode", wn=params["nn"] * 16,
+                      bn=params["wn"] * params["nn"] * 16, bk=DECODE_BK, wk=params.get("spw", 0) * DECODE_BK,
+                      supported_reduce_k=DECODE_K[stage], k_step=params["kw"] * DECODE_BK)
+        source = "moe_w4a16_decode.h"
+    else:
+        fields.update(kernel="launch_moe_w4a16_prefill", wn=params["nn"] * 16,
+                      bn=params["warps"] * params["nn"] * 16,
+                      nloop=params.get("nch", 1), stages=params.get("st", 2))
+        if implementation == "bstat":
+            fields.update(kernel="launch_moe_w4a16_g2_bstat", supported_reduce_k=(256,))
+        source = "moe_w4a16_prefill.h"
+    return dict(fields, source=f"csrc_for_aiter/936_938/{source}")
+
+
+W4A16_QUANT = "int4_w4a16"
+DEFAULT_M = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024)
+DIRECT_SEED = 0
+DIRECT_DTYPES = {"bf16": "torch.bfloat16", "fp16": "torch.float16"}
 PROFILES: Dict[str, QuantProfile] = {
+    "int4_w4a16": QuantProfile("int4_w4a16", ("int4_w4a16",), (1,), (0, 1), (), W4A16_MODES_BY_STAGE),
     "fp8_w8a8": QuantProfile("fp8_w8a8", ("fp8_w8a8",), (0, 1), (0, 1, 2), (201, 202, 203, 204), _w8a8_fp8_modes()),
     "int8_w8a8": QuantProfile("int8_w8a8", ("int8_w8a8",), (0,), (0, 1, 2), (201, 202, 203, 204), _w8a8_int8_modes()),
     "int8_w4a8": QuantProfile("int8_w4a8", ("int8_w4a8",), (1,), (0, 1, 2, 3), (201, 202, 203, 204), _w4a8_modes()),
@@ -467,13 +546,16 @@ def _shape_from_config_name(path: Path, arch: str, dtype: str) -> Shape:
 
 def audit_configs(profile: QuantProfile, arch: str, out_dir: Path,
                   shape_filter: Optional[Tuple[int, int, int]] = None) -> List[BenchResult]:
+    runtime = fused_moe()
+    CSV_NAMES, QUANT_TYPES = runtime.CSV_NAMES, runtime.QUANT_TYPES
+
     results: List[BenchResult] = []
     records = []
     csv_path = CONFIG_ROOT / CSV_NAMES[profile.name]
     if csv_path.is_file():
         with csv_path.open(newline="") as stream:
             for row in csv.DictReader(stream):
-                if row["arch"] != arch or row["quant_type"] != profile.name + "_channel":
+                if row["arch"] != arch or row["quant_type"] != QUANT_TYPES[profile.name]:
                     continue
                 for stage, mode_i in enumerate(row["sol_id"].split("+"), 1):
                     file_shape = Shape(int(row["expert"]), int(row["inter_dim"]), int(row["model_dim"]),
@@ -481,7 +563,7 @@ def audit_configs(profile: QuantProfile, arch: str, out_dir: Path,
                                        "fp16" if row["indtype"] == "torch.float16" else "bf16", arch,
                                        int(row["cu_num"]) if row["cu_num"] else None)
                     records.append((csv_path, {row["token"]: {"MODE": int(mode_i)}}, stage == 2, file_shape))
-    else:
+    elif profile.name != W4A16_QUANT:  # archived W4A16 JSON IDs are incompatible
         for path in _arch_files(arch, profile):
             try:
                 data = json.loads(path.read_text())
@@ -509,7 +591,7 @@ def audit_configs(profile: QuantProfile, arch: str, out_dir: Path,
                 error = str(exc)
                 token_i = int(token) if str(token).isdigit() else 0
             results.append(BenchResult(
-                str(path.relative_to(ROOT)), file_shape.topk, file_shape.cu,
+                str(path.relative_to(CHECKOUT_ROOT)), file_shape.topk, file_shape.cu,
                 token_i, cand.stage if cand else 0, mode_i if cand else 0,
                 cand.bm if cand else 0,
                 "moe_align" if cand and cand.sorting else "ck_sorting" if cand else "",
@@ -601,12 +683,17 @@ def _config_file_names(e: int, n: int, k: int, dtype: str, is_bottom: bool,
 def _load_shape_config(profile: QuantProfile, arch: str, e: int, n: int, k: int,
                        is_bottom: bool, topk: Optional[int] = None,
                        cu: Optional[int] = None) -> Dict[int, Any]:
+    runtime = fused_moe()
+    CSV_NAMES, find_csv_config = runtime.CSV_NAMES, runtime.find_csv_config
+
     if (CONFIG_ROOT / CSV_NAMES[profile.name]).is_file():
         result = find_csv_config(str(CONFIG_ROOT), arch, profile.name, e, n, k,
                                  topk, cu, is_bottom)
         if result is None:
             raise FileNotFoundError(f"No CSV config for {profile.name}/{arch}, N={n}, K={k}")
         return result
+    if profile.name == W4A16_QUANT:
+        raise FileNotFoundError(f"Missing W4A16 CSV: {CONFIG_ROOT / CSV_NAMES[profile.name]}")
     candidates = []
     for category in profile.categories:
         base = CONFIG_ROOT / arch / category
@@ -619,42 +706,47 @@ def _load_shape_config(profile: QuantProfile, arch: str, e: int, n: int, k: int,
 
 
 def _config_declared_modes(profile: QuantProfile, arch: str, stage: int) -> List[int]:
+    runtime = fused_moe()
+    csv_path = CONFIG_ROOT / runtime.CSV_NAMES[profile.name]
     modes = set()
-    for category in profile.categories:
-        base = CONFIG_ROOT / arch / category
-        if not base.exists():
-            continue
-        want_bottom = stage == 2
-        for path in base.glob("*.json"):
-            if _is_bottom(path) != want_bottom:
+    if csv_path.is_file():
+        with csv_path.open(newline="") as stream:
+            for row in csv.DictReader(stream):
+                if row["arch"] == arch and row["quant_type"] == runtime.QUANT_TYPES[profile.name]:
+                    modes.add(int(row["sol_id"].split("+")[stage - 1]))
+    elif profile.name != W4A16_QUANT:
+        for path in _arch_files(arch, profile):
+            if _is_bottom(path) != (stage == 2):
                 continue
             try:
-                with path.open() as f:
-                    data = json.load(f)
-                for item in data.values():
-                    modes.add(int(item["MODE"]))
-            except Exception:
+                with path.open() as stream:
+                    modes.update(int(item["MODE"]) for item in json.load(stream).values())
+            except (OSError, ValueError, KeyError, TypeError):
                 continue
-    return sorted(mode_i for mode_i in modes if mode_i in profile.candidate_modes(stage))
+    return sorted(modes.intersection(profile.candidate_modes(stage)))
 
 
-def _candidate_modes(profile: QuantProfile, stage: int, arch: Optional[str] = None,
-                     config_declared_only: bool = False) -> List[int]:
-    if config_declared_only and arch:
-        modes = _config_declared_modes(profile, arch, stage)
-        if modes:
-            return modes
-    return list(profile.candidate_modes(stage))
+def _stage_descriptors(profile: QuantProfile, stage: int, selected=None,
+                       *, arch=None, config_declared_only=False) -> Tuple[ModeDescriptor, ...]:
+    modes = profile.candidate_modes(stage)
+    if selected is not None:
+        invalid = sorted(set(selected) - set(modes))
+        if invalid:
+            raise ValueError(f"Unknown GEMM{stage} {profile.name} modes: {invalid}")
+        modes = sorted(set(selected))
+    elif config_declared_only and arch:
+        modes = _config_declared_modes(profile, arch, stage) or modes
+    return tuple(profile.descriptor(value) for value in modes)
 
 
 def _make_w8a8_inputs(m: int, shape: Shape, quant: str) -> Dict[str, Any]:
     import torch
 
-    from moe_utils.fused_moe_c import fused_topk
+    fused_topk = fused_moe().fused_topk
     from moe_utils.shuffle import w8a8_moe_repack_shuffle
     from moe_utils.utils import dtypes, pertoken_quant
 
-    torch.manual_seed(0)
+    torch.manual_seed(DIRECT_SEED)
     if quant == "int8_w4a8":
         from tune.tune_moe_w4a8_perchannel import _pack_and_shuffle_one_expert
 
@@ -716,7 +808,7 @@ def _make_w8a8_inputs(m: int, shape: Shape, quant: str) -> Dict[str, Any]:
     }
 
 
-def _make_sorted(data: Dict[str, Any], shape: Shape, bm: int, sorting: int):
+def _make_sorted(data: Dict[str, Any], shape: Shape, bm: int, sorting: int, *, align=None):
     if sorting not in (0, 1):
         raise ValueError(f"unknown metadata layout F={sorting}")
     cache = data.setdefault("_sort_cache", {})
@@ -724,13 +816,14 @@ def _make_sorted(data: Dict[str, Any], shape: Shape, bm: int, sorting: int):
     if cache_key in cache:
         return cache[cache_key]
     if sorting == 1:
-        from moe_utils.moe_ops import moe_align_block_size
+        if align is None:
+            align = (fused_moe() if IN_AITER else ops()).moe_align_block_size
 
-        result = moe_align_block_size(data["topk_ids"], bm, shape.e, None)
+        result = align(data["topk_ids"], bm, shape.e, None)
         cache[cache_key] = result
         return result
 
-    from moe_utils.fused_moe_c import moe_sorting_ck
+    moe_sorting_ck = fused_moe().moe_sorting_ck
     from moe_utils.utils import dtypes
 
     sorted_token_ids, _, expert_ids, num_tokens_post_padded, _, _ = moe_sorting_ck(
@@ -750,17 +843,23 @@ def _make_sorted(data: Dict[str, Any], shape: Shape, bm: int, sorting: int):
 def _valid_modes_for_shape(profile: QuantProfile, shape: Shape, stage: int,
                            config_declared_only: bool = False,
                            recommended_only: bool = False,
-                           max_nloop: int = 5) -> List[int]:
+                           max_nloop: Optional[int] = 5, *,
+                           descriptors: Optional[Tuple[ModeDescriptor, ...]] = None,
+                           on_unsupported=None) -> List[int]:
     is_bottom = stage == 2
     modes = []
-    for mode_i in _candidate_modes(profile, stage, shape.arch, config_declared_only):
-        cand = profile.candidate(mode_i, shape)
-        if cand.family in (2, 3) and profile.descriptor(mode_i, shape).nloop > max_nloop:
+    if descriptors is None:
+        descriptors = _stage_descriptors(profile, stage, arch=shape.arch, config_declared_only=config_declared_only)
+    for desc in descriptors:
+        if max_nloop is not None and desc.family in (2, 3) and desc.for_shape(shape).nloop > max_nloop:
             continue
-        if recommended_only and not profile.descriptor(mode_i).recommended(shape.m):
+        if recommended_only and not desc.recommended(shape.m):
             continue
-        if profile.validate(cand, shape, is_bottom) is None:
-            modes.append(mode_i)
+        error = profile.validate(decode_mode(desc.mode), shape, is_bottom)
+        if error is None:
+            modes.append(desc.mode)
+        elif on_unsupported is not None:
+            on_unsupported(desc, error)
     return modes
 
 
@@ -802,10 +901,9 @@ def _bench_w8a8_stage(
 ) -> DirectBenchRow:
     import torch
 
-    from moe_utils.fused_moe_c import moe_kernel_prepare_input
-    from moe_utils.moe_ops import moe_c_moe_gemm_marlin_w8a8, moe_c_moe_gemm_marlin_w8a8_fp8, moe_c_moe_gemm_marlin_w4a8
     from moe_utils.utils import dtypes, per_token_quant_hip
 
+    runtime, kernel_ops = fused_moe(), ops()
     mode_i = int(config["MODE"])
     cand = PROFILES[quant].candidate(mode_i, shape)
     bm = int(config.get("BLOCK_SIZE_M", cand.bm))
@@ -816,7 +914,7 @@ def _bench_w8a8_stage(
     def quantize_activation(a, b, b_scale):
         if is_fp8:
             return per_token_quant_hip(a, quant_dtype=torch.float8_e4m3fn)
-        return moe_kernel_prepare_input(
+        return runtime.moe_kernel_prepare_input(
             A=a,
             B=b,
             A_scale=None,
@@ -835,12 +933,13 @@ def _bench_w8a8_stage(
                     sorted_token_ids, expert_ids, num_tokens_post_padded,
                     gemm_topk, mode_arg, real_topk, key_selected, real_size_k=0):
         if is_fp8:
-            return moe_c_moe_gemm_marlin_w8a8_fp8(
+            return kernel_ops.moe_c_moe_gemm_marlin_w8a8_fp8(
                 a, b, c, a_scale, b_scale, routed_weight,
                 sorted_token_ids, expert_ids, num_tokens_post_padded,
                 gemm_topk, mode_arg, real_topk, key_selected, real_size_k,
             )
-        op = moe_c_moe_gemm_marlin_w4a8 if quant == "int8_w4a8" else moe_c_moe_gemm_marlin_w8a8
+        op = (kernel_ops.moe_c_moe_gemm_marlin_w4a8 if quant == "int8_w4a8"
+              else kernel_ops.moe_c_moe_gemm_marlin_w8a8)
         return op(
             a, b, c, a_scale, b_scale, routed_weight,
             sorted_token_ids, expert_ids, num_tokens_post_padded,
@@ -982,7 +1081,99 @@ def _run_direct_candidate_child(
     return DirectBenchRow(m, stage, mode_i, cand.bm, "moe_align" if cand.sorting else "ck_sorting", None, False, f"child rc={proc.returncode}: {tail}")
 
 
-def bench_direct(args: argparse.Namespace) -> int:
+def _run_direct_sweep(args, shape, stages, *, progress_csv=None, checkpoint=None):
+    """Run the same stage sweep with either resumable batches or per-mode isolation."""
+    import torch
+
+    profile = PROFILES[args.quant]
+    resumable = checkpoint is not None
+    completed = _read_w4a16_checkpoint(checkpoint) if resumable else {}
+    rows = list(completed.values())
+    preparation_errors = {}
+    if resumable:
+        moe_align_block_size = fused_moe().moe_align_block_size
+
+        state_path = args.w4a16_worker_state
+        dtype = torch.bfloat16 if shape.dtype == "bf16" else torch.float16
+        torch.manual_seed(DIRECT_SEED)
+
+    def save(row):
+        if resumable:
+            # Commit the result before clearing the in-flight marker.
+            _append_w4a16_checkpoint(checkpoint, row)
+            completed[(row.m, row.stage, row.mode)] = row
+            latency = "" if row.latency_us is None else f"{row.latency_us:.2f}us"
+            print(f"M={row.m} {row.stage} mode={row.mode} BM={row.bm} {row.status} {latency} {row.error}", flush=True)
+        rows.append(row)
+
+    for m in args.m:
+        workload = replace(shape, m=m)
+        if not resumable:
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        def unsupported(desc, error):
+            save(W4A16BenchRow(m, f"gemm{desc.stage}", desc.mode, desc.bm, status="unsupported", error=error))
+
+        pending = []
+        for stage, descriptors in stages.items():
+            if resumable:
+                descriptors = tuple(d for d in descriptors if (m, f"gemm{stage}", d.mode) not in completed)
+            modes = _valid_modes_for_shape(
+                profile, workload, stage, recommended_only=args.recommended_only,
+                max_nloop=None if resumable else args.max_nloop, descriptors=descriptors,
+                on_unsupported=unsupported if resumable else None,
+            )
+            pending.extend(profile.descriptor(mode_i) for mode_i in modes)
+
+        if pending:
+            if resumable:
+                topk_ids, *inputs = make_inputs(workload, dtype, DIRECT_SEED)
+                sort_cache = {}
+                data = {"topk_ids": topk_ids, "topk_weights": inputs[1].topk_weights, "_sort_cache": sort_cache}
+            elif args.direct_inprocess:
+                try:
+                    data = _make_w8a8_inputs(m, workload, args.quant)
+                except torch.cuda.OutOfMemoryError as exc:
+                    preparation_errors[str(m)] = str(exc)
+                    (args.out_dir / "preparation_errors.json").write_text(json.dumps(preparation_errors, indent=2) + "\n")
+                    print(f"M={m}: input preparation OOM: {exc}", flush=True)
+                    continue
+
+            for desc in pending:
+                name = f"gemm{desc.stage}"
+                if resumable:
+                    key = (desc.bm, desc.sorting)
+                    needs_routing = key not in sort_cache
+                    routing = _make_sorted(data, workload, *key, align=moe_align_block_size)
+                    if needs_routing:
+                        torch.cuda.synchronize()  # a routing failure is not a GEMM failure
+                    marker = dict(checkpoint=str(checkpoint), m=m, stage=name, mode=desc.mode, bm=desc.bm)
+                    tmp = state_path.with_suffix(".tmp")
+                    tmp.write_text(json.dumps(marker))
+                    tmp.replace(state_path)
+                    row = bench_candidate(m, desc, inputs[desc.stage - 1], routing, args.warmup, args.iters, _event_time_us)
+                elif args.direct_inprocess:
+                    config = {"MODE": desc.mode, "BLOCK_SIZE_M": desc.bm, "key_selected": m}
+                    row = _bench_w8a8_stage(workload, data, config, name, args.quant, args.warmup, args.iters)
+                else:
+                    row = _run_direct_candidate_child(args, m, name, desc.mode)
+                save(row)
+                if resumable:
+                    state_path.unlink()
+            if resumable:
+                del data, inputs, routing, sort_cache, topk_ids
+                torch.cuda.empty_cache()
+            elif args.direct_inprocess:
+                del data
+
+        if progress_csv is not None:
+            _write_bench_csv(progress_csv, DirectBenchRow, rows)
+            print(f"completed M={m}, candidate rows={len(rows)}", flush=True)
+    return rows, preparation_errors
+
+
+def bench_direct(args: argparse.Namespace, stages) -> int:
     if args.device is not None:
         os.environ["HIP_VISIBLE_DEVICES"] = str(args.device)
     sys.path.insert(0, str(ROOT))
@@ -990,70 +1181,37 @@ def bench_direct(args: argparse.Namespace) -> int:
 
     torch.set_default_device("cuda")
     profile = PROFILES[args.quant]
-    gemm1_configs = {} if args.sweep_direct else _load_shape_config(profile, args.arch, args.e, args.n, args.k, False, args.topk, args.cu)
-    gemm2_configs = {} if args.sweep_direct else _load_shape_config(profile, args.arch, args.e, args.n, args.k, True, args.topk, args.cu)
-    rows: List[DirectBenchRow] = []
+    shape = Shape(args.e, args.n, args.k, args.topk, args.m[0], args.dtype or args.quant, args.arch, args.cu)
     args.out_dir.mkdir(parents=True, exist_ok=True)
     cu_part = "none" if args.cu is None else str(args.cu)
     csv_path = args.out_dir / f"{args.quant}_{args.arch}_E{args.e}_N{args.n}_K{args.k}_topk{args.topk}_cu{cu_part}_direct_bench.csv"
-    data = None
-    preparation_errors = {}
-    for m in args.m:
-        data = None
-        gc.collect()
-        torch.cuda.empty_cache()
-        shape = Shape(args.e, args.n, args.k, args.topk, m, args.dtype or args.quant, args.arch, args.cu)
-        gemm1 = _select_config(gemm1_configs, m) if gemm1_configs else {}
-        gemm2 = _select_config(gemm2_configs, m) if gemm2_configs else {}
-        if args.sweep_direct:
-            if args.direct_inprocess:
-                try:
-                    data = _make_w8a8_inputs(m, shape, args.quant)
-                except torch.cuda.OutOfMemoryError as exc:
-                    preparation_errors[str(m)] = str(exc)
-                    (args.out_dir / "preparation_errors.json").write_text(json.dumps(preparation_errors, indent=2) + "\n")
-                    print(f"M={m}: input preparation OOM: {exc}", flush=True)
-                    continue
-                for mode_i in _valid_modes_for_shape(profile, shape, 1, args.sweep_config_modes, args.recommended_only, args.max_nloop):
-                    cand = decode_mode(mode_i)
-                    config = {"MODE": mode_i, "BLOCK_SIZE_M": cand.bm, "key_selected": m}
-                    rows.append(_bench_w8a8_stage(shape, data, config, "gemm1", args.quant, args.warmup, args.iters))
-                for mode_i in _valid_modes_for_shape(profile, shape, 2, args.sweep_config_modes, args.recommended_only, args.max_nloop):
-                    cand = decode_mode(mode_i)
-                    config = {
-                        "MODE": mode_i,
-                        "BLOCK_SIZE_M": cand.bm,
-                        "key_selected": m,
-                    }
-                    rows.append(_bench_w8a8_stage(shape, data, config, "gemm2", args.quant, args.warmup, args.iters))
-            else:
-                for mode_i in _valid_modes_for_shape(profile, shape, 1, args.sweep_config_modes, args.recommended_only, args.max_nloop):
-                    row = _run_direct_candidate_child(args, m, "gemm1", mode_i)
-                    rows.append(row)
-                for mode_i in _valid_modes_for_shape(profile, shape, 2, args.sweep_config_modes, args.recommended_only, args.max_nloop):
-                    row = _run_direct_candidate_child(args, m, "gemm2", mode_i)
-                    rows.append(row)
-        else:
-            data = _make_w8a8_inputs(m, shape, args.quant)
-            rows.append(_bench_w8a8_stage(shape, data, gemm1, "gemm1", args.quant, args.warmup, args.iters))
-            rows.append(_bench_w8a8_stage(shape, data, gemm2, "gemm2", args.quant, args.warmup, args.iters))
+    if args.sweep_direct:
+        rows, preparation_errors = _run_direct_sweep(args, shape, stages, progress_csv=csv_path)
+    else:
+        gemm1_configs = _load_shape_config(profile, args.arch, args.e, args.n, args.k, False, args.topk, args.cu)
+        gemm2_configs = _load_shape_config(profile, args.arch, args.e, args.n, args.k, True, args.topk, args.cu)
+        rows = []
+        for m in args.m:
+            gc.collect()
+            torch.cuda.empty_cache()
+            workload = replace(shape, m=m)
+            data = _make_w8a8_inputs(m, workload, args.quant)
+            for name, configs in (("gemm1", gemm1_configs), ("gemm2", gemm2_configs)):
+                config = _select_config(configs, m) if configs else {}
+                rows.append(_bench_w8a8_stage(workload, data, config, name, args.quant, args.warmup, args.iters))
+            del data
+            _write_bench_csv(csv_path, DirectBenchRow, rows)
+            print(f"completed M={m}, candidate rows={len(rows)}", flush=True)
 
-        with csv_path.open("w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=list(DirectBenchRow.__dataclass_fields__))
-            writer.writeheader()
-            writer.writerows(asdict(row) for row in rows)
-        print(f"completed M={m}, candidate rows={len(rows)}", flush=True)
-
-    with csv_path.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(DirectBenchRow.__dataclass_fields__))
-        writer.writeheader()
-        writer.writerows(asdict(row) for row in rows)
+    _write_bench_csv(csv_path, DirectBenchRow, rows)
     print(f"direct bench written: {csv_path}")
     print("M,stage,mode,bm,sorting,latency_us,ok,error")
     for row in rows:
         latency = "" if row.latency_us is None else f"{row.latency_us:.3f}"
         print(f"{row.m},{row.stage},{row.mode},{row.bm},{row.sorting},{latency},{row.ok},{row.error}")
     if args.sweep_direct:
+        CSV_NAMES = fused_moe().CSV_NAMES
+
         print("best summary:")
         missing_best = False
         summary = {"shape": {"e": args.e, "n": args.n, "k": args.k, "topk": args.topk,
@@ -1076,44 +1234,260 @@ def bench_direct(args: argparse.Namespace) -> int:
         for stage in ("gemm1", "gemm2"):
             name = _config_file_names(args.e, args.n, args.k, args.quant, stage == "gemm2", args.topk, args.cu)[0]
             (args.out_dir / name).write_text(json.dumps(configs[stage], indent=2) + "\n")
-        indtype = {"bf16": "torch.bfloat16", "fp16": "torch.float16"}[args.dtype or "bf16"]
-        csv_rows = rows_from_pair(configs["gemm1"], configs["gemm2"], args.arch, args.quant,
-                                  args.e, args.n, args.k, args.topk, args.cu, (indtype,),
-                                  {m: row["best"]["latency_us"] for m, row in summary["m_results"].items()
-                                   if row["best"] is not None})
-        write_config_csv(str(args.out_dir / CSV_NAMES[args.quant]), csv_rows)
+        times = {m: row["best"]["latency_us"] for m, row in summary["m_results"].items()
+                 if row["best"] is not None}
+        _write_tuned_pair_csv(args.out_dir / CSV_NAMES[args.quant], args.quant, args, configs, times)
         return 2 if missing_best else 0
     return 0 if rows and all(row.ok for row in rows) else 2
+
+
+def _write_bench_csv(path, row_type, rows):
+    with path.open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(row_type.__dataclass_fields__))
+        writer.writeheader()
+        writer.writerows(asdict(row) for row in rows)
+
+
+def _write_tuned_pair_csv(path, quant, shape, configs, times):
+    runtime = fused_moe()
+
+    dtype = DIRECT_DTYPES[shape.dtype or "bf16"]
+    group = {"group_size": shape.group_size} if quant == W4A16_QUANT else {}
+    rows = runtime.rows_from_pair(configs["gemm1"], configs["gemm2"], shape.arch, quant,
+                                 shape.e, shape.n, shape.k, shape.topk, shape.cu, (dtype,), times, **group)
+    runtime.write_config_csv(path, rows)
+
+
+def _fastest_stage_pair(rows, score=attrgetter("latency_us")):
+    up = min((r for r in rows if r.stage == "gemm1"), key=score, default=None)
+    down = min((r for r in rows if r.stage == "gemm2"), key=score, default=None)
+    if up is not None and down is not None:
+        return up, down
+    return None
 
 
 def _best_bm_pairs(rows: List[DirectBenchRow], m: int) -> List[Dict[str, Any]]:
     passed = [r for r in rows if r.m == m and r.ok and r.latency_us is not None]
     groups = []
     for bm, sorting in sorted({(r.bm, r.sorting) for r in passed}):
-        up = [r for r in passed if (r.bm, r.sorting) == (bm, sorting) and r.stage == "gemm1"]
-        down = [r for r in passed if (r.bm, r.sorting) == (bm, sorting) and r.stage == "gemm2"]
-        if not up or not down:
+        pair = _fastest_stage_pair([r for r in passed if (r.bm, r.sorting) == (bm, sorting)])
+        if pair is None:
             continue
-        g1 = min(up, key=lambda r: r.latency_us)
-        g2 = min(down, key=lambda r: r.latency_us)
+        g1, g2 = pair
         groups.append({"bm": bm, "sorting": sorting, "gemm1": asdict(g1), "gemm2": asdict(g2),
                        "latency_us": g1.latency_us + g2.latency_us})
     return groups
 
 
-def main() -> int:
+def _best_w4a16_pair(rows: List[W4A16BenchRow], m: int) -> Optional[Dict[str, Any]]:
+    """Fastest passing GEMM1 and GEMM2, chosen independently: their BMs may differ because the
+    runtime aligns the routing once per distinct BM (dual align)."""
+    passed = [r for r in rows if r.m == m and r.status == "ok"]
+    pair = _fastest_stage_pair(passed, lambda r: r.latency_us + (r.epilogue_us if r.stage == "gemm1" else 0))
+    if pair is None:
+        return None
+    g1, g2 = pair
+    return {"gemm1": asdict(g1), "gemm2": asdict(g2), "dual_routing": g1.bm != g2.bm,
+            "latency_us": g1.latency_us + g1.epilogue_us + g2.latency_us}
+
+
+def _w4a16_trial_settings(args, stages):
+    return dict(warmup=args.warmup, iters=args.iters, seed=DIRECT_SEED, **W4A16_TOLERANCES,
+                backend="aiter_jit" if IN_AITER else "standalone", recommended_only=args.recommended_only,
+                modes={stage: [desc.mode for desc in descs] for stage, descs in stages.items()})
+
+
+def _read_w4a16_checkpoint(path: Path):
+    if not path.is_file():
+        return {}
+    with path.open() as stream:
+        rows = (W4A16BenchRow(**json.loads(line)) for line in stream if line.strip())
+        return {(row.m, row.stage, row.mode): row for row in rows}
+
+
+def _append_w4a16_checkpoint(path: Path, row: W4A16BenchRow):
+    with path.open("a") as stream:
+        stream.write(json.dumps(asdict(row)) + "\n")
+
+
+def _record_w4a16_crash(state_path: Path, rc: int) -> bool:
+    if not state_path.is_file():
+        return False
+    marker = json.loads(state_path.read_text())
+    checkpoint = Path(marker["checkpoint"])
+    key = (marker["m"], marker["stage"], marker["mode"])
+    # A worker can exit after committing its result and before clearing the marker.
+    if key not in _read_w4a16_checkpoint(checkpoint):
+        row = W4A16BenchRow(*key, marker["bm"], status="crashed", error=f"worker exited with {rc}")
+        _append_w4a16_checkpoint(checkpoint, row)
+        print(f"M={row.m} {row.stage} mode={row.mode} crashed ({rc}); resuming", flush=True)
+    state_path.unlink()
+    return True
+
+
+def _supervise_w4a16(args, argv) -> int:
+    # The marker belongs to this invocation, even if unrelated sweeps share out-dir.
+    with tempfile.TemporaryDirectory(prefix="hipc-w4a16-") as directory:
+        state_path = Path(directory) / "inflight.json"
+        if args.fresh:
+            state_path.with_suffix(".fresh").touch()
+        cmd = [sys.executable, str(Path(__file__).resolve()), *argv, "--w4a16-worker-state", str(state_path)]
+        while True:
+            rc = subprocess.call(cmd)
+            if rc in (0, 2) or not _record_w4a16_crash(state_path, rc):
+                return rc
+
+
+def _write_w4a16_results(args, shape, settings, rows, tag) -> int:
+    rows_path = args.out_dir / f"{tag}_candidates.csv"
+    rows = sorted((row for row in rows if row.m in args.m), key=lambda r: (r.m, r.stage, r.mode))
+    _write_bench_csv(rows_path, W4A16BenchRow, rows)
+    summary = {"mode_schema": W4A16_MODE_SCHEMA,
+               "shape": {"arch": shape.arch, "cu": shape.cu, "e": shape.e, "n": shape.n,
+                         "k": shape.k, "topk": shape.topk, "dtype": shape.dtype, "group_size": shape.group_size},
+               "settings": settings,
+               "objective": "gemm1_us (+ silu_and_mul_us if unfused) + gemm2_us; BMs may differ (dual align)",
+               "m_results": {}}
+    new_rows = [row for row in rows if W4A16_SPECS[row.mode].implementation != "legacy_decode"]
+    configs = {"gemm1": {}, "gemm2": {}}
+    times = {}
+    for m in args.m:
+        best = _best_w4a16_pair(rows, m)
+        summary["m_results"][str(m)] = {"best": best, "best_without_legacy_decode": _best_w4a16_pair(new_rows, m)}
+        if best is None:
+            print(f"M={m}: no passing GEMM1/GEMM2 candidate pair", flush=True)
+            continue
+        for stage in configs:
+            configs[stage][m] = {"MODE": best[stage]["mode"], "BLOCK_SIZE_M": best[stage]["bm"]}
+        times[str(m)] = best["latency_us"]
+        print(f"M={m} modes={best['gemm1']['mode']}+{best['gemm2']['mode']} "
+              f"BM={best['gemm1']['bm']}/{best['gemm2']['bm']} sum_us={best['latency_us']:.2f}", flush=True)
+    (args.out_dir / f"{tag}_best_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+    if times:
+        config_csv = args.out_dir / W4A16_CSV_NAME
+        _write_tuned_pair_csv(config_csv, W4A16_QUANT, shape, configs, times)
+        print(f"tuned rows merged into {config_csv}", flush=True)
+    print(f"candidates: {rows_path}", flush=True)
+    return 0 if len(times) == len(args.m) else 2
+
+
+def _bench_w4a16(args, stages) -> int:
+    import torch
+
+    device = torch.cuda.get_device_properties(torch.cuda.current_device())
+    arch, cu = device.gcnArchName.split(":")[0], device.multi_processor_count
+    if args.arch is not None and args.arch != arch:
+        raise ValueError(f"Requested --arch={args.arch}, but the active GPU is {arch}")
+    if args.cu is not None and args.cu != cu:
+        raise ValueError(f"Requested --cu={args.cu}, but the active GPU has {cu} CUs")
+    shape = Shape(args.e, args.n, args.k, args.topk, args.m[0], args.dtype, arch, cu, args.group_size)
+    settings = _w4a16_trial_settings(args, stages)
+    signature = hashlib.sha256(json.dumps(settings, sort_keys=True).encode()).hexdigest()[:12]
+    # Keep existing group-32 checkpoint names and give group-128 its own files.
+    group_tag = "_gs128" if shape.group_size == 128 else ""
+    tag = (f"{W4A16_MODE_SCHEMA}{group_tag}_{arch}_E{shape.e}_N{shape.n}_K{shape.k}_topk{shape.topk}"
+           f"_cu{cu}_{shape.dtype}_{signature}")
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint = args.out_dir.resolve() / f"{tag}_candidates.jsonl"
+    state_path = args.w4a16_worker_state
+    fresh = state_path.with_suffix(".fresh")
+    if fresh.is_file():
+        if checkpoint.is_file():
+            checkpoint.unlink()
+        fresh.unlink()
+    rows, _ = _run_direct_sweep(args, shape, stages, checkpoint=checkpoint)
+    return _write_w4a16_results(args, shape, settings, rows, tag)
+
+
+def _tune_w4a16(args, parser, argv, stages) -> int:
+    if not args.bench_direct or not args.sweep_direct:
+        parser.error("--quant int4_w4a16 requires --bench-direct --sweep-direct (or --list-modes)")
+    if (args.perf_only or args.skip_correctness or args.sweep_config_modes or args.direct_inprocess
+            or args.run_correctness or args.direct_child):
+        parser.error("W4A16 sweeps always validate candidates in a supervised worker; "
+                     "the channelwise config, audit and in-process options do not apply")
+    args.dtype = args.dtype or "bf16"
+    if args.dtype not in DIRECT_DTYPES:
+        parser.error("W4A16 requires --dtype bf16 or fp16")
+    if args.k % 128 or args.n % 128:
+        parser.error("W4A16 K and N must be multiples of 128")
+    if args.topk > args.e:
+        parser.error("topk must be <= E")
+    args.m = list(dict.fromkeys(args.m))
+    return _bench_w4a16(args, stages) if args.w4a16_worker_state else _supervise_w4a16(args, argv)
+
+
+def _list_modes(args: argparse.Namespace) -> int:
+    profile = PROFILES[args.quant]
+    shapes = [Shape(args.e, args.n, args.k, args.topk, m,
+                    args.dtype or ("bf16" if args.quant == W4A16_QUANT else args.quant),
+                    args.arch, args.cu, args.group_size) for m in args.m]
+    entries = []
+    for desc in profile.descriptors.values():
+        entry = dict(asdict(desc), tile_n=desc.tile_n, sorting_name=desc.sorting_name,
+                     token_encoding=desc.token_encoding, shape_checks=[])
+        w4a16 = isinstance(desc, W4A16ModeDescriptor)
+        if w4a16:
+            entry.update(profile=desc.mode % 1000, mode_schema=W4A16_MODE_SCHEMA)
+        for shape in shapes:
+            effective = desc.for_shape(shape)
+            check = dict(m=shape.m, arch=shape.arch, cu=shape.cu, dtype=shape.dtype,
+                         error=desc.validate(shape), tile_n=effective.tile_n,
+                         recommended=desc.recommended(shape.m), effective_kernel=effective.kernel,
+                         tile=dict(bm=effective.bm, bn=effective.bn, bk=effective.bk, nloop=effective.nloop))
+            if w4a16:
+                check.update(group_size=shape.group_size, effective_template=effective.template,
+                             selection_notes=effective.selection_notes)
+                spec = W4A16_SPECS[desc.mode]
+                if effective.implementation == "decode":
+                    params = effective.template
+                    check["tile"].update(
+                        reduce_k=shape.k if spec.stage == 1 else shape.n,
+                        prefetch_depth=spec.template["pd"],
+                        effective_prefetch_depth=params["pd"] if "spw" in params else None,
+                        epilogue=("DownWeighted" if spec.stage == 2 else
+                                  "UpSilu" if params["silu"] else "Up"),
+                    )
+                elif effective.implementation == "prefill":
+                    tile = BSTAT_FALLBACK_TILE if spec.implementation == "bstat" else spec.prefill_tile
+                    if shape.dtype == "fp16" and spec.fp16_prefill_tile:
+                        tile = spec.fp16_prefill_tile
+                    check["prefill_tile"] = dict(
+                        bm=spec.bm, bn=tile.bn, bk=128, nloop=tile.nloop,
+                        effective_nloop=effective.template["nch"], pipeline=tile.pipeline,
+                        epilogue=("DownWeighted" if spec.stage == 2 else
+                                  "UpSilu" if effective.template["silu"] else "Up"),
+                    )
+                elif effective.implementation == "bstat":
+                    check["prefill_tile"] = dict(
+                        bm=desc.bm, bn=effective.template["warps"] * effective.template["nn"] * 16,
+                        bk=128, pipeline="ResidentB", epilogue="DownWeighted",
+                    )
+            entry["shape_checks"].append(check)
+        entries.append(entry)
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    path = args.out_dir / f"{args.quant}_mode_descriptors.json"
+    path.write_text(json.dumps(entries, indent=2) + "\n")
+    print(f"[{args.quant}] descriptors={len(entries)} written to {path}")
+    return 0
+
+
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--quant", choices=sorted(PROFILES), required=True)
-    parser.add_argument("--arch", default="gfx936")
+    parser.add_argument("--arch", default=None,
+                        help="default: detected from the device (gfx936 when no GPU is visible)")
     parser.add_argument("--dtype", default=None)
     parser.add_argument("--e", type=int, default=0)
     parser.add_argument("--n", type=int, default=0)
     parser.add_argument("--k", type=int, default=0)
     parser.add_argument("--topk", type=int, default=8)
+    parser.add_argument("--group-size", type=int, choices=(32, 128),
+                        help="INT4 W4A16 group size (default: 32)")
     parser.add_argument("--cu", "--num-cu", dest="cu", type=int, default=None)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=30)
-    parser.add_argument("--max-nloop", type=int, default=5)
+    parser.add_argument("--max-nloop", type=int, default=5, help="maximum NLoop for channelwise loop families")
     parser.add_argument("--perf-only", action="store_true")
     parser.add_argument("--skip-correctness", action="store_true")
     parser.add_argument("--out-dir", type=Path, default=ROOT / "tune/tune_results/hipc_audit")
@@ -1121,50 +1495,61 @@ def main() -> int:
     parser.add_argument("--list-modes", action="store_true", help="export per-quant descriptors and shape rejection reasons without a GPU")
     parser.add_argument("--recommended-only", action="store_true", help="restrict sweep to each descriptor's recommended M range")
     parser.add_argument("--bench-direct", action="store_true", help="benchmark current config with direct moe_c GEMM calls")
-    parser.add_argument("--sweep-direct", action="store_true", help="with --bench-direct, sweep instantiated FP8 modes instead of current config")
+    parser.add_argument("--sweep-direct", action="store_true", help="with --bench-direct, sweep instantiated modes instead of current config")
     parser.add_argument("--sweep-config-modes", action="store_true", help="with --sweep-direct, only sweep modes already declared by runtime configs")
-    parser.add_argument("--direct-inprocess", action="store_true", help="with --sweep-direct, run candidates in one process for speed")
-    parser.add_argument("--candidate-timeout", type=int, default=90)
+    parser.add_argument("--direct-inprocess", action="store_true", help="channelwise sweep: run candidates in one process for speed")
+    parser.add_argument("--candidate-timeout", type=int, default=90, help="channelwise worker timeout (seconds)")
     parser.add_argument("--direct-child", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--direct-stage", choices=("gemm1", "gemm2"), default="gemm1", help=argparse.SUPPRESS)
     parser.add_argument("--direct-mode", type=int, default=0, help=argparse.SUPPRESS)
-    parser.add_argument("--m", nargs="+", type=int, default=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024])
+    parser.add_argument("--m", nargs="+", type=int, default=list(DEFAULT_M),
+                        help=f"token counts (default: {' '.join(map(str, DEFAULT_M))})")
     parser.add_argument("--device", default=None)
-    args = parser.parse_args()
-    args.cu = resolve_cu(args.arch, args.cu)
-
+    parser.add_argument("--gemm1-modes", nargs="+", type=int, help="restrict GEMM1 in a direct sweep")
+    parser.add_argument("--gemm2-modes", nargs="+", type=int, help="restrict GEMM2 in a direct sweep")
+    parser.add_argument("--fresh", action="store_true", help="restart a resumable sweep instead of using its checkpoint")
+    parser.add_argument("--w4a16-worker-state", type=Path, help=argparse.SUPPRESS)
+    argv = sys.argv[1:] if argv is None else list(argv)
+    args = parser.parse_args(argv)
+    if args.group_size is not None and args.quant != W4A16_QUANT:
+        parser.error("--group-size applies only to --quant int4_w4a16")
+    args.group_size = args.group_size or W4A16_GROUP_SIZE
+    if args.device is not None:
+        os.environ["HIP_VISIBLE_DEVICES"] = str(args.device)  # before CUDA initialises
+    # W4A16 workers check explicit arch/CU against the actual GPU. List mode needs no GPU.
+    if args.quant != W4A16_QUANT:
+        args.arch = args.arch or _detect_arch()
+        args.cu = resolve_cu(args.arch, args.cu)
     if args.list_modes:
-        profile = PROFILES[args.quant]
-        entries = []
-        for desc in profile.descriptors.values():
-            shapes = [Shape(args.e, args.n, args.k, args.topk, m,
-                            args.dtype or args.quant, args.arch, args.cu) for m in args.m]
-            entries.append({**asdict(desc), "tile_n": desc.tile_n,
-                            "sorting_name": desc.sorting_name, "token_encoding": desc.token_encoding,
-                            "shape_checks": [{"m": shape.m, "error": desc.validate(shape),
-                                              "tile_n": desc.for_shape(shape).tile_n,
-                                              "recommended": desc.recommended(shape.m)} for shape in shapes]})
-        args.out_dir.mkdir(parents=True, exist_ok=True)
-        path = args.out_dir / f"{args.quant}_mode_descriptors.json"
-        path.write_text(json.dumps(entries, indent=2) + "\n")
-        print(f"[{args.quant}] descriptors={len(entries)} written to {path}")
-        return 0
-
-    if args.bench_direct or args.direct_child:
+        args.arch = args.arch or "gfx936"
+        return _list_modes(args)
+    if args.bench_direct or args.direct_child or args.quant == W4A16_QUANT:
         if args.perf_only or args.skip_correctness:
             parser.error("independent GEMM tuning requires correctness before timing")
         if min(args.e, args.n, args.k, args.topk, *args.m) <= 0:
             parser.error("direct tuning requires positive E/N/K/topk/M")
         if args.warmup < 0 or args.iters < 1:
             parser.error("warmup must be nonnegative and iters must be positive")
+    profile = PROFILES[args.quant]
+    stages = {}
+    if args.bench_direct and args.sweep_direct:
+        try:
+            stages = {
+                stage: _stage_descriptors(profile, stage, selected, arch=args.arch,
+                                          config_declared_only=args.sweep_config_modes)
+                for stage, selected in ((1, args.gemm1_modes), (2, args.gemm2_modes))
+            }
+        except ValueError as exc:
+            parser.error(str(exc))
+    elif args.gemm1_modes is not None or args.gemm2_modes is not None:
+        parser.error("--gemm1-modes and --gemm2-modes require --bench-direct --sweep-direct")
+    if args.quant == W4A16_QUANT:
+        return _tune_w4a16(args, parser, argv, stages)
 
-    if args.device is not None:
-        os.environ["HIP_VISIBLE_DEVICES"] = str(args.device)
     if args.direct_child:
         return _bench_direct_child(args)
     if args.bench_direct:
-        return bench_direct(args)
-    profile = PROFILES[args.quant]
+        return bench_direct(args, stages)
     results = audit_configs(profile, args.arch, args.out_dir, (args.e, args.n, args.k))
     print(f"[{profile.name}/{args.arch}] files={len({r.file for r in results})} entries={len(results)} "
           f"passed={sum(r.ok for r in results)} failed={sum(not r.ok for r in results)}")

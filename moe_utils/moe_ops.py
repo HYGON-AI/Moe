@@ -190,6 +190,33 @@ def moe_c_sgl_moe_align_block_size(
     )
 
 
+def moe_c_sgl_moe_align_block_size_dual(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    block_size: int,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_pad: torch.Tensor,
+    block_size2: int,
+    sorted_token_ids2: torch.Tensor,
+    expert_ids2: torch.Tensor,
+    num_tokens_post_pad2: torch.Tensor,
+) -> None:
+    _call_moe_wna16_op(
+        "sgl_moe_align_block_size_dual",
+        topk_ids,
+        num_experts,
+        block_size,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        block_size2,
+        sorted_token_ids2,
+        expert_ids2,
+        num_tokens_post_pad2,
+    )
+
+
 moe_c_moe_sum = moe_sum
 moe_c_moe_sum_opt_v2 = moe_sum_opt_v2
 moe_c_silu_and_mul = silu_and_mul
