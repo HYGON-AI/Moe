@@ -1255,23 +1255,6 @@ void moe_c_sgl_moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts,
                                          num_tokens_post_pad, 0, nullptr, nullptr, nullptr); });
 }
 
-// Two routings of the same topk_ids (block_size and block_size2) in one pass, e.g. a BM128 gemm1
-// and a BM64 gemm2.  Inside every expert segment both list the slots in the same order.
-void moe_c_sgl_moe_align_block_size_dual(torch::Tensor topk_ids, int64_t num_experts,
-                                         int64_t block_size, torch::Tensor sorted_token_ids,
-                                         torch::Tensor experts_ids, torch::Tensor num_tokens_post_pad,
-                                         int64_t block_size2, torch::Tensor sorted_token_ids2,
-                                         torch::Tensor experts_ids2, torch::Tensor num_tokens_post_pad2)
-{
-  TORCH_CHECK(num_experts == 256 || num_experts == 384 || num_experts == 896,
-              "sgl_moe_align_block_size_dual kernel only supports 256, 384 or 896 experts.");
-  MOE_DISPATCH_INTEGRAL_TYPES(
-      topk_ids.scalar_type(), "sgl_moe_align_block_size_dual_kernel", [&]
-      { moe_c_sgl_align_launch<scalar_t>(topk_ids, num_experts, block_size, sorted_token_ids, experts_ids,
-                                         num_tokens_post_pad, block_size2, &sorted_token_ids2, &experts_ids2,
-                                         &num_tokens_post_pad2); });
-}
-
 void moe_c_moe_sum(torch::Tensor &input,   // [num_tokens, topk, hidden_size]
                    torch::Tensor &output,  // [num_tokens, hidden_size]
                    torch::Tensor topk_ids) // [num_tokens, top_k]

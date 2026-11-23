@@ -25,7 +25,6 @@
 #include "moe_w8a8_block_wise_fp8.h"
 #include "moe_w8a8_block_wise_kernel2_fp8.h"
 #include "moe_w8a8_opt.h"
-#include "moe_w4a16_opt.h"
 #include "moe_w8a16_chan_opt.h"
 
 #undef S_BARRIER
@@ -227,34 +226,6 @@ using at::device_of;
 // VVV=profile ID. The profile descriptor owns N_LOOP and any other static
 // attributes. The n160/kgrain64 family is intentionally excluded from this
 // descriptive mode namespace.
-static inline bool is_moe_channel_mode(int64_t mode) {
-  return mode >= 10000000LL && mode < 30000000LL;
-}
-
-// Kept as a named alias for callers that still describe the FP8 path.
-static inline bool is_fp8_channel_mode(int64_t mode) {
-  return is_moe_channel_mode(mode);
-}
-
-static inline int moe_channel_mode_stage(int64_t mode) {
-  return static_cast<int>(mode / 10000000LL);
-}
-
-static inline int moe_channel_mode_sorting(int64_t mode) {
-  return static_cast<int>((mode / 1000000LL) % 10);
-}
-
-static inline int moe_channel_mode_family(int64_t mode) {
-  return static_cast<int>((mode / 100000LL) % 10);
-}
-
-static inline int moe_channel_mode_bm(int64_t mode) {
-  return static_cast<int>((mode / 1000LL) % 100) * 16;
-}
-
-static inline int moe_channel_mode_profile(int64_t mode) {
-    return static_cast<int>(mode % 1000LL);
-}
 
 static inline void validate_moe_channel_layout(int64_t mode,
                                                 int expected_sorting) {

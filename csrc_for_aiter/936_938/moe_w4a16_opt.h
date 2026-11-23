@@ -67,7 +67,7 @@ __global__ void __launch_bounds__(512, 1) GEMM_NT_1STAGE(
   constexpr int mfma_n = 16;
 
   int warp_id_vec = threadIdx.x / 64;
-  int warp_id = __builtin_amdgcn_readfirstlane(warp_id_vec);
+  int warp_id = __builtin_hcu_readfirstlane(warp_id_vec);
   int lane_id = threadIdx.x & 63;
 
   constexpr int warp_n_num = BLOCK_SIZE_N / WARP_N;
@@ -308,7 +308,7 @@ __global__ void __launch_bounds__(512, 1) GEMM_NT_2STAGE(
   constexpr int mfma_k = 16;
 
   int warp_id_vec = threadIdx.x / 64;                        // warp id in a block
-  int warp_id = __builtin_amdgcn_readfirstlane(warp_id_vec); // 用于对warp id直接进行广播，不同一个block中的每个线程都去计算threadIdx.x / 64
+  int warp_id = __builtin_hcu_readfirstlane(warp_id_vec); // 用于对warp id直接进行广播，不同一个block中的每个线程都去计算threadIdx.x / 64
   int lane_id = threadIdx.x & 63;                            // thread_id
   int row_id = lane_id % 16;
   int col_id = lane_id / 16;
@@ -386,18 +386,19 @@ __global__ void __launch_bounds__(512, 1) GEMM_NT_2STAGE(
 
 // Dynamic LDS of the decode launchers.  1-stage: the epilogue stages BM / 2 output rows per phase, so
 // tiles with BM / 2 * BN * sizeof(T) > 16 KiB need more than the 16 KiB main-loop buffers.
-// 2-stage: BM * BN output tile plus store pad; the hardware limit is 64 KiB per block, so a tile
-// that asks for more (BM256 x BN128 bf16: 66560 B) is clamped to it.
+// 2-stage: BM * BN output tile plus store pad; every instantiated tile must fit in 64 KiB LDS.
 template <int BLOCK_SIZE_M, int BLOCK_SIZE_N, int BLOCK_SIZE_K, int WARP_N, int WARP_K, int STAGES, typename T>
 constexpr int w4a16_decode_lds_bytes()
 {
   constexpr int kMaxLds = 64 * 1024;
-  if constexpr (STAGES == 1)
-    return std::max<int>(16 * 1024, BLOCK_SIZE_M / 2 * BLOCK_SIZE_N * (int)sizeof(T));
-  else
-    return std::min<int>(kMaxLds, std::max<int>({BLOCK_SIZE_M * BLOCK_SIZE_N * (int)sizeof(T) + 1024 /*for store pad*/,
-                                                 BLOCK_SIZE_M * BLOCK_SIZE_K * (int)sizeof(T),
-                                                 w4a16_ksplit_lds_bytes<BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_N, WARP_K>()}));
+  constexpr int lds_bytes =
+      (STAGES == 1)
+          ? std::max<int>(16 * 1024, BLOCK_SIZE_M / 2 * BLOCK_SIZE_N * (int)sizeof(T))
+          : std::max<int>({BLOCK_SIZE_M * BLOCK_SIZE_N * (int)sizeof(T) + 1024 /*for store pad*/,
+                           BLOCK_SIZE_M * BLOCK_SIZE_K * (int)sizeof(T),
+                           w4a16_ksplit_lds_bytes<BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_N, WARP_K>()});
+  static_assert(lds_bytes <= kMaxLds, "moe_w4a16 legacy decode: LDS requirement exceeds 64 KiB");
+  return lds_bytes;
 }
 
 template <int BLOCK_SIZE_M, int BLOCK_SIZE_N, int BLOCK_SIZE_K, int WARP_M, int WARP_N, int WARP_K, int STAGES, typename T>

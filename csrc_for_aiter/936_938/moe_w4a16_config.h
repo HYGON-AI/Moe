@@ -1,17 +1,15 @@
 // Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 // SPDX-License-Identifier: MIT
 
-#include <unordered_map>
-#include <functional>
-#include <type_traits>
-#include <vector>
-#include <algorithm>
+#pragma once
 
-// HIPC mode format shared with W8A8: S F K MM VVV (see csrc/moe_c_common.h).
-// W4A16 kernels consume moe_align ids, so SORTING is always 1; FAMILY 0 is decode.
-#define MOE_W4A16_MODE(STAGE, SORTING, FAMILY, BM, PROFILE) \
-    ((STAGE) * 10000000 + (SORTING) * 1000000 + (FAMILY) * 100000 + \
-     ((BM) / 16) * 1000 + (PROFILE))
+#include <algorithm>
+#include <limits>
+#include <type_traits>
+#include <utility>
+
+#include "moe_channel_mode.h"
+#include "moe_w4a16_prefill_pipeline.h"
 
 template <typename T>
 struct GemmParams_w4a16
@@ -78,141 +76,73 @@ void launch_moe_w4a16_first_stage_decode(const GemmParams_w4a16<T> &params);
 template <int BLOCK_SIZE_M, int BLOCK_SIZE_N, int BLOCK_SIZE_K, int WARP_M, int WARP_N, int WARP_K, int STAGES, typename T>
 void launch_moe_w4a16_second_stage_decode(const GemmParams_w4a16<T> &params);
 
-// moe_w4a16_prefill.h: BM rows, WARPS warps along N, NN 16-column tiles per warp, NCH column
-// chunks per block (A resident in LDS, size_k == 256 only), ST LDS stages, PREFETCH_A fragments,
-// GEMM2 = down projection (scales rows by topk_weights).
-template <int BM, int WARPS, int NN, int NCH, int ST, bool PREFETCH_A, bool GEMM2, int WPE, int SCM, typename T, bool SILU = false,
-          int AH = 1>
+// BM routing rows, BN physical columns per chunk, NLoop chunks per CTA (A stays in
+// LDS when NLoop > 1). The pipeline derives wave layout and scheduling at compile time.
+// GS selects the scale layout. Legacy decode always uses group-32 scales.
+template <int BM, int BN, int NLoop, W4A16Pipeline Pipeline, W4A16Epilogue Epilogue, typename T, int GS = 32>
 void launch_moe_w4a16_prefill(const GemmParams_w4a16<T> &params);
 
-template <typename scalar_t>
-using KernelFunc_w4a16 = std::function<void(const GemmParams_w4a16<scalar_t> &)>;
+template <int BM, int BN, typename T, int GS = 32>
+void launch_moe_w4a16_g2_bstat(const GemmParams_w4a16<T> &params);
 
-// Prefill modes (FAMILY 1).  Profile segments: 2xx unfused, 3xx GEMM1 with fused silu_and_mul
-// (output [M, topk, N / 2]); a fused mode minus 100 is its unfused twin.
-inline bool w4a16_prefill_fused_silu(int64_t mode)
+template <int BM, int BN, int PrefetchDepth, W4A16Epilogue Epilogue, typename T, int GS = 32>
+void launch_moe_w4a16_decode(const GemmParams_w4a16<T> &params);
+
+// The unfused twin also describes the epilogue: a nonzero twin means the C
+// buffer holds half of GEMM1's output columns.
+template <typename T>
+struct W4A16Mode
 {
-    return mode / 100000 % 10 == 1 && mode % 1000 / 100 == 3;
+    int id;
+    int unfused_mode;
+    void (*launch)(const GemmParams_w4a16<T> &);
+};
+
+template <int Stage, int BM, int BN, int BK, int WM, int WN, int WK, int ST, typename T>
+void launch_w4a16_legacy(const GemmParams_w4a16<T> &p)
+{
+    TORCH_CHECK(p.size_n > 0 && p.size_n % BN == 0,
+                "moe_w4a16 legacy decode: N must be a positive multiple of ", BN, ", got ", p.size_n);
+    // Stage 1 pipelines load 4 blocks for K=256 and 8 blocks otherwise (BK=64).
+    const bool valid_k = ST == 1 ? (p.size_k == 256 || p.size_k % (8 * BK) == 0)
+                                 : p.size_k % (2 * BK) == 0;
+    TORCH_CHECK(p.size_k > 0 && valid_k, "moe_w4a16 legacy decode: unsupported K=", p.size_k,
+                " for BK=", BK, ", ST=", ST);
+    if constexpr (Stage == 1)
+        launch_moe_w4a16_first_stage_decode<BM, BN, BK, WM, WN, WK, ST>(p);
+    else
+        launch_moe_w4a16_second_stage_decode<BM, BN, BK, WM, WN, WK, ST>(p);
 }
 
-// Kernel registration.  BM is written once: it is both the BM field of the map key and the first
-// template argument of the launcher, so a key can never disagree with its kernel.  The map keys
-// (all four maps) are the only list of valid modes; moe_c_w4a16_modes() exports them to the tuner.
-#define W4A16_UNPAREN(...) __VA_ARGS__
-#define W4A16_DECODE(STAGE, PROFILE, BM, BN, BK, WM, WN, WK, ST, FN)                              \
-    {MOE_W4A16_MODE(STAGE, 1, 0, BM, PROFILE), [](const GemmParams_w4a16<scalar_t> &p)             \
-     { FN<BM, BN, BK, WM, WN, WK, ST, scalar_t>(p); }}
-// ARGS: launch_moe_w4a16_prefill template arguments after BM, as "(WARPS, NN, NCH, ST, PREFETCH_A,
-// GEMM2, WPE, SCM, scalar_t[, SILU[, AH]])"; FP16_ARGS replaces them for fp16 where the bf16
-// instance spills registers.
-#define W4A16_PREFILL(STAGE, PROFILE, BM, ARGS) W4A16_PREFILL_FP16(STAGE, PROFILE, BM, ARGS, ARGS)
-#define W4A16_PREFILL_FP16(STAGE, PROFILE, BM, ARGS, FP16_ARGS)                                   \
-    {MOE_W4A16_MODE(STAGE, 1, 1, BM, PROFILE), [](const GemmParams_w4a16<scalar_t> &p)             \
-     {                                                                                            \
-       if constexpr (std::is_same_v<scalar_t, half>)                                              \
-         launch_moe_w4a16_prefill<BM, W4A16_UNPAREN FP16_ARGS>(p);                                \
-       else                                                                                       \
-         launch_moe_w4a16_prefill<BM, W4A16_UNPAREN ARGS>(p);                                     \
-     }}
-
-template <typename scalar_t>
-static std::unordered_map<int, KernelFunc_w4a16<scalar_t>> kernel_maps_gemm1_prefill_w4a16 = {
-    W4A16_PREFILL(1, 201, 48, (4, 2, 1, 2, true, false, 0, 4, scalar_t)),
-    W4A16_PREFILL(1, 201, 64, (8, 2, 1, 2, true, false, 0, 4, scalar_t)),
-    W4A16_PREFILL(1, 202, 64, (8, 4, 1, 2, false, false, 4, 4, scalar_t)),
-    // BM80 / BM128: A staged per half K step (two blocks per CU).
-    W4A16_PREFILL(1, 201, 80, (8, 2, 1, 2, false, false, 4, 4, scalar_t, false, 2)),
-    W4A16_PREFILL(1, 201, 128, (8, 2, 1, 2, false, false, 4, 4, scalar_t, false, 2)),
-    // Larger row tiles reuse each dequantized B fragment across more MMACs.
-    // Half-step staging keeps BM256 within the 64 KiB LDS budget.
-    W4A16_PREFILL(1, 201, 160, (8, 2, 1, 2, false, false, 4, 4, scalar_t, false, 2)),
-    W4A16_PREFILL(1, 201, 192, (8, 2, 1, 2, false, false, 4, 4, scalar_t, false, 2)),
-    W4A16_PREFILL(1, 201, 256, (8, 2, 1, 2, false, false, 4, 4, scalar_t, false, 2)),
-    // These LDS sizes permit one block/CU, so a two-wave register budget avoids
-    // forcing the larger accumulator tiles to spill for unattainable occupancy.
-    W4A16_PREFILL(1, 202, 160, (8, 2, 1, 2, false, false, 2, 4, scalar_t, false, 2)),
-    W4A16_PREFILL(1, 202, 192, (8, 2, 1, 2, false, false, 2, 4, scalar_t, false, 2)),
-    W4A16_PREFILL(1, 202, 256, (8, 2, 1, 2, false, false, 2, 4, scalar_t, false, 2)),
-    // Fused silu_and_mul twins (profile + 100).
-    W4A16_PREFILL(1, 301, 48, (4, 2, 1, 2, true, false, 0, 4, scalar_t, true)),
-    W4A16_PREFILL(1, 302, 64, (8, 4, 1, 2, false, false, 4, 4, scalar_t, true)),
-    W4A16_PREFILL(1, 301, 80, (8, 2, 1, 2, false, false, 4, 4, scalar_t, true, 2)),
-    W4A16_PREFILL(1, 301, 128, (8, 2, 1, 2, false, false, 4, 4, scalar_t, true, 2)),
-    W4A16_PREFILL(1, 301, 160, (8, 2, 1, 2, false, false, 4, 4, scalar_t, true, 2)),
-    W4A16_PREFILL(1, 301, 192, (8, 2, 1, 2, false, false, 4, 4, scalar_t, true, 2)),
-    W4A16_PREFILL(1, 301, 256, (8, 2, 1, 2, false, false, 4, 4, scalar_t, true, 2)),
-    W4A16_PREFILL(1, 302, 160, (8, 2, 1, 2, false, false, 2, 4, scalar_t, true, 2)),
-    W4A16_PREFILL(1, 302, 192, (8, 2, 1, 2, false, false, 2, 4, scalar_t, true, 2)),
-    W4A16_PREFILL(1, 302, 256, (8, 2, 1, 2, false, false, 2, 4, scalar_t, true, 2)),
-};
-
-template <typename scalar_t>
-static std::unordered_map<int, KernelFunc_w4a16<scalar_t>> kernel_maps_gemm2_prefill_w4a16 = {
-    W4A16_PREFILL(2, 201, 48, (8, 2, 4, 2, true, true, 0, 4, scalar_t)),
-    W4A16_PREFILL(2, 201, 64, (8, 2, 2, 2, true, true, 0, 4, scalar_t)),
-    W4A16_PREFILL(2, 202, 64, (8, 2, 4, 2, true, true, 0, 4, scalar_t)),
-    // 203..205: NN4 / full-width variants (bf16); the fp16 NN4 instances spill registers, so fp16
-    // falls back to the 202 instance (or the 256-VGPR-budget variant for 205).
-    W4A16_PREFILL_FP16(2, 203, 64, (8, 4, 4, 2, false, true, 4, 2, scalar_t),
-                                   (8, 2, 4, 2, true, true, 0, 4, scalar_t)),
-    W4A16_PREFILL_FP16(2, 204, 64, (8, 4, 2, 2, false, true, 4, 2, scalar_t),
-                                   (8, 2, 4, 2, true, true, 0, 4, scalar_t)),
-    // NN2, all 2048 columns per block (8 chunks over the resident A).
-    W4A16_PREFILL_FP16(2, 205, 64, (8, 2, 8, 2, false, true, 4, 4, scalar_t),
-                                   (8, 2, 8, 2, false, true, 3, 4, scalar_t)),
-    // Resident-A variants: BM128 uses the full 64 KiB LDS allocation.
-    W4A16_PREFILL(2, 205, 80, (8, 2, 8, 2, false, true, 3, 4, scalar_t)),
-    W4A16_PREFILL(2, 205, 128, (8, 2, 8, 2, false, true, 2, 4, scalar_t)),
-    W4A16_PREFILL(2, 203, 128, (8, 4, 4, 2, false, true, 2, 2, scalar_t)),
-    // Beyond BM128, stream A in half steps to stay within 64 KiB LDS.
-    W4A16_PREFILL(2, 206, 256, (8, 2, 1, 2, false, true, 2, 4, scalar_t, false, 2)),
-    // Restore sixteen resident waves with one BM128 block (1024 threads).
-    W4A16_PREFILL(2, 207, 128, (16, 2, 4, 2, false, true, 4, 4, scalar_t)),
-};
-
-template <typename scalar_t>
-static std::unordered_map<int, KernelFunc_w4a16<scalar_t>> kernel_maps_gemm1_decode_w4a16 = {
-    W4A16_DECODE(1, 101, 16, 16, 512, 16, 16, 128, 2, launch_moe_w4a16_first_stage_decode),
-    W4A16_DECODE(1, 102, 16, 32, 512, 16, 32, 128, 2, launch_moe_w4a16_first_stage_decode),
-    W4A16_DECODE(1, 103, 16, 32, 256, 16, 16, 128, 2, launch_moe_w4a16_first_stage_decode),
-    W4A16_DECODE(1, 104, 16, 256, 128, 16, 64, 128, 2, launch_moe_w4a16_first_stage_decode),
-    W4A16_DECODE(1, 105, 16, 128, 256, 16, 64, 128, 2, launch_moe_w4a16_first_stage_decode),
-    W4A16_DECODE(1, 101, 32, 128, 256, 32, 64, 128, 2, launch_moe_w4a16_first_stage_decode),
-    W4A16_DECODE(1, 102, 32, 256, 128, 32, 64, 128, 2, launch_moe_w4a16_first_stage_decode),
-    W4A16_DECODE(1, 101, 48, 128, 128, 48, 32, 128, 2, launch_moe_w4a16_first_stage_decode),
-    W4A16_DECODE(1, 102, 48, 256, 128, 48, 64, 128, 2, launch_moe_w4a16_first_stage_decode),
-    W4A16_DECODE(1, 101, 64, 128, 128, 64, 32, 128, 2, launch_moe_w4a16_first_stage_decode),
-    W4A16_DECODE(1, 102, 64, 256, 128, 64, 64, 128, 2, launch_moe_w4a16_first_stage_decode),
-    W4A16_DECODE(1, 101, 128, 128, 128, 64, 64, 128, 2, launch_moe_w4a16_first_stage_decode),
-    W4A16_DECODE(1, 102, 128, 256, 64, 64, 64, 64, 1, launch_moe_w4a16_first_stage_decode),
-    W4A16_DECODE(1, 103, 128, 128, 64, 64, 64, 64, 1, launch_moe_w4a16_first_stage_decode),
-};
-
-template <typename scalar_t>
-static std::unordered_map<int, KernelFunc_w4a16<scalar_t>> kernel_maps_gemm2_decode_w4a16 = {
-    W4A16_DECODE(2, 101, 16, 64, 128, 16, 16, 128, 2, launch_moe_w4a16_second_stage_decode),
-    W4A16_DECODE(2, 102, 16, 128, 128, 16, 32, 128, 2, launch_moe_w4a16_second_stage_decode),
-    W4A16_DECODE(2, 103, 16, 256, 128, 16, 64, 128, 2, launch_moe_w4a16_second_stage_decode),
-    W4A16_DECODE(2, 101, 32, 256, 128, 32, 64, 128, 2, launch_moe_w4a16_second_stage_decode),
-    W4A16_DECODE(2, 102, 32, 128, 256, 32, 64, 128, 2, launch_moe_w4a16_second_stage_decode),
-    W4A16_DECODE(2, 101, 48, 128, 128, 48, 32, 128, 2, launch_moe_w4a16_second_stage_decode),
-    W4A16_DECODE(2, 102, 48, 256, 128, 48, 64, 128, 2, launch_moe_w4a16_second_stage_decode),
-    W4A16_DECODE(2, 101, 64, 128, 128, 64, 32, 128, 2, launch_moe_w4a16_second_stage_decode),
-    W4A16_DECODE(2, 102, 64, 256, 128, 64, 64, 128, 2, launch_moe_w4a16_second_stage_decode),
-    W4A16_DECODE(2, 101, 128, 128, 128, 64, 64, 128, 2, launch_moe_w4a16_second_stage_decode),
-    W4A16_DECODE(2, 102, 128, 256, 64, 64, 64, 64, 1, launch_moe_w4a16_second_stage_decode),
-    W4A16_DECODE(2, 103, 128, 128, 64, 64, 64, 64, 1, launch_moe_w4a16_second_stage_decode),
-    W4A16_DECODE(2, 104, 128, 384, 64, 64, 64, 64, 1, launch_moe_w4a16_second_stage_decode),
-    W4A16_DECODE(2, 101, 256, 128, 128, 64, 64, 128, 2, launch_moe_w4a16_second_stage_decode),
-};
-
-// Every registered mode of one stage (decode and prefill), sorted.
-inline std::vector<int64_t> w4a16_registered_modes(int stage)
+template <typename T>
+bool w4a16_bstat_output_fits(const GemmParams_w4a16<T> &p)
 {
-    std::vector<int64_t> modes;
-    auto add = [&](const auto &map) { for (const auto &kv : map) modes.push_back(kv.first); };
-    if (stage == 1) { add(kernel_maps_gemm1_decode_w4a16<half>); add(kernel_maps_gemm1_prefill_w4a16<half>); }
-    else            { add(kernel_maps_gemm2_decode_w4a16<half>); add(kernel_maps_gemm2_prefill_w4a16<half>); }
-    std::sort(modes.begin(), modes.end());
-    return modes;
+    constexpr uint64_t max_bytes = std::numeric_limits<int32_t>::max() - 1;
+    const uint64_t rows = static_cast<uint64_t>(p.size_m) * p.top_k;
+    return p.size_n == 0 || rows <= max_bytes / sizeof(T) / p.size_n;
 }
+
+template <int BM, int BN, typename T, int GS>
+void launch_w4a16_bstat_or_streamed(const GemmParams_w4a16<T> &p)
+{
+    if (p.size_k == 256 && w4a16_bstat_output_fits(p))
+        launch_moe_w4a16_g2_bstat<BM, BN, T, GS>(p);
+    else
+        launch_moe_w4a16_prefill<BM, w4a16_prefill::BstatFallbackBN, w4a16_prefill::BstatFallbackNLoop,
+                                w4a16_prefill::BstatFallbackPipeline, W4A16Epilogue::DownWeighted, T, GS>(p);
+}
+
+#include "moe_w4a16_mode_table.h"
+
+template <typename T, size_t N>
+const W4A16Mode<T> *find_w4a16_mode(const W4A16Mode<T> (&table)[N], int bm, int profile)
+{
+    // Stage and family select the table. Its remaining fields are sorted by BM, then profile.
+    const int key = (bm / 16) * 1000 + profile;
+    const auto *end = table + N;
+    const auto *it = std::lower_bound(table, end, key, [](const W4A16Mode<T> &entry, int value) {
+        return entry.id % 100000 < value;
+    });
+    return it != end && it->id % 100000 == key ? it : nullptr;
+}
+// NOTE(build-diff): Standalone CMake builds libmoe_w4a16.so with -ffast-math and post-misched enabled, whereas AITER JIT (core.py) builds module_moe_c_kernel with -mllvm -enable-post-misched=0, -mllvm --lsr-drop-solution=1, -fno-offload-uniform-block and without -ffast-math (+2.6%-7.8% slower on some prefill modes in gfx938 A/B).
