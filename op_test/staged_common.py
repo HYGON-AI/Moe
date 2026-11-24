@@ -60,7 +60,8 @@ _KERNEL_RULES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("routing", ("moe_align", "token_sort", "moe_sorting", "moesorting",
                  "fillfunctor")),
     ("quant", ("per_token_quant", "per_token_scaled_quant")),
-    ("gemm", ("moe_w4a8", "moe_w8a8", "moe_w4a16_prefill", "gemm_nt_", "marlin")),
+    ("gemm", ("moe_w4a8", "moe_w8a8", "moe_w4a16_", "moe_wna16_gemm_kernel",
+              "gemm_nt_", "marlin")),
     ("activation", ("glu_kernel", "silu")),
     ("sum", ("moe_sum",)),
 )

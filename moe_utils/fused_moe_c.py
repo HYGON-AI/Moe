@@ -16,6 +16,8 @@ import statistics
 import logging
 
 import time
+from .channel_mode import mode as encode_channel_mode
+from .w4a16_modes import w4a16_spec, w4a16_unfused_mode
 from .utils import (
     _apply_activation,
     _normalize_activation_and_gate,
@@ -77,15 +79,14 @@ def _check_moec_quant_legal(
 
     if use_int4_w4a16:
         assert block_shape is not None, (
-            "W4A16 moe_c currently requires groupwise block_shape=[0, 32]."
+            "W4A16 moe_c requires groupwise block_shape=[0, 32] or [0, 128]."
         )
         assert len(block_shape) == 2, (
-            f"W4A16 moe_c currently only supports block_shape=[0, 32], got {block_shape}."
+            f"W4A16 moe_c expects a two-element block_shape, got {block_shape}."
         )
         block_n, block_k = block_shape
-        assert block_n == 0 and block_k == _MOEC_WFP4_GROUP_SIZE, (
-            f"W4A16 moe_c currently only supports group_size=32 "
-            f"(expected block_shape=[0, 32], got block_shape={block_shape})."
+        assert block_n == 0 and block_k in (32, 128), (
+            f"W4A16 moe_c requires block_shape=[0, 32] or [0, 128], got {block_shape}."
         )
 
     if use_fp4_w4a16:
@@ -2325,6 +2326,13 @@ def invoke_fused_moe_kernel_marlin(A: torch.Tensor,
     if (use_int8_w8a16 or use_int4_w4a16 or use_fp4_w4a16 or use_fp4_w4a8 or use_fp8_w8a8 or use_int8_w8a8 or use_int8_w4a8) :
         assert B_scale is not None and B_scale.ndim == 3
         assert B_zp is None or B_zp.ndim == 3
+        if use_int4_w4a16:
+            group_size = block_shape[1]
+            if B_scale.shape[-1] * group_size != A.shape[-1]:
+                raise ValueError(f"W4A16 scale shape {B_scale.shape} does not match "
+                                 f"K={A.shape[-1]} and group_size={group_size}")
+            if group_size == 128:
+                B_scale = B_scale.contiguous()
 
         # use_moe_wna16_cuda = should_moe_wna16_use_cuda(
         #     num_valid_tokens=topk_ids.numel(),
@@ -2608,12 +2616,18 @@ def validate_channelwise_reduce_k(quant, mode, reduce_k, is_bottom, out_n=None):
         (f" or have remainder {tail}" if tail is not None else ""))
 
 
-W4A16_GROUP_SIZE = 32  # GROUP_K of the launchers
-
-
 def w4a16_fuse_silu(mode) -> bool:
-    """GEMM1 prefill profile 3xx (K digit 1): silu_and_mul is fused, output [M, topk, N / 2]; mode - 100 is the unfused twin."""
-    return mode // 100000 % 10 == 1 and mode % 1000 // 100 == 3
+    return w4a16_unfused_mode(mode) is not None
+
+
+def _default_w4a16_config(n, k, bottom):
+    # Both streamed-A launchers accept all full 128-column tiles and K steps
+    # of 256. This is a correctness fallback until the workload is retuned.
+    out_n, reduce_k = (k, n) if bottom else (2 * n, k)
+    if not out_n or not reduce_k or out_n % 128 or reduce_k % 256:
+        return None
+    bm, profile = (32, 540) if bottom else (48, 311)
+    return {"MODE": encode_channel_mode(2 if bottom else 1, 1, 1, bm, profile), "BLOCK_SIZE_M": bm}
 
 
 CSV_NAMES = {
@@ -2652,36 +2666,44 @@ def _read_table(path, mtime_ns, size):
             quant = next((q for q, label in QUANT_TYPES.items() if label == row["quant_type"]), None)
             assert quant is not None, f"{path}:{line}: invalid quant_type"
             w4a16 = quant == "int4_w4a16"
-            assert int(row["q_size_n"]) == 0 and int(row["q_size_k"]) == (W4A16_GROUP_SIZE if w4a16 else 0), (
+            group_size = int(row["q_size_k"])
+            assert int(row["q_size_n"]) == 0 and group_size in ((32, 128) if w4a16 else (0,)), (
                 f"{path}:{line}: unexpected quantization group")
             modes, _ = decode_pair(row["sol_id"], same_bm=not w4a16)
             n, k = int(row["inter_dim"]), int(row["model_dim"])
-            if not w4a16:  # W4A16 modes are validated by the tuner that wrote them
+            if w4a16:
+                specs = tuple(w4a16_spec(mode_id) for mode_id in modes)
+                if group_size == 128 and any(spec.implementation == "legacy_decode" for spec in specs):
+                    continue
+            else:
                 validate_channelwise_reduce_k(quant, modes[0], k, False, 2 * n)
                 validate_channelwise_reduce_k(quant, modes[1], n, True, k)
             key = (row["arch"], row["quant_type"], row["indtype"],
                    int(row["inter_dim"]), int(row["model_dim"]), int(row["expert"]),
                    int(row["topk"]) if row["topk"] else None,
-                   int(row["cu_num"]) if row["cu_num"] else None)
+                   int(row["cu_num"]) if row["cu_num"] else None, group_size)
             token = int(row["token"])
             assert token > 0 and token not in groups.get(key, {}), f"{path}:{line}: duplicate/invalid token"
             groups.setdefault(key, {})[token] = row["sol_id"]
     return groups
 
 
-def find_csv_config(root, arch, quant, e, n, k, topk, cu, bottom, indtype=None):
+def find_csv_config(root, arch, quant, e, n, k, topk, cu, bottom, indtype=None, *, group_size=32):
     path = os.path.join(root, CSV_NAMES[quant])
     if k is None or not os.path.isfile(path):
         return None
     stamp = os.stat(path)
     groups = _read_table(path, stamp.st_mtime_ns, stamp.st_size)
     requested = (cu, topk, e)
+    q_size_k = group_size if quant == "int4_w4a16" else 0
     candidates = []
     for key, table in groups.items():
-        a, q, dt, cn, ck, ce, ct, cc = key
-        if (a, q, cn, ck) != (arch, QUANT_TYPES[quant], n, k):
+        a, q, dt, cn, ck, ce, ct, cc, group = key
+        if (a, q, cn, ck, group) != (arch, QUANT_TYPES[quant], n, k, q_size_k):
             continue
         if dt != str(indtype or "torch.bfloat16"):
+            continue
+        if quant == "int4_w4a16" and cu is not None and cc != cu:
             continue
         actual = (cc, ct, ce)
         level = max((i for i, (x, y) in enumerate(zip(actual, requested), 1)
@@ -2703,13 +2725,25 @@ def find_csv_config(root, arch, quant, e, n, k, topk, cu, bottom, indtype=None):
 
 def write_config_csv(path, rows):
     """Merge tuned rows by shape/M, retaining results for other workloads."""
+    rows = list(rows)
+    writes_w4a16 = any(row["quant_type"] == "int4_w4a16_group" for row in rows)
     merged = {}
     if os.path.isfile(path):
         with open(path, newline="") as stream:
             for row in csv.DictReader(stream):
+                if writes_w4a16 and row["quant_type"] != "int4_w4a16_group":
+                    raise ValueError(f"Cannot merge int4_w4a16_group into {path}: incompatible quant_type={row['quant_type']!r}")
                 merged[tuple(str(row[field]) for field in FIELDS if field not in ("sol_id", "time_us"))] = row
     for row in rows:
-        decode_pair(row["sol_id"], same_bm=row["quant_type"] != QUANT_TYPES["int4_w4a16"])
+        w4a16 = row["quant_type"] == "int4_w4a16_group"
+        modes, _ = decode_pair(row["sol_id"], same_bm=not w4a16)
+        if w4a16:
+            group_size = int(row["q_size_k"])
+            if int(row["q_size_n"]) != 0 or group_size not in (32, 128):
+                raise ValueError("W4A16 CSV requires q_size_n=0 and q_size_k=32 or 128")
+            specs = tuple(w4a16_spec(mode_id) for mode_id in modes)
+            if group_size == 128 and any(spec.implementation == "legacy_decode" for spec in specs):
+                raise ValueError(f"W4A16 legacy decode requires group_size=32: {row['sol_id']}")
         merged[tuple(str(row[field]) for field in FIELDS if field not in ("sol_id", "time_us"))] = row
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w", newline="") as stream:
@@ -2719,7 +2753,7 @@ def write_config_csv(path, rows):
 
 
 def rows_from_pair(top, bottom, arch, quant, e, n, k, topk=None, cu=None,
-                   indtypes=("torch.bfloat16", "torch.float16"), times=None):
+                   indtypes=("torch.bfloat16", "torch.float16"), times=None, *, group_size=32):
     assert set(top) == set(bottom), "GEMM1/GEMM2 must have identical M keys for CSV migration"
     rows = []
     for token in sorted(top, key=int):
@@ -2731,7 +2765,7 @@ def rows_from_pair(top, bottom, arch, quant, e, n, k, topk=None, cu=None,
         for indtype in indtypes:
             rows.append(dict(zip(FIELDS, (arch, QUANT_TYPES[quant], indtype, int(token), n, k,
                                          e, topk if topk is not None else "", 0,
-                                         W4A16_GROUP_SIZE if quant == "int4_w4a16" else 0, "moe_c", sol,
+                                         group_size if quant == "int4_w4a16" else 0, "moe_c", sol,
                                          (times or {}).get(str(token), ""), cu if cu is not None else ""))))
     return rows
 
@@ -3118,9 +3152,12 @@ def get_moe_configs_marlin(
     top_k: Optional[int] = None,
     num_cu: Optional[int] = None,
     indtype: Optional[str] = None,
+    arch: Optional[str] = None,
 ) -> Optional[Dict[int, Any]]:
     """
     Return optimized configurations for the fused MoE kernel.
+
+    W4A16 requires the actual device arch and CU count in the cache key.
 
     The return value will be a dictionary that maps an irregular grid of
     batch sizes to configurations of the fused_moe kernel. To evaluate the
@@ -3129,17 +3166,22 @@ def get_moe_configs_marlin(
     """
 
     block_shape = [block_n if block_n is not None else 0, block_k] if block_k is not None else None
-    arch = _get_gfx_version()
+    if dtype == "int4_w4a16":
+        if block_k not in (None, 32, 128) or block_n not in (None, 0):
+            return None
+        if arch is None or num_cu is None:
+            return None
+        csv_config = find_csv_config(_moe_c_config_root(), arch, dtype, E, N, K, top_k,
+                                     num_cu, is_bottom, indtype, group_size=block_k or 32)
+        if csv_config is not None:
+            return csv_config
+        default = _default_w4a16_config(N, K, is_bottom) if K is not None else None
+        return {1: default} if default is not None else None
+    arch = arch or _get_gfx_version()
     resolved_cu = _resolve_num_cu(arch, num_cu)
     if dtype in ("fp8_w8a8", "int8_w8a8", "int8_w4a8"):
         return _find_closest_channelwise_config(
             E, N, dtype, is_bottom, K, top_k, resolved_cu, arch, indtype=indtype)
-    if dtype == "int4_w4a16" and block_k in (None, W4A16_GROUP_SIZE):
-        # Tuned CSV first; untuned shapes fall back to the JSON files below.
-        csv_config = find_csv_config(_moe_c_config_root(), arch, dtype, E, N, K, top_k,
-                                     resolved_cu, is_bottom, indtype)
-        if csv_config is not None:
-            return csv_config
     csv_config = _load_fp8_channel_csv_config(E, N, K, dtype, is_bottom, top_k, resolved_cu)
     if csv_config is not None:
         return csv_config
@@ -3385,6 +3427,8 @@ def try_get_optimal_moe_config_marlin(
     is_bottom: bool = False,
     use_moe_wna16_cuda: bool = False,
     indtype: Optional[str] = None,
+    num_cu: Optional[int] = None,
+    arch: Optional[str] = None,
 ):
     override_config = get_config()
     if override_config:
@@ -3430,8 +3474,10 @@ def try_get_optimal_moe_config_marlin(
         block_k = block_shape[1] if block_shape else 0
         configs = get_moe_configs_marlin(
             E, N, dtype, block_n, block_k, is_bottom, use_moe_wna16_cuda,
-            K=logical_k, top_k=top_k, indtype=indtype)
+            K=logical_k, top_k=top_k, indtype=indtype, num_cu=num_cu, arch=arch)
 
+        if dtype == "int4_w4a16" and not configs:
+            raise ValueError(f"No W4A16 mode for N={N}, K={logical_k}, group size={block_k}")
         if block_shape is None and dtype in ("fp8_w8a8", "int8_w8a8", "int8_w4a8"):
             assert configs, f"No moe_c config with matching N={N}, K={logical_k}, dtype={dtype}"
         if configs:
@@ -4197,6 +4243,7 @@ def fused_experts_impl_marlin(hidden_states: torch.Tensor,
                                         use_w16a16=use_w16a16,
                                         dtype=compute_dtype)
 
+    w4a16_device = torch.cuda.get_device_properties(hidden_states.device) if use_int4_w4a16 else None
     get_config_func = functools.partial(
         try_get_optimal_moe_config_marlin,
         w1.shape,
@@ -4205,6 +4252,8 @@ def fused_experts_impl_marlin(hidden_states: torch.Tensor,
         config_dtype,
         block_shape=block_shape,
         indtype=str(compute_dtype),
+        num_cu=w4a16_device.multi_processor_count if w4a16_device is not None else None,
+        arch=w4a16_device.gcnArchName.split(":")[0] if w4a16_device is not None else None,
     )
     # use_moe_wna16_cuda = should_moe_wna16_use_cuda(
     #         num_valid_tokens=topk_ids.numel(),
@@ -4340,11 +4389,16 @@ def fused_experts_impl_marlin(hidden_states: torch.Tensor,
                 raise ValueError("channelwise GEMM1/GEMM2 must use the same routing layout")
         fuse_silu = dual_routing = False
         if use_int4_w4a16 and not find_best and config2 is not None:
-            # GEMM1 may fuse silu_and_mul; fall back to the unfused twin (mode - 100) otherwise.
-            fuse_silu = w4a16_fuse_silu(config["MODE"])
+            spec1 = w4a16_spec(config["MODE"])
+            spec2 = w4a16_spec(config2["MODE"])
+            if ((spec1.stage, spec2.stage) != (1, 2) or
+                    (spec1.bm, spec2.bm) != (int(config["BLOCK_SIZE_M"]), int(config2["BLOCK_SIZE_M"]))):
+                raise ValueError("W4A16 mode stage/BM disagrees with the routing configuration")
+            twin = w4a16_unfused_mode(config["MODE"])
+            fuse_silu = twin is not None
             if fuse_silu and not (activation == "silu" and is_gated and gemm1_alpha is None
                                   and gemm1_limit is None):
-                config = dict(config, MODE=int(config["MODE"]) - 100)
+                config = dict(config, MODE=twin)
                 fuse_silu = False
             dual_routing = int(config["BLOCK_SIZE_M"]) != int(config2["BLOCK_SIZE_M"])
         w4a16_gemm2_routing = None

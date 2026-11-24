@@ -1,16 +1,175 @@
 """CPU-only checks for mode routing, C++ tiles, and shape restrictions."""
 
+import json
 import re
+import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from tune.tune_moe_hipc import PROFILES, Shape, DirectBenchRow, _best_bm_pairs, _valid_modes_for_shape, mode
+from tune.tune_moe_hipc import (_append_w4a16_checkpoint, _best_w4a16_pair,
+                                _read_w4a16_checkpoint, _stage_descriptors, _supervise_w4a16)
+from tune.w4a16_tune_utils import W4A16BenchRow
 from tune.tune_moe_w4a8_perchannel import Shape as W4Shape, generate_candidates
+from moe_utils.w4a16_modes import W4A16_CSV_NAME, W4A16_CSV_QUANT, mode_specs, w4a16_unfused_mode
+from tune.gen_w4a16_mode_table import PIPELINES, TABLE, render, render_pipelines
 
 
 def shape(**changes):
     return replace(Shape(256, 256, 7168, 8, 1, "bf16", "gfx938", 72), **changes)
+
+
+class W4A16ModeDescriptorsTest(unittest.TestCase):
+    profile = PROFILES["int4_w4a16"]
+
+    def test_catalog_is_unique_and_fused_modes_have_exact_twins(self):
+        specs = mode_specs()
+        ids = [mode(s.stage, 1, s.family, s.bm, s.profile) for s in specs]
+        self.assertEqual(len(specs), 80)
+        self.assertEqual(list(self.profile.descriptors), sorted(ids))
+        self.assertEqual(sum(d.implementation == "legacy_decode" for d in self.profile.descriptors.values()), 27)
+        for desc in self.profile.descriptors.values():
+            if desc.template.get("silu"):
+                twin = self.profile.descriptor(desc.unfused_mode)
+                self.assertEqual((twin.stage, twin.family, twin.bm), (1, desc.family, desc.bm))
+                self.assertEqual(twin.template, dict(desc.template, silu=False))
+
+    def test_generated_table_and_runtime_fused_twins(self):
+        self.assertEqual(TABLE.read_text(), render())
+        self.assertEqual(PIPELINES.read_text(), render_pipelines())
+        self.assertIsNone(w4a16_unfused_mode(11103331))
+        self.assertEqual(w4a16_unfused_mode(11103431), 11103331)
+        self.assertEqual(w4a16_unfused_mode(11001218), 11001118)
+
+    def test_csv_rejects_incompatible_quant_and_wrong_cu(self):
+        from moe_utils.fused_moe_c import find_csv_config, rows_from_pair, write_config_csv
+
+        rows = rows_from_pair({1: {"MODE": 11008101}}, {1: {"MODE": 21001101}},
+                              "gfx936", "int4_w4a16", 8, 256, 1024, 4, 72,
+                              ["torch.float16"])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / W4A16_CSV_NAME
+            write_config_csv(path, rows)
+            read = lambda cu: find_csv_config(directory, "gfx936", "int4_w4a16",
+                                               8, 256, 1024, 4, cu, False, "torch.float16")
+            self.assertEqual(read(72), {1: {"MODE": 11008101, "BLOCK_SIZE_M": 128}})
+            self.assertIsNone(read(80))
+            bad = path.read_text().replace(W4A16_CSV_QUANT, "int4_w4a16_legacy")
+            path.write_text(bad)
+            with self.assertRaisesRegex(AssertionError, "invalid quant_type"):
+                read(72)
+            with self.assertRaisesRegex(ValueError, "incompatible quant_type"):
+                write_config_csv(path, rows)
+            self.assertEqual(path.read_text(), bad)
+
+    def test_untuned_shape_uses_legal_modes(self):
+        from moe_utils.fused_moe_c import _default_w4a16_config
+
+        for n, k in ((256, 1024), (512, 7168), (512, 2304)):
+            for bottom in (False, True):
+                config = _default_w4a16_config(n, k, bottom)
+                descriptor = self.profile.descriptor(config["MODE"])
+                self.assertEqual(descriptor.bm, config["BLOCK_SIZE_M"])
+                self.assertIsNone(descriptor.validate(shape(n=n, k=k)))
+        self.assertIsNone(_default_w4a16_config(256, 1152, False))
+
+    def test_legacy_single_stage_requires_complete_packed_scale_load(self):
+        desc = self.profile.descriptor(11008191)
+        self.assertIsNone(desc.validate(shape(k=256)))
+        self.assertIsNone(desc.validate(shape(k=1024)))
+        self.assertIsNotNone(desc.validate(shape(k=768)))
+
+    def test_group_128_skips_legacy_decode_in_both_stages(self):
+        for stage, legacy, decode in ((1, 11008101, 11001112), (2, 21001101, 21001122)):
+            descriptors = _stage_descriptors(self.profile, stage, [legacy, decode])
+            self.assertIn(legacy, _valid_modes_for_shape(self.profile, shape(), stage, descriptors=descriptors))
+            self.assertEqual(
+                _valid_modes_for_shape(self.profile, shape(group_size=128), stage, descriptors=descriptors),
+                [decode],
+            )
+
+    def test_decode_depth_depends_on_reduction_k(self):
+        desc = self.profile.descriptor(11001218)
+        for k, depth in ((1024, 4), (2048, 8)):
+            workload = shape(k=k)
+            self.assertIsNone(desc.validate(workload))
+            self.assertEqual(desc.for_shape(workload).template["pd"], depth)
+        self.assertIsNotNone(desc.validate(shape(k=1536)))
+
+    def test_sweep_uses_profile_and_picks_different_bms(self):
+        self.assertEqual({d.family for d in _stage_descriptors(self.profile, 1)}, {0, 1})
+        self.assertEqual([d.mode for d in _stage_descriptors(self.profile, 1, [11001218])], [11001218])
+        with self.assertRaisesRegex(ValueError, "Unknown GEMM1"):
+            _stage_descriptors(self.profile, 1, [21001101])
+        rows = [W4A16BenchRow(8, "gemm1", 11103331, 48, "ok", 2.0, epilogue_us=2.0),
+                W4A16BenchRow(8, "gemm1", 11001218, 16, "ok", 3.0),
+                W4A16BenchRow(8, "gemm2", 21102611, 32, "ok", 1.0),
+                W4A16BenchRow(8, "gemm2", 21001101, 16, "mismatch")]
+        best = _best_w4a16_pair(rows, 8)
+        self.assertEqual((best["gemm1"]["mode"], best["gemm2"]["mode"]), (11001218, 21102611))
+        self.assertEqual(best["latency_us"], 4.0)
+        self.assertTrue(best["dual_routing"])
+
+    def test_w4a16_worker_resumes_without_overwriting_completed_candidates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "sweep.jsonl"
+            unrelated = Path(directory) / "other.inflight.json"
+            unrelated.write_text("unrelated")
+            done = W4A16BenchRow(8, "gemm1", 11001218, 16, "ok", 3.0)
+            _append_w4a16_checkpoint(checkpoint, done)
+            missing = dict(m=8, stage="gemm2", mode=21102611, bm=32)
+            calls = 0
+
+            def worker(cmd):
+                nonlocal calls
+                marker = Path(cmd[-1])
+                self.assertFalse(marker.exists())
+                calls += 1
+                if calls == 1:
+                    # First exit occurs between journal append and marker removal.
+                    fields = dict(m=done.m, stage=done.stage, mode=done.mode, bm=done.bm)
+                elif calls == 2:
+                    fields = missing
+                else:
+                    return 0
+                marker.write_text(json.dumps(dict(checkpoint=str(checkpoint), **fields)))
+                return -11
+
+            with patch("tune.tune_moe_hipc.subprocess.call", side_effect=worker):
+                self.assertEqual(_supervise_w4a16(SimpleNamespace(fresh=False), []), 0)
+            results = _read_w4a16_checkpoint(checkpoint)
+            self.assertEqual(results[(8, "gemm1", 11001218)], done)
+            self.assertEqual(results[(8, "gemm2", 21102611)].status, "crashed")
+            self.assertEqual(len(checkpoint.read_text().splitlines()), 2)
+            self.assertEqual(unrelated.read_text(), "unrelated")
+            self.assertEqual(calls, 3)
+
+    def test_prefill_checks_shape_after_dtype_and_launcher_fallbacks(self):
+        desc = self.profile.descriptor(21104522)
+        workload = shape(k=1024)
+        self.assertEqual(desc.for_shape(workload).template["nch"], 2)
+        fp16 = replace(workload, dtype="fp16")
+        self.assertEqual(desc.for_shape(fp16).template["nch"], 4)
+        self.assertEqual(desc.for_shape(replace(fp16, k=768)).template["nch"], 1)
+        self.assertIsNotNone(desc.validate(replace(fp16, k=640)))
+
+        bstat = self.profile.descriptor(21102611)
+        self.assertEqual(bstat.for_shape(workload).implementation, "bstat")
+        self.assertIsNotNone(bstat.validate(replace(workload, k=256)))
+        last_bstat_m = ((1 << 31) - 2) // (workload.topk * workload.k * 2)
+        self.assertEqual(bstat.for_shape(replace(workload, m=last_bstat_m)).implementation, "bstat")
+        wide_output = replace(workload, m=last_bstat_m + 1)
+        effective = bstat.for_shape(wide_output)
+        self.assertEqual((effective.implementation, effective.bm, effective.bn), ("prefill", 32, 128))
+        self.assertIn("signed int32 byte limit", effective.selection_notes[-1])
+        self.assertIsNone(bstat.validate(wide_output))
+        fallback = replace(workload, n=512, k=256)
+        self.assertEqual(bstat.for_shape(fallback).implementation, "prefill")
+        self.assertIsNone(bstat.validate(fallback))
+        self.assertIsNotNone(bstat.validate(replace(fallback, n=384)))
 
 
 class ModeDescriptorsTest(unittest.TestCase):

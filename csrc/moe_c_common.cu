@@ -5,6 +5,7 @@
 
 #include "moe_wna16_utils.h"
 #include "moe_align_sum_kernels.h"
+#include "moe_align_dual_kernels.h"
 #include "moe_sum_kernels_opt_v2.h"
 #include "silu_mul_kernels.h"
 #include "topk_softmax_kernel.h"
