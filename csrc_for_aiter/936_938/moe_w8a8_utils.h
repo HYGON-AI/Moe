@@ -91,7 +91,9 @@ __forceinline__ __device__ void gemm_nt_marlin_prefill(
 #pragma unroll
     for (int n_tile = 0; n_tile < WARP_N / MFMA_N; n_tile++)
     {
-        g_row_B[n_tile] = (warp_n_id * WARP_N + row_id + n_tile * MFMA_N) * 64 + col_id * 16; // warp内部k连续[warpn, 64] warp外部在N方向连续
+        // Match the shared N16/K16-interleaved W8A8 weight layout.
+        g_row_B[n_tile] = (warp_n_id * WARP_N + n_tile * MFMA_N) * 64 +
+                          row_id * 16 + col_id * 16 * 16;
     }
 
     // Short K must neither prefetch nor accumulate nonexistent tiles.
