@@ -2510,6 +2510,9 @@ def invoke_fused_moe_kernel_marlin(A: torch.Tensor,
 
 def _mode_tiles(quant, stage, routing, family, bm, profile):
     up = stage == 1
+    if quant == "int8_w8a8" and family == 3:
+        assert routing in (0, 1) and bm in (128, 256) and profile in (101, 102)
+        return 256
     if quant == "int8_w4a8":
         assert routing == 1 and bm in (16, 32, 48, 64)
         if family == 0:
@@ -2585,6 +2588,8 @@ def validate_channelwise_reduce_k(quant, mode, reduce_k, is_bottom, out_n=None):
                              if family == 0 else
                              (192,) if family == 3 else
                              (128, 192, 256, 384, 512, 640, 768, 1024, 1536, 2048, 3072))
+    elif quant == "int8_w8a8" and family == 3:
+        pass  # WASP accepts any reduction K aligned to BK=128.
     elif family == 0:
         if up:
             variants = ({(16, 101): 1024, (16, 102): 512, (16, 103): 256,
@@ -2723,6 +2728,15 @@ def find_csv_config(root, arch, quant, e, n, k, topk, cu, bottom, indtype=None, 
     return result
 
 
+def _config_csv_sort_key(row):
+    text_fields = ("arch", "quant_type", "indtype")
+    numeric_fields = ("expert", "inter_dim", "model_dim", "topk", "cu_num",
+                      "q_size_n", "q_size_k", "token")
+    return (tuple(row[field] for field in text_fields)
+            + tuple(int(row[field]) if row[field] != "" else -1 for field in numeric_fields)
+            + (row["sol_type"],))
+
+
 def write_config_csv(path, rows):
     """Merge tuned rows by shape/M, retaining results for other workloads."""
     rows = list(rows)
@@ -2749,7 +2763,7 @@ def write_config_csv(path, rows):
     with open(path, "w", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=FIELDS, lineterminator="\n")
         writer.writeheader()
-        writer.writerows(merged[key] for key in sorted(merged))
+        writer.writerows(sorted(merged.values(), key=_config_csv_sort_key))
 
 
 def rows_from_pair(top, bottom, arch, quant, e, n, k, topk=None, cu=None,

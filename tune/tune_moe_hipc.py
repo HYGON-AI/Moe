@@ -137,6 +137,10 @@ class ModeDescriptor:
         effective = self.for_shape(shape)
         out_n = shape.k if self.stage == 2 else 2 * shape.n
         reduce_k = shape.n if self.stage == 2 else shape.k
+        if self.quant == "int8_w8a8" and self.family == 3:
+            rows = shape.m if self.stage == 1 else shape.m * shape.topk
+            if rows * reduce_k >= 1 << 31 or out_n * reduce_k >= 1 << 31:
+                return "WASP exceeds the 2 GiB input/expert buffer limit"
         # Zero dimensions are unknown in config filenames, not a tuning shape.
         if out_n:
             if effective.exact_out_n is not None and out_n != effective.exact_out_n:
@@ -339,6 +343,10 @@ def _w8a8_int8_modes() -> Dict[int, Tuple[int, ...]]:
     gemm2 += _ordinary_modes(2, 0, 1, ((32, 201), (64, 202)))
     gemm2 += _nloop_modes(2, 0, 2, (32, 48, 64), (4,))
     gemm2 += _nloop_modes(2, 0, 2, (32, 48, 64), (1, 2))
+    for stage, candidates in ((1, gemm1), (2, gemm2)):
+        candidates += [(stage, sorting, 3, bm, profile)
+                       for sorting in (0, 1) for bm in (128, 256)
+                       for profile in (101, 102)]
     return {1: _modes(gemm1), 2: _modes(gemm2)}
 
 
@@ -383,6 +391,16 @@ def _describe_mode(quant: str, cand: Candidate) -> ModeDescriptor:
             template=spec.template, fp16_overrides=spec.fp16_overrides,
             unfused_mode=unfused_mode,
             **_w4a16_launch_fields(cand.stage, spec.implementation, spec.template),
+        )
+    if quant == "int8_w8a8" and cand.family == 3:
+        waves_m = cand.profile - 100
+        return ModeDescriptor(
+            quant=quant, mode=cand.mode, stage=cand.stage, sorting=cand.sorting,
+            family=cand.family, kernel="launch_moe_w8a8_int8_wasp", bm=cand.bm,
+            bn=256, bk=128, wm=cand.bm // waves_m, wn=32 * waves_m, wk=32,
+            stages=2, nloop=1, k_step=128, min_reduce_k=128,
+            input_dtypes=("bf16",), recommended_m_min=513,
+            source="csrc_for_aiter/936_938/moe_w8a8_int8_wasp.h",
         )
     up_k = (2048, 3072, 4096, 6144, 7168)
     fp8_up_k = (1280, *up_k)
@@ -512,7 +530,7 @@ DIRECT_DTYPES = {"bf16": "torch.bfloat16", "fp16": "torch.float16"}
 PROFILES: Dict[str, QuantProfile] = {
     "int4_w4a16": QuantProfile("int4_w4a16", ("int4_w4a16",), (1,), (0, 1), (), W4A16_MODES_BY_STAGE),
     "fp8_w8a8": QuantProfile("fp8_w8a8", ("fp8_w8a8",), (0, 1), (0, 1, 2), (201, 202, 203, 204), _w8a8_fp8_modes()),
-    "int8_w8a8": QuantProfile("int8_w8a8", ("int8_w8a8",), (0,), (0, 1, 2), (201, 202, 203, 204), _w8a8_int8_modes()),
+    "int8_w8a8": QuantProfile("int8_w8a8", ("int8_w8a8",), (0, 1), (0, 1, 2, 3), (201, 202, 203, 204), _w8a8_int8_modes()),
     "int8_w4a8": QuantProfile("int8_w4a8", ("int8_w4a8",), (1,), (0, 1, 2, 3), (201, 202, 203, 204), _w4a8_modes()),
 }
 
@@ -1495,7 +1513,7 @@ def main(argv=None) -> int:
     parser.add_argument("--list-modes", action="store_true", help="export per-quant descriptors and shape rejection reasons without a GPU")
     parser.add_argument("--recommended-only", action="store_true", help="restrict sweep to each descriptor's recommended M range")
     parser.add_argument("--bench-direct", action="store_true", help="benchmark current config with direct moe_c GEMM calls")
-    parser.add_argument("--sweep-direct", action="store_true", help="with --bench-direct, sweep instantiated modes instead of current config")
+    parser.add_argument("--sweep-direct", action="store_true", help="with --bench-direct, sweep legal instantiated modes instead of current config")
     parser.add_argument("--sweep-config-modes", action="store_true", help="with --sweep-direct, only sweep modes already declared by runtime configs")
     parser.add_argument("--direct-inprocess", action="store_true", help="channelwise sweep: run candidates in one process for speed")
     parser.add_argument("--candidate-timeout", type=int, default=90, help="channelwise worker timeout (seconds)")

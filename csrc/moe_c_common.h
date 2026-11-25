@@ -311,7 +311,8 @@ static void moe_marlin_w8a8_dispatch_gemm_stages(
   TORCH_CHECK(mode / 10000000 == (first_stage ? 1 : 2),
               "W8A8 mode stage does not match GEMM stage: ", mode);
   if constexpr (std::is_same_v<ElemT, int8_t>) {
-    TORCH_CHECK(routing == 0, "W8A8 INT8 requires CK sorting mode: ", mode);
+    TORCH_CHECK(routing == 0 || (routing == 1 && moe_channel_mode_family(mode) == 3),
+                "W8A8 INT8 moe_align requires a WASP mode: ", mode);
   } else {
     TORCH_CHECK(routing == 0 || (routing == 1 && !is_decode),
                 "unsupported W8A8 FP8 routing/kernel family: ", mode);
@@ -344,6 +345,14 @@ static void moe_marlin_w8a8_dispatch_gemm_stages(
         tensorwise_scale,
         real_size_k);
 
+    if constexpr (std::is_same_v<ElemT, int8_t>) {
+      if (moe_channel_mode_family(mode) == 3) {
+        auto it = kernel_maps_gemm1_wasp<OutT>.find(mode);
+        TORCH_CHECK(it != kernel_maps_gemm1_wasp<OutT>.end(), "invalid W8A8 WASP mode: ", mode);
+        it->second(params_in);
+        return;
+      }
+    }
     if (is_decode) {
       if constexpr (std::is_same_v<ElemT, at::Float8_e4m3fn>) {
         auto it = kernel_maps_gemm1_decode_fp8_ck_sorting<OutT>.find(mode);
@@ -408,6 +417,14 @@ static void moe_marlin_w8a8_dispatch_gemm_stages(
         tensorwise_scale,
         real_size_k);
 
+    if constexpr (std::is_same_v<ElemT, int8_t>) {
+      if (moe_channel_mode_family(mode) == 3) {
+        auto it = kernel_maps_gemm2_wasp<OutT>.find(mode);
+        TORCH_CHECK(it != kernel_maps_gemm2_wasp<OutT>.end(), "invalid W8A8 WASP mode: ", mode);
+        it->second(params_in);
+        return;
+      }
+    }
     if (is_decode) {
       if constexpr (std::is_same_v<ElemT, at::Float8_e4m3fn>) {
         auto it = kernel_maps_gemm2_decode_fp8_ck_sorting<OutT>.find(mode);
