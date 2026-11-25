@@ -136,6 +136,35 @@ void launch_moe_w8a8_prefill_down_fp8_bk64_nloop(const GemmParams<T, T_hidden> &
 template <typename scalar_t>
 using KernelFunc = std::function<void(const GemmParams<char, scalar_t> &)>;
 
+template <bool FirstStage, bool CkSorting, typename OutT, int WavesM, int BlockM>
+void launch_moe_w8a8_int8_wasp(const GemmParams<char, OutT> &params);
+
+#define MOE_W8A8_WASP_ENTRY(STAGE, SORTING, BM, PROFILE, WAVES_M) \
+    {MOE_W8A8_MODE(STAGE, SORTING, 3, BM, PROFILE), \
+     [](const GemmParams<char, scalar_t> &p) { \
+         launch_moe_w8a8_int8_wasp<(STAGE) == 1, (SORTING) == 0, scalar_t, WAVES_M, BM>(p); }}
+#define MOE_W8A8_WASP_ENTRIES(STAGE) \
+    MOE_W8A8_WASP_ENTRY(STAGE, 0, 128, 101, 1), \
+    MOE_W8A8_WASP_ENTRY(STAGE, 1, 128, 101, 1), \
+    MOE_W8A8_WASP_ENTRY(STAGE, 0, 128, 102, 2), \
+    MOE_W8A8_WASP_ENTRY(STAGE, 1, 128, 102, 2), \
+    MOE_W8A8_WASP_ENTRY(STAGE, 0, 256, 101, 1), \
+    MOE_W8A8_WASP_ENTRY(STAGE, 1, 256, 101, 1), \
+    MOE_W8A8_WASP_ENTRY(STAGE, 0, 256, 102, 2), \
+    MOE_W8A8_WASP_ENTRY(STAGE, 1, 256, 102, 2)
+
+template <typename scalar_t>
+static std::unordered_map<int, KernelFunc<scalar_t>> kernel_maps_gemm1_wasp = {
+    MOE_W8A8_WASP_ENTRIES(1),
+};
+template <typename scalar_t>
+static std::unordered_map<int, KernelFunc<scalar_t>> kernel_maps_gemm2_wasp = {
+    MOE_W8A8_WASP_ENTRIES(2),
+};
+
+#undef MOE_W8A8_WASP_ENTRIES
+#undef MOE_W8A8_WASP_ENTRY
+
 #define MOE_W8A8_INT8_PREFILL_UP_BK64_NLOOP_ENTRY(BM, N_LOOP_NUM) \
     {MOE_W8A8_MODE(1, 0, 2, BM, 100 + (N_LOOP_NUM)), [](const GemmParams<char, scalar_t> &p) \
      { launch_moe_w8a8_prefill_up_int8_bk64_nloop<BM, 128, 64, BM, 32, 64, 2, N_LOOP_NUM>(p); }}

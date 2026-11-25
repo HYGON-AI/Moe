@@ -25,9 +25,10 @@ static torch::Tensor moe_c_moe_gemm_marlin_w8a8_impl(torch::Tensor input,
   bool tensorwise_scale
   ) {
 
-    // The instantiated W8A8 INT8 kernels consume CK-sorting packed IDs.
-    // Do not let a future moe_align mode fall through to the same callable.
-    validate_moe_channel_layout(mode, /*expected_sorting=*/0);
+    validate_moe_channel_mode(mode);
+    if (moe_channel_mode_family(mode) != 3) {
+      validate_moe_channel_layout(mode, /*expected_sorting=*/0);
+    }
 
     const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
     const int size_m = input.size(0); 

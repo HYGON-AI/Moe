@@ -10,6 +10,7 @@
 #include "moe_w8a8_bk128_prefill.h"
 #include "moe_w8a8_bk64_prefill.h"
 #include "moe_w8a8_int8_bk128_prefill.h"
+#include "moe_w8a8_int8_wasp.h"
 
 template <
     typename scalar_t,

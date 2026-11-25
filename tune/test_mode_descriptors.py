@@ -173,6 +173,32 @@ class W4A16ModeDescriptorsTest(unittest.TestCase):
 
 
 class ModeDescriptorsTest(unittest.TestCase):
+    def test_wasp_modes_and_limits(self):
+        from moe_utils.fused_moe_c import validate_channelwise_reduce_k
+        profile = PROFILES["int8_w8a8"]
+        s = shape(k=2048, m=8192)
+        for stage in (1, 2):
+            for sorting in (0, 1):
+                for bm in (128, 256):
+                    for variant in (101, 102):
+                        value = mode(stage, sorting, 3, bm, variant)
+                        desc = profile.descriptor(value)
+                        self.assertIn(value, _valid_modes_for_shape(profile, s, stage, max_nloop=1))
+                        self.assertEqual((desc.bm, desc.bn, desc.bk, desc.nloop), (bm, 256, 128, 1))
+                        self.assertEqual((desc.wm, desc.wn), (bm // (variant - 100), 32 * (variant - 100)))
+                        self.assertIsNone(desc.validate(s))
+                        self.assertIsNotNone(desc.validate(replace(s, dtype="fp16")))
+                        self.assertIsNotNone(desc.validate(replace(s, n=192)))
+                        self.assertIsNotNone(desc.validate(replace(s, m=1 << 30)))
+                        large_topk = replace(s, e=1024, topk=512, m=1)
+                        if sorting == 1:
+                            self.assertIsNone(desc.validate(large_topk))
+                        else:
+                            self.assertIn("8-bit topk", desc.validate(large_topk))
+                        validate_channelwise_reduce_k("int8_w8a8", value,
+                                                     s.k if stage == 1 else s.n, stage == 2,
+                                                     2 * s.n if stage == 1 else s.k)
+
     def test_pair_selection_requires_matching_routing(self):
         rows = [DirectBenchRow(1, "gemm1", 1, 16, "ck_sorting", 1, True),
                 DirectBenchRow(1, "gemm2", 2, 16, "moe_align", 1, True),
